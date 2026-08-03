@@ -73,4 +73,49 @@ JSON
   grep -Fq "udp dport 20000-50000 redirect to :55556" "$NFT_LOG"
 '
 
+# Regression: build_inbound must return the selected hop range to its caller.
+SBCTL_TESTING=1 \
+SBCTL_CONFIG_DIR="$TMP/build/cfg" \
+SBCTL_CONFIG_FILE="$TMP/build/cfg/config.json" \
+SBCTL_META_FILE="$TMP/build/meta.json" \
+SBCTL_CERT_DIR="$TMP/build/cfg/certs" \
+SBCTL_LOCK_FILE="$TMP/build/lock" \
+bash -c '
+  set -Eeuo pipefail
+  source ./sbctl.sh
+  write_default_config
+  choose() {
+    local __var=$1 prompt=$2
+    case $prompt in
+      "选择入站协议") printf -v "$__var" "%s" 3 ;;
+      "端口模式") printf -v "$__var" "%s" 2 ;;
+      "QUIC 混淆") printf -v "$__var" "%s" 1 ;;
+      *) echo "unexpected choose prompt: $prompt" >&2; return 1 ;;
+    esac
+  }
+  prompt_tag() { printf -v "$1" "%s" hy2-created; }
+  prompt_value() {
+    local __var=$1 prompt=$2
+    case $prompt in
+      "监听地址") printf -v "$__var" "%s" 0.0.0.0 ;;
+      "跳跃端口范围") printf -v "$__var" "%s" 20000-50000 ;;
+      "用户名称") printf -v "$__var" "%s" user-test ;;
+      *) echo "unexpected prompt_value: $prompt" >&2; return 1 ;;
+    esac
+  }
+  prompt_hy2_internal_port() { printf -v "$1" "%s" 60000; }
+  prompt_public_host() { printf -v "$1" "%s" 203.0.113.10; }
+  build_certificate_tls() { printf -v "$1" "%s" '{"enabled":true,"server_name":"example.com","certificate_path":"/tmp/a.crt","key_path":"/tmp/a.key"}'; }
+  prompt_secret() { printf -v "$1" "%s" secret; }
+  prompt_optional_positive_int() { printf -v "$1" "%s" ""; }
+  hy2_hop_check_conflicts() { return 0; }
+  warn() { :; }
+
+  inbound=""; host=""; public=""; hop_range=""
+  build_inbound inbound host public hop_range
+  [[ $hop_range == 20000-50000 ]]
+  [[ $(jq -r .listen_port <<<"$inbound") == 60000 ]]
+  [[ $host == 203.0.113.10 ]]
+'
+
 printf 'hy2 hop test passed.\n'
