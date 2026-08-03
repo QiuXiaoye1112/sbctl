@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq openssl
+      - name: Install current stable sing-box
+        run: curl -fsSL https://sing-box.app/install.sh | sudo sh
+      - name: Run smoke tests
+        env:
+          TERM: xterm
+        run: bash tests/smoke.sh
