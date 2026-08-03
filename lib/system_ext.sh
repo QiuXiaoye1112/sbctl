@@ -82,9 +82,16 @@ show_firewall_rules() {
   fi
 }
 
+_ufw_delete_rule_all() {
+  local action=$1 spec=$2 count=0
+  while ((count < 20)) && ufw --force delete "$action" "$spec" >/dev/null 2>&1; do
+    ((count+=1))
+  done
+}
+
 firewall_port_action() {
   ensure_dependencies firewall
-  local action=$1 port=$2 protocol=${3:-tcp} p
+  local action=$1 port=$2 protocol=${3:-tcp} p spec
   local protocols=()
   validate_port "$port" || die "端口必须为 1-65535。"
   [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || die "协议必须是 tcp、udp 或 both。"
@@ -92,14 +99,14 @@ firewall_port_action() {
 
   if command_exists ufw; then
     for p in "${protocols[@]}"; do
+      spec="${port}/${p}"
+      _ufw_delete_rule_all allow "$spec"
+      _ufw_delete_rule_all deny "$spec"
+      _ufw_delete_rule_all reject "$spec"
       if [[ $action == open ]]; then
-        ufw --force delete deny "${port}/${p}" >/dev/null 2>&1 || true
-        ufw --force delete reject "${port}/${p}" >/dev/null 2>&1 || true
-        ufw allow "${port}/${p}"
+        ufw insert 1 allow "$spec"
       else
-        ufw --force delete allow "${port}/${p}" >/dev/null 2>&1 || true
-        ufw --force delete reject "${port}/${p}" >/dev/null 2>&1 || true
-        ufw deny "${port}/${p}"
+        ufw insert 1 deny "$spec"
       fi
     done
   elif command_exists firewall-cmd; then
