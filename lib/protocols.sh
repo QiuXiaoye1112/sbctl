@@ -2,7 +2,9 @@
 # Mixed(SOCKS+HTTP) is intentionally not offered or created by sbctl.
 
 build_inbound() {
-  local __json=$1 __host=$2 __public=$3 choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down
+  local __json=$1 __host=$2 __public=$3 choice type tag listen port client_host
+  local tls="" reality_public="" name="" password="" uuid="" flow=""
+  local obfs_choice="" obfs_password="" up="" down=""
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
   case $choice in
     1) type=anytls;;
