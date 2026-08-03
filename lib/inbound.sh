@@ -181,12 +181,25 @@ add_inbound() {
 
 list_inbounds() {
   ensure_config
-  local count
+  local count tag type port security users
+  local tag_width=24 type_width=14 port_width=8 security_width=12 users_width=6
   count=$(jq '.inbounds|length' "$CONFIG_FILE")
   ((count)) || { info "还没有入站。"; return 0; }
-  printf '%-22s %-12s %-7s %-10s %-6s\n' 标签 协议 端口 安全 用户
+
+  print_table_cell_clipped "标签" "$tag_width"; printf '| '
+  print_table_cell_clipped "协议" "$type_width"; printf '| '
+  print_table_cell "端口" "$port_width"; printf '| '
+  print_table_cell_clipped "安全" "$security_width"; printf '| '
+  printf '用户\n'
+
   jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE" |
-    while IFS=$'\t' read -r tag type port security users; do printf '%-22s %-12s %-7s %-10s %-6s\n' "$tag" "$type" "$port" "$security" "$users"; done
+    while IFS=$'\t' read -r tag type port security users; do
+      print_table_cell_clipped "$tag" "$tag_width"; printf '| '
+      print_table_cell_clipped "$type" "$type_width"; printf '| '
+      print_table_cell "$port" "$port_width"; printf '| '
+      print_table_cell_clipped "$security" "$security_width"; printf '| '
+      printf '%s\n' "$users"
+    done
 }
 
 show_inbound() {
