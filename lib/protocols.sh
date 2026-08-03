@@ -1,8 +1,62 @@
 # Supported inbound set and creation flow.
 # Mixed(SOCKS+HTTP) is intentionally not offered or created by sbctl.
 
+hy2_port_in_range() {
+  local port=$1 range=$2 start end
+  start=${range%-*}; end=${range#*-}
+  validate_port "$port" && validate_hy2_hop_range "$range" || return 1
+  ((10#$port >= 10#$start && 10#$port <= 10#$end))
+}
+
+hy2_internal_port_available() {
+  local port=$1 range=$2
+  validate_port "$port" || return 1
+  hy2_port_in_range "$port" "$range" && return 1
+  port_in_config "$port" && return 1
+  port_in_use_os "$port" && return 1
+  return 0
+}
+
+hy2_pick_internal_port() {
+  local __var=$1 range=$2 candidate hex i
+  for ((i=0; i<256; i++)); do
+    hex=$(random_hex 2)
+    candidate=$((10000 + (16#$hex % 55536)))
+    if hy2_internal_port_available "$candidate" "$range"; then
+      printf -v "$__var" '%s' "$candidate"
+      return 0
+    fi
+  done
+  for ((candidate=10000; candidate<=65535; candidate++)); do
+    if hy2_internal_port_available "$candidate" "$range"; then
+      printf -v "$__var" '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prompt_hy2_internal_port() {
+  local __var=$1 range=$2 value=""
+  while true; do
+    prompt_optional value "内部监听端口（留空自动选择）" || return 1
+    if [[ -z $value ]]; then
+      hy2_pick_internal_port value "$range" || { error "找不到可用的内部监听端口。"; return 1; }
+      info "内部监听端口：${value}"
+      printf -v "$__var" '%s' "$value"
+      return 0
+    fi
+    validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
+    hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
+    port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
+    port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
+    printf -v "$__var" '%s' "$value"
+    return 0
+  done
+}
+
 build_inbound() {
-  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host
+  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port="" client_host
   local tls="" reality_public="" name="" password="" uuid="" flow=""
   local obfs_choice="" obfs_password="" up="" down="" hop_choice="" hop_range=""
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
@@ -17,7 +71,25 @@ build_inbound() {
 
   prompt_tag tag "${type}-$(random_hex 2)"
   prompt_value listen "监听地址" "0.0.0.0"
-  prompt_port port 443
+
+  if [[ $type == hysteria2 ]]; then
+    choose hop_choice "端口模式" "单端口" "端口跳跃"
+    if [[ $hop_choice == 1 ]]; then
+      prompt_port port 443
+    else
+      while true; do
+        prompt_value hop_range "跳跃端口范围" "20000-50000"
+        validate_hy2_hop_range "$hop_range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
+        hy2_hop_check_conflicts "$tag" "$hop_range" || { warn "请换一个不冲突的端口范围。"; continue; }
+        break
+      done
+      prompt_hy2_internal_port port "$hop_range"
+      warn "该范围内的入站 UDP 流量会重定向到内部端口 ${port}；请勿覆盖其他 UDP 服务使用的端口。"
+    fi
+  else
+    prompt_port port 443
+  fi
+
   prompt_public_host client_host
 
   case $type in
@@ -49,18 +121,6 @@ build_inbound() {
       prompt_optional_positive_int down "下行限制 Mbps（留空=不限）"
       choose obfs_choice "QUIC 混淆" "关闭" "Salamander"
       if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)"; fi
-      if [[ -t 0 ]]; then
-        choose hop_choice "端口跳跃" "关闭" "开启"
-        if [[ $hop_choice == 2 ]]; then
-          while true; do
-            prompt_value hop_range "跳跃端口范围" "20000-50000"
-            validate_hy2_hop_range "$hop_range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
-            hy2_hop_check_conflicts "$tag" "$hop_range" || { warn "请换一个不冲突的端口范围。"; continue; }
-            break
-          done
-          warn "该范围内的入站 UDP 流量会重定向到此 Hysteria2 入站；请勿覆盖其他 UDP 服务使用的端口。"
-        fi
-      fi
       printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --arg up "$up" --arg down "$down" --arg obfs "$obfs_password" --argjson tls "$tls" '
         {type:"hysteria2",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} |
         if $up!="" then .up_mbps=($up|tonumber) else . end |
