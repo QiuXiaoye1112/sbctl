@@ -160,7 +160,8 @@ install_quick_command() {
 
 install_or_update_sing_box() {
   ensure_dependencies install
-  local version=${1-} installer manager
+  local version=${1-} installer manager had_config=0
+  [[ -f $CONFIG_FILE ]] && had_config=1
   manager=$(pkg_manager)
   if [[ $manager == apk ]]; then
     apk add --no-cache --upgrade sing-box
@@ -174,7 +175,13 @@ install_or_update_sing_box() {
   refresh_binary_path
   sing_box_installed || die "sing-box 安装失败。"
   require_supported_core
-  ensure_config
+  if ((had_config)); then
+    ensure_config
+  else
+    # Some sing-box packages/installers create a demonstration config (commonly
+    # a Shadowsocks listener on 8080). A fresh sbctl install must start empty.
+    write_default_config
+  fi
   create_service_definition
   install_quick_command
   validate_candidate "$CONFIG_FILE"
