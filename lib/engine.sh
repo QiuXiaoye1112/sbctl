@@ -192,12 +192,13 @@ install_or_update_sing_box() {
 
 uninstall_sing_box() {
   ensure_dependencies uninstall
-  local purge=${1:-0} manager
+  local purge=${1:-0} manager hook
   if [[ $purge == 1 ]]; then
-    confirm "彻底卸载并删除配置、证书和元数据？" N || return 0
+    confirm "完全卸载 sing-box 和 sbctl，并删除配置、证书与元数据？" N || return 0
   else
-    confirm "卸载 sing-box，保留配置？" N || return 0
+    confirm "卸载 sing-box，保留配置、证书、元数据和 sbctl？" N || return 0
   fi
+
   service_stop >/dev/null 2>&1 || true
   service_disable >/dev/null 2>&1 || true
   manager=$(pkg_manager)
@@ -209,12 +210,36 @@ uninstall_sing_box() {
     pacman) pacman -Rns --noconfirm sing-box 2>/dev/null || true ;;
     zypper) zypper --non-interactive remove sing-box 2>/dev/null || true ;;
   esac
-  [[ $(init_system) != systemd ]] || { rm -f "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"; systemctl daemon-reload; }
-  [[ $(init_system) != openrc ]] || rm -f "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
+
+  case $(init_system) in
+    systemd)
+      rm -f "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc)
+      rm -f "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
+      ;;
+  esac
+
   if [[ $purge == 1 ]]; then
+    for hook in "$CERTBOT_HOOK_DIR"/sbctl-*; do
+      [[ -e $hook ]] && rm -f "$hook"
+    done
+
     rm -rf "$CONFIG_DIR" "$DATA_DIR"
     rm -f "$META_FILE"
     rmdir "$(dirname "$META_FILE")" 2>/dev/null || true
+
+    if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then
+      rm -f "$QUICK_SYMLINK"
+    fi
+    if [[ $QUICK_COMMAND == /usr/local/sbin/sbctl ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then
+      rm -f "$QUICK_COMMAND"
+    fi
+    [[ $LIB_DIR != /usr/local/lib/sbctl ]] || rm -rf "$LIB_DIR"
+
+    info "完全卸载完成；Let’s Encrypt 原始证书未删除，备份保留在 ${BACKUP_DIR}。"
+  else
+    info "sing-box 已卸载；配置、证书、元数据、sbctl 和备份均已保留。"
   fi
-  info "卸载完成。"
 }
