@@ -74,7 +74,7 @@ show_firewall_rules() {
   require_root firewall-rules
   heading "当前防火墙规则"
   if command_exists ufw; then
-    ufw status numbered
+    LC_ALL=C ufw status numbered
   elif command_exists firewall-cmd; then
     firewall-cmd --list-all
   else
@@ -82,16 +82,30 @@ show_firewall_rules() {
   fi
 }
 
-_ufw_delete_rule_all() {
-  local action=$1 spec=$2 count=0
-  while ((count < 20)) && ufw --force delete "$action" "$spec" >/dev/null 2>&1; do
-    ((count+=1))
-  done
+_ufw_rule_numbers_for_port() {
+  local port=$1 proto=$2
+  LC_ALL=C ufw status numbered 2>/dev/null \
+    | sed -nE "/${port}\\/${proto}([[:space:]]|$)/s/^\\[[[:space:]]*([0-9]+)\\].*/\\1/p" \
+    | sort -rn
+}
+
+_ufw_delete_rules_for_port() {
+  local port=$1 proto=$2 rule_no
+  while IFS= read -r rule_no; do
+    [[ -n $rule_no ]] || continue
+    ufw --force delete "$rule_no" >/dev/null
+  done < <(_ufw_rule_numbers_for_port "$port" "$proto")
+}
+
+_ufw_rule_matches() {
+  local port=$1 proto=$2 expected=$3
+  LC_ALL=C ufw status numbered 2>/dev/null \
+    | grep -Eq "^\\[[[:space:]]*[0-9]+\\][[:space:]]+${port}/${proto}([[:space:]]|$).*${expected}[[:space:]]+IN([[:space:]]|$)"
 }
 
 firewall_port_action() {
   ensure_dependencies firewall
-  local action=$1 port=$2 protocol=${3:-tcp} p spec
+  local action=$1 port=$2 protocol=${3:-tcp} p expected
   local protocols=()
   validate_port "$port" || die "端口必须为 1-65535。"
   [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || die "协议必须是 tcp、udp 或 both。"
@@ -99,15 +113,16 @@ firewall_port_action() {
 
   if command_exists ufw; then
     for p in "${protocols[@]}"; do
-      spec="${port}/${p}"
-      _ufw_delete_rule_all allow "$spec"
-      _ufw_delete_rule_all deny "$spec"
-      _ufw_delete_rule_all reject "$spec"
+      _ufw_delete_rules_for_port "$port" "$p"
       if [[ $action == open ]]; then
-        ufw insert 1 allow "$spec"
+        ufw prepend allow in proto "$p" to any port "$port"
+        expected=ALLOW
       else
-        ufw insert 1 deny "$spec"
+        ufw prepend deny in proto "$p" to any port "$port"
+        expected=DENY
       fi
+      ufw reload >/dev/null
+      _ufw_rule_matches "$port" "$p" "$expected" || die "UFW 规则写入失败：${port}/${p} 未出现 ${expected} IN。"
     done
   elif command_exists firewall-cmd; then
     for p in "${protocols[@]}"; do
