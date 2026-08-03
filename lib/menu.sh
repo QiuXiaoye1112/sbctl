@@ -26,7 +26,7 @@ modify_inbound_menu() {
     printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
     read -r -p "请选择: " choice
     case $choice in
-      1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return;;
+      1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
       2) run_menu_action modify_inbound_basic "$tag"; pause;;
       3) run_menu_action modify_inbound_security "$tag"; pause;;
       0) return;; *) warn "无效选项。"; pause;;
@@ -229,7 +229,7 @@ sbctl - sing-box Linux 管理器
   sbctl diagnose
   sbctl version
 
-支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP、Mixed
+支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP
 代理出站: SOCKS5、HTTP
 EOF_HELP
 }
