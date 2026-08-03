@@ -58,7 +58,7 @@ prompt_hy2_internal_port() {
 build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port="" client_host
   local tls="" reality_public="" name="" password="" uuid="" flow=""
-  local obfs_choice="" obfs_password="" up="" down="" hop_choice="" hop_range=""
+  local obfs_choice="" obfs_password="" up="" down="" hop_choice="" selected_hop_range=""
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
   case $choice in
     1) type=anytls;;
@@ -78,12 +78,12 @@ build_inbound() {
       prompt_port port 443
     else
       while true; do
-        prompt_value hop_range "跳跃端口范围" "20000-50000"
-        validate_hy2_hop_range "$hop_range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
-        hy2_hop_check_conflicts "$tag" "$hop_range" || { warn "请换一个不冲突的端口范围。"; continue; }
+        prompt_value selected_hop_range "跳跃端口范围" "20000-50000"
+        validate_hy2_hop_range "$selected_hop_range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
+        hy2_hop_check_conflicts "$tag" "$selected_hop_range" || { warn "请换一个不冲突的端口范围。"; continue; }
         break
       done
-      prompt_hy2_internal_port port "$hop_range"
+      prompt_hy2_internal_port port "$selected_hop_range"
       warn "该范围内的入站 UDP 流量会重定向到内部端口 ${port}；请勿覆盖其他 UDP 服务使用的端口。"
     fi
   else
@@ -146,7 +146,7 @@ build_inbound() {
 
   printf -v "$__host" '%s' "$client_host"
   printf -v "$__public" '%s' "$reality_public"
-  [[ -z $__hop ]] || printf -v "$__hop" '%s' "$hop_range"
+  [[ -z $__hop ]] || printf -v "$__hop" '%s' "$selected_hop_range"
 }
 
 show_help() {
