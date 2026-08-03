@@ -2,7 +2,7 @@
 
 `sbctl` 是一个 Linux sing-box 终端管理器，交互方式参考 `xrayctl`，底层使用 sing-box 配置和命令。
 
-当前版本：`0.1.0`
+当前版本：`0.2.15`
 
 ## 支持环境
 
@@ -10,16 +10,17 @@
 - Alpine Linux / OpenRC
 - sing-box `1.12.0+`
 
-## 首批功能
+## 功能
 
-- AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP、Mixed 入站
+- AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP 入站
 - REALITY 与证书 TLS
 - 用户新增、删除、重置凭据
 - 配置校验与失败回滚
 - TLS 证书导入和 Let's Encrypt 域名证书签发
 - config / meta / certs 整体备份恢复
 - systemd / OpenRC 服务管理
-- 分享信息与 AnyTLS 客户端 outbound JSON
+- VLESS、Trojan、Hysteria2 与 AnyTLS(TLS) 分享链接
+- AnyTLS + REALITY 客户端 outbound JSON
 
 ## 安装
 
@@ -85,8 +86,12 @@ sbctl help
 sbctl.sh              命令入口
 lib/core.sh            通用函数、服务抽象、元数据
 lib/engine.sh          sing-box 安装、配置事务、服务定义
-lib/inbound.sh         入站生成与管理
-lib/clients.sh         用户与分享信息
+lib/inbound.sh         入站基础管理
+lib/certificate.sh     TLS 证书选择与 SNI
+lib/reality.sh         REALITY 交互
+lib/protocols.sh       支持协议与入站生成
+lib/clients.sh         用户管理
+lib/share.sh           分享信息
 lib/ops.sh             证书、备份、状态、配置操作
 lib/menu.sh            菜单与 CLI 路由
 install.sh             systemd Linux 安装入口
@@ -127,7 +132,3 @@ TERM=xterm bash tests/smoke.sh
 ```
 
 GitHub Actions 会安装当前稳定 sing-box，并使用真实 `sing-box check` 检查代表性配置。
-
-## 当前范围
-
-`0.1.0` 优先完成基础管理链路。端口跳跃管理、复杂出站路由、流量统计和更多新协议留到后续版本。
