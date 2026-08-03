@@ -16,4 +16,6 @@ jobs:
       - name: Run smoke tests
         env:
           TERM: xterm
-        run: bash tests/smoke.sh
+        run: |
+          bash tests/smoke.sh
+          bash tests/outbound.sh
