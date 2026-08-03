@@ -20,3 +20,4 @@ jobs:
           bash tests/ui.sh
           bash tests/smoke.sh
           bash tests/outbound.sh
+          bash tests/legacy-config.sh
