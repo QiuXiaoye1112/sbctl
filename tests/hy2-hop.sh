@@ -48,6 +48,22 @@ JSON
   ! validate_hy2_hop_range 50000-20000
   [[ $(hy2_hop_client_port_spec hy2-test 55556) == 20000-50000 ]]
 
+  # Manual internal ports inside the hopping range must be rejected and reprompted.
+  attempt=0
+  warnings=""
+  prompt_optional() {
+    local __var=$1
+    ((attempt+=1))
+    if ((attempt == 1)); then printf -v "$__var" "%s" 30000; else printf -v "$__var" "%s" 60000; fi
+  }
+  port_in_use_os() { return 1; }
+  warn() { warnings+="$*"$'"'"'\n'"'"'; }
+  selected=""
+  prompt_hy2_internal_port selected 20000-50000
+  [[ $selected == 60000 ]]
+  [[ $attempt == 2 ]]
+  grep -Fq "内部监听端口不能位于跳跃端口范围 20000-50000 内。" <<<"$warnings"
+
   share=$(print_share hy2-test)
   grep -Fq "hysteria2://secret@203.0.113.10:20000-50000?sni=example.com" <<<"$share"
 
