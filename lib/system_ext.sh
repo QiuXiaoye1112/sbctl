@@ -79,8 +79,6 @@ firewall_port_action() {
   if [[ $protocol == both ]]; then protocols=(tcp udp); else protocols=("$protocol"); fi
 
   if command_exists ufw; then
-    # In sbctl's UFW mode the default incoming policy is ALLOW. Therefore a
-    # closed port needs an explicit deny; deleting an allow rule is not enough.
     for p in "${protocols[@]}"; do
       if [[ $action == open ]]; then
         ufw --force delete deny "${port}/${p}" >/dev/null 2>&1 || true
@@ -128,6 +126,14 @@ EOF_BBR_OFF
   info "BBR 已关闭；当前拥塞控制算法：${fallback}。"
 }
 
+toggle_bbr() {
+  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then
+    disable_bbr
+  else
+    enable_bbr
+  fi
+}
+
 firewall_mode_summary() {
   if command_exists ufw; then
     printf '默认开放，显式 deny 的端口除外'
@@ -160,14 +166,13 @@ system_menu() {
   while true; do
     clear_screen; heading "系统工具"
     printf 'BBR: %s  |  防火墙: %s\n\n' "$(bbr_state_summary)" "$(firewall_state_summary)"
-    printf '1) 防火墙管理\n2) 启用 BBR\n3) 关闭 BBR\n4) 系统诊断\n5) 修复快捷命令\n0) 返回\n'
+    printf '1) 防火墙管理\n2) BBR 开启/关闭\n3) 系统诊断\n4) 修复快捷命令\n0) 返回\n'
     read -r -p "请选择: " choice
     case $choice in
       1) firewall_menu;;
-      2) run_menu_action enable_bbr; pause;;
-      3) run_menu_action disable_bbr; pause;;
-      4) run_menu_action system_diagnostics; pause;;
-      5) run_menu_action repair_quick_command; pause;;
+      2) run_menu_action toggle_bbr; pause;;
+      3) run_menu_action system_diagnostics; pause;;
+      4) run_menu_action repair_quick_command; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
