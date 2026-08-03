@@ -24,3 +24,4 @@ jobs:
           bash tests/outbound.sh
           bash tests/legacy-config.sh
           bash tests/reality-share.sh
+          bash tests/hy2-hop.sh
