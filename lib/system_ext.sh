@@ -9,7 +9,7 @@ install_firewall() {
     ufw default allow incoming >/dev/null
     ufw default allow outgoing >/dev/null
     ufw --force enable
-    info "UFW 已启用；默认未显式关闭的入站端口保持开放。"
+    info "UFW 已启用。"
     return
   fi
   if command_exists firewall-cmd; then
@@ -30,7 +30,7 @@ install_firewall() {
       ufw default allow incoming >/dev/null
       ufw default allow outgoing >/dev/null
       ufw --force enable
-      info "UFW 已安装并启用；默认未显式关闭的入站端口保持开放。"
+      info "UFW 已安装并启用。"
       ;;
   esac
 }
@@ -68,6 +68,18 @@ uninstall_firewall() {
     return
   fi
   info "未安装 UFW/firewalld。"
+}
+
+show_firewall_rules() {
+  require_root firewall-rules
+  heading "当前防火墙规则"
+  if command_exists ufw; then
+    ufw status numbered
+  elif command_exists firewall-cmd; then
+    firewall-cmd --list-all
+  else
+    info "未安装 UFW/firewalld。"
+  fi
 }
 
 firewall_port_action() {
@@ -134,28 +146,19 @@ toggle_bbr() {
   fi
 }
 
-firewall_mode_summary() {
-  if command_exists ufw; then
-    printf '默认开放，显式 deny 的端口除外'
-  elif command_exists firewall-cmd; then
-    printf '按 firewalld zone 规则'
-  else
-    printf '未安装'
-  fi
-}
-
 firewall_menu() {
   local choice
   while true; do
     clear_screen; heading "防火墙"
-    printf '状态: %s\n模式: %s\n\n' "$(firewall_state_summary)" "$(firewall_mode_summary)"
-    printf '1) 安装/启用\n2) 放行端口\n3) 关闭端口\n4) 卸载 UFW/firewalld\n0) 返回\n'
+    printf '状态: %s\n\n' "$(firewall_state_summary)"
+    printf '1) 安装/启用\n2) 查看当前规则\n3) 放行端口\n4) 关闭端口\n5) 卸载 UFW/firewalld\n0) 返回\n'
     read -r -p "请选择: " choice
     case $choice in
       1) run_menu_action install_firewall; pause;;
-      2) run_menu_action manage_firewall_port open; pause;;
-      3) run_menu_action manage_firewall_port close; pause;;
-      4) run_menu_action uninstall_firewall; pause;;
+      2) run_menu_action show_firewall_rules; pause;;
+      3) run_menu_action manage_firewall_port open; pause;;
+      4) run_menu_action manage_firewall_port close; pause;;
+      5) run_menu_action uninstall_firewall; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
