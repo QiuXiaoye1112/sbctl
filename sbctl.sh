@@ -37,7 +37,7 @@ else
 fi
 unset _repo_lib
 
-for _module in core engine inbound outbound clients ops menu; do
+for _module in core engine inbound outbound clients ops management menu; do
   [[ -r "$LIB_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$LIB_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$LIB_DIR/${_module}.sh"
