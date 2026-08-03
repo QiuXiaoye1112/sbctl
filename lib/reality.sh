@@ -5,7 +5,7 @@ validate_reality_target() {
   [[ $value == *:* ]] || return 1
   host=${value%:*}
   port=${value##*:}
-  [[ -n $host ]] && validate_domain "$host" && validate_port "$port"
+  [[ -n $host ]] && validate_port "$port"
 }
 
 build_reality_tls() {
