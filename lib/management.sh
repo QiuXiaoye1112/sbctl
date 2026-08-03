@@ -8,7 +8,7 @@ rename_inbound() {
       prompt_value new "新入站名称" "$old"
       [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
       validate_tag "$new" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-      if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在。"; continue; fi
+      if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
       break
     done
   fi
@@ -122,59 +122,6 @@ test_certificate_renewal() {
   certbot renew --dry-run
 }
 
-firewall_state_summary() {
-  if command_exists ufw; then
-    if ufw status 2>/dev/null | grep -q '^Status: active'; then printf 'UFW 运行中'; else printf 'UFW 未启用'; fi
-  elif command_exists firewall-cmd; then
-    if firewall-cmd --state >/dev/null 2>&1; then printf 'firewalld 运行中'; else printf 'firewalld 未启用'; fi
-  else printf '未安装'; fi
-}
-
-install_firewall() {
-  ensure_dependencies firewall
-  local manager
-  if command_exists ufw; then ufw --force enable; return; fi
-  if command_exists firewall-cmd; then
-    command_exists systemctl || die "firewalld 需要 systemd。"
-    systemctl enable --now firewalld
-    return
-  fi
-  manager=$(pkg_manager)
-  case $manager in
-    dnf|yum) install_packages firewalld; systemctl enable --now firewalld;;
-    *) install_packages ufw; ufw --force enable;;
-  esac
-}
-
-firewall_port_action() {
-  ensure_dependencies firewall
-  local action=$1 port=$2 protocol=${3:-tcp} p
-  local protocols=()
-  validate_port "$port" || die "端口必须为 1-65535。"
-  [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || die "协议必须是 tcp、udp 或 both。"
-  if [[ $protocol == both ]]; then protocols=(tcp udp); else protocols=("$protocol"); fi
-  if command_exists ufw; then
-    for p in "${protocols[@]}"; do
-      if [[ $action == open ]]; then ufw allow "${port}/${p}"; else ufw --force delete allow "${port}/${p}" >/dev/null 2>&1 || true; fi
-    done
-  elif command_exists firewall-cmd; then
-    for p in "${protocols[@]}"; do
-      if [[ $action == open ]]; then firewall-cmd --permanent --add-port="${port}/${p}"; else firewall-cmd --permanent --remove-port="${port}/${p}" || true; fi
-    done
-    firewall-cmd --reload
-  else die "未检测到 UFW/firewalld，请先安装防火墙。"; fi
-  info "防火墙端口操作完成：${action} ${port}/${protocol}"
-}
-
-manage_firewall_port() {
-  local action=$1 port choice protocol
-  prompt_value port "端口"
-  validate_port "$port" || die "端口必须为 1-65535。"
-  choose choice "选择协议" "TCP" "UDP" "TCP + UDP"
-  case $choice in 1) protocol=tcp;; 2) protocol=udp;; 3) protocol=both;; esac
-  firewall_port_action "$action" "$port" "$protocol"
-}
-
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
     [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'
@@ -194,6 +141,35 @@ EOF_BBR
   info "BBR 已启用。"
 }
 
+disable_bbr() {
+  ensure_dependencies bbr-disable
+  command_exists sysctl || die "缺少 sysctl。"
+  local available fallback=""
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  if grep -qw cubic <<<"$available"; then
+    fallback=cubic
+  elif grep -qw reno <<<"$available"; then
+    fallback=reno
+  else
+    fallback=$(tr ' ' '\n' <<<"$available" | awk '$0!="" && $0!="bbr" {print; exit}')
+  fi
+  [[ -n $fallback ]] || die "没有找到可用于替代 BBR 的拥塞控制算法。"
+  cat >/etc/sysctl.d/99-sbctl-bbr.conf <<EOF_BBR_OFF
+net.ipv4.tcp_congestion_control=${fallback}
+EOF_BBR_OFF
+  sysctl -p /etc/sysctl.d/99-sbctl-bbr.conf >/dev/null
+  [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) != bbr ]] || die "BBR 关闭失败。"
+  info "BBR 已关闭；当前拥塞控制算法：${fallback}。"
+}
+
+toggle_bbr() {
+  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then
+    disable_bbr
+  else
+    enable_bbr
+  fi
+}
+
 system_diagnostics() {
   ensure_dependencies diagnose
   heading "系统诊断"
@@ -203,7 +179,6 @@ system_diagnostics() {
   printf '服务: %s\n' "$(service_state_summary)"
   printf '开机自启: %s\n' "$(startup_state_summary)"
   printf 'BBR: %s\n' "$(bbr_state_summary)"
-  printf '防火墙: %s\n' "$(firewall_state_summary)"
   printf '配置: %s\n' "$CONFIG_FILE"
   if [[ -f $CONFIG_FILE ]]; then
     printf '入站: %s  |  出站: %s\n' "$(jq '.inbounds|length' "$CONFIG_FILE")" "$(jq '.outbounds|length' "$CONFIG_FILE")"
