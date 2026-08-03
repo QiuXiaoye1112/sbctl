@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.2.2"
+readonly SBCTL_VERSION="0.2.3"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main/sbctl.sh}"
 readonly OFFICIAL_INSTALLER_URL="https://sing-box.app/install.sh"
@@ -37,7 +37,7 @@ else
 fi
 unset _repo_lib
 
-for _module in core ui engine compat inbound outbound clients ops management menu; do
+for _module in core ui engine compat inbound outbound clients ops management menu layout; do
   [[ -r "$LIB_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$LIB_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$LIB_DIR/${_module}.sh"
