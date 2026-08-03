@@ -19,7 +19,8 @@ jobs:
         run: |
           bash tests/no-firewall.sh
           bash tests/ui.sh
-          bash tests/smoke.sh
+          bash tests/protocol-surface.sh
+          bash tests/smoke-current.sh
           bash tests/outbound.sh
           bash tests/legacy-config.sh
           bash tests/reality-share.sh
