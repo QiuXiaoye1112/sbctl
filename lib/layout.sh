@@ -75,3 +75,83 @@ outbound_menu() {
     esac
   done
 }
+
+manage_inbound_menu() {
+  local tag=$1 choice type port security user_count
+  while inbound_exists "$tag"; do
+    clear_screen
+    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+    port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+    security=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end' "$CONFIG_FILE")
+    user_count=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users // [])|length' "$CONFIG_FILE")
+    heading "入站 · ${tag}"
+    printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
+
+    case $type in
+      vless|trojan|hysteria2)
+        printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        read -r -p "请选择: " choice
+        case $choice in
+          1) run_menu_action print_share "$tag"; pause;;
+          2) client_menu "$tag";;
+          3) modify_inbound_menu "$tag";;
+          4) run_menu_action show_inbound "$tag"; pause;;
+          0) return;; *) warn "无效选项。"; pause;;
+        esac
+        ;;
+      anytls)
+        printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        read -r -p "请选择: " choice
+        case $choice in
+          1) run_menu_action print_share "$tag"; pause;;
+          2) client_menu "$tag";;
+          3) modify_inbound_menu "$tag";;
+          4) run_menu_action show_inbound "$tag"; pause;;
+          0) return;; *) warn "无效选项。"; pause;;
+        esac
+        ;;
+      socks|http|mixed)
+        if ((user_count > 0)); then
+          printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+          read -r -p "请选择: " choice
+          case $choice in
+            1) run_menu_action print_share "$tag"; pause;;
+            2) client_menu "$tag";;
+            3) modify_inbound_menu "$tag";;
+            4) run_menu_action show_inbound "$tag"; pause;;
+            0) return;; *) warn "无效选项。"; pause;;
+          esac
+        else
+          printf '1) 客户端配置\n2) 修改入站信息\n3) 查看 JSON\n0) 返回列表\n'
+          read -r -p "请选择: " choice
+          case $choice in
+            1) run_menu_action print_share "$tag"; pause;;
+            2) modify_inbound_menu "$tag";;
+            3) run_menu_action show_inbound "$tag"; pause;;
+            0) return;; *) warn "无效选项。"; pause;;
+          esac
+        fi
+        ;;
+      *) warn "不支持的入站协议：${type}"; return;;
+    esac
+  done
+}
+
+inbound_menu() {
+  local choice tag
+  while true; do
+    clear_screen
+    heading "入站管理"
+    list_inbounds
+    printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
+    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
+    read -r -p "请选择: " choice
+    case $choice in
+      1) run_menu_action add_inbound; pause;;
+      2) select_inbound tag && manage_inbound_menu "$tag";;
+      3) run_menu_action print_all_share; pause;;
+      4) run_menu_action delete_inbound; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
