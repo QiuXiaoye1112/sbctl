@@ -8,7 +8,7 @@ manage_inbound_menu() {
     heading "入站 · ${tag}"
     printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
     printf '1) 分享信息 / 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action print_share "$tag" ""; pause;;
       2) client_menu "$tag";;
@@ -24,7 +24,7 @@ modify_inbound_menu() {
   while inbound_exists "$tag"; do
     clear_screen; heading "修改入站信息 · ${tag}"
     printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
       2) run_menu_action modify_inbound_basic "$tag"; pause;;
@@ -42,7 +42,7 @@ inbound_menu() {
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
     printf '1) 新增入站\n2) 管理已有入站\n3) 全部分享信息\n4) 删除入站\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
       2) select_inbound tag && manage_inbound_menu "$tag";;
@@ -58,7 +58,7 @@ client_menu() {
   while inbound_exists "$tag"; do
     clear_screen; heading "用户管理 · ${tag}"; list_clients "$tag"
     printf '\n1) 添加用户\n2) 重命名用户\n3) 更换 UUID/密码\n4) 删除用户\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action add_client "$tag"; pause;;
       2) run_menu_action rename_client "$tag"; pause;;
@@ -76,7 +76,7 @@ outbound_menu() {
     heading "出站管理"
     list_outbound_overview
     printf '\n1) 选择入站设置出站\n2) 添加代理出站 (SOCKS5/HTTP)\n3) 删除出站\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action assign_outbound; pause;;
       2) run_menu_action add_outbound; pause;;
@@ -92,7 +92,7 @@ certificate_menu() {
     clear_screen; heading "TLS 证书"
     printf '托管证书: %s\n\n' "$(managed_certificate_count)"
     printf '1) Let\x27s Encrypt 自动签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n5) 测试自动续期\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action issue_certificate; pause;;
       2) run_menu_action import_certificate; pause;;
@@ -118,7 +118,7 @@ service_menu() {
     clear_screen; heading "服务管理"
     printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$(service_state_summary)" "$(startup_state_summary)" "$(sing_box_version_summary)"
     printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装/更新/修复 sing-box\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action toggle_service_running; pause;;
       2) run_menu_action service_action restart; pause;;
@@ -136,7 +136,7 @@ system_menu() {
     clear_screen; heading "系统工具"
     printf 'BBR: %s\n\n' "$(bbr_state_summary)"
     printf '1) BBR 开启/关闭\n2) 系统诊断\n3) 修复快捷命令\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action toggle_bbr; pause;;
       2) run_menu_action system_diagnostics; pause;;
@@ -151,7 +151,7 @@ uninstall_menu() {
   while true; do
     clear_screen; heading "卸载"
     printf '1) 卸载 sing-box（保留配置）\n2) 彻底卸载\n0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) run_menu_action uninstall_sing_box 0; pause;;
       2) run_menu_action uninstall_sing_box 1; return;;
@@ -175,7 +175,7 @@ main_menu() {
     node_summary
     show_main_inbounds
     printf '1) 入站管理\n2) 出站管理\n3) TLS 证书\n4) 服务管理\n5) 系统工具\n6) 卸载\n0) 退出\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || { echo; continue; }
     case $choice in
       1) inbound_menu;; 2) outbound_menu;; 3) certificate_menu;; 4) service_menu;;
       5) system_menu;; 6) uninstall_menu;;

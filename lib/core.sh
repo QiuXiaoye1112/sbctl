@@ -32,14 +32,14 @@ trap cleanup_on_exit EXIT
 
 pause() {
   [[ -t 0 ]] || return 0
-  read -r -p "按回车键继续..." _
+  read -r -p "按回车键继续..." _ || true
 }
 
 confirm() {
   local prompt=${1:-"确定继续吗？"} default=${2:-N} answer suffix
   [[ $default == Y ]] && suffix='[Y/n]' || suffix='[y/N]'
   if [[ ! -t 0 ]]; then [[ $default == Y ]]; return; fi
-  read -r -p "${prompt} ${suffix} " answer
+  read -r -p "${prompt} ${suffix} " answer || { echo; answer=${default}; }
   answer=${answer:-$default}
   [[ $answer =~ ^[Yy]$ ]]
 }
@@ -92,7 +92,7 @@ choose() {
   printf '%s\n' "$prompt"
   for ((i=0;i<${#options[@]};i++)); do printf '  %d) %s\n' "$((i+1))" "${options[$i]}"; done
   while true; do
-    read -r -p "请选择 [1-${#options[@]}]: " __choice
+    read -r -p "请选择 [1-${#options[@]}]: " __choice || { echo; continue; }
     if [[ $__choice =~ ^[0-9]+$ ]] && ((__choice>=1 && __choice<=${#options[@]})); then
       printf -v "$__var" '%s' "$__choice"; return 0
     fi
