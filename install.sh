@@ -16,7 +16,7 @@ info "正在下载 sbctl..."
 curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$BASE_URL/sbctl.sh" -o "$tmp/sbctl.sh"
 grep -q '^# sbctl - sing-box Linux terminal manager' "$tmp/sbctl.sh" || die "下载内容校验失败。"
 mkdir -p "$tmp/lib"
-for module in core ui engine compat inbound certificate reality outbound clients share ops management menu protocols layout hy2_hop hy2_create; do
+for module in core ui engine compat inbound certificate reality outbound clients share ops management menu protocols layout hy2_hop hy2_create hy2_nft; do
   curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$BASE_URL/lib/${module}.sh" -o "$tmp/lib/${module}.sh"
   [[ -s "$tmp/lib/${module}.sh" ]] || die "模块下载失败：${module}"
 done
