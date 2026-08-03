@@ -75,6 +75,29 @@ backup_menu() {
   done
 }
 
+uninstall_menu() {
+  local choice
+  while true; do
+    clear_screen; heading "卸载"
+    printf '1) 卸载 sing-box，保留配置\n2) 完全卸载（同时删除配置、证书、元数据和 sbctl）\n0) 返回\n'
+    read -r -p "请选择: " choice
+    case $choice in
+      1)
+        run_menu_action uninstall_sing_box 0
+        pause
+        return
+        ;;
+      2)
+        run_menu_action uninstall_sing_box 1
+        [[ -e $QUICK_COMMAND || -d $CONFIG_DIR ]] && pause
+        return
+        ;;
+      0) return;;
+      *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
 main_menu() {
   ensure_config 2>/dev/null || true
   local choice
@@ -86,7 +109,8 @@ main_menu() {
     read -r -p "请选择: " choice
     case $choice in
       1) inbound_menu;; 2) certificate_menu;; 3) service_menu;; 4) backup_menu;;
-      5) run_menu_action show_status; pause;; 6) run_menu_action uninstall_sing_box 0; pause;;
+      5) run_menu_action show_status; pause;;
+      6) uninstall_menu; [[ -e $QUICK_COMMAND || -d $CONFIG_DIR ]] || return;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -99,7 +123,8 @@ sbctl - sing-box Linux 管理器
 用法:
   sbctl                              打开交互菜单
   sbctl install [版本]               安装/更新 sing-box
-  sbctl uninstall [--purge]          卸载；--purge 同时删除配置
+  sbctl uninstall                    卸载 sing-box，保留配置和 sbctl
+  sbctl uninstall --purge            完全卸载并删除配置、证书、元数据和 sbctl
   sbctl status                       查看状态
   sbctl start|stop|restart           服务控制
   sbctl enable|disable               开关开机自启
