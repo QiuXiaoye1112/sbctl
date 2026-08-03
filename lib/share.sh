@@ -86,19 +86,29 @@ print_share() {
       ;;
 
     anytls)
-      while IFS= read -r name; do
-        [[ -z $filter || $name == "$filter" ]] || continue
-        json=$(client_json_for_anytls "$tag" "$name")
-        print_share_entry "$name" "客户端 outbound JSON" "$json"
-      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
+      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
+      tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
+      [[ $tls_enabled == true ]] || die "AnyTLS 入站未启用 TLS，无法生成分享信息。"
+      if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+        while IFS= read -r name; do
+          [[ -z $filter || $name == "$filter" ]] || continue
+          json=$(client_json_for_anytls "$tag" "$name")
+          print_share_entry "$name" "客户端 outbound JSON" "$json"
+        done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
+      else
+        while IFS=$'\t' read -r name value; do
+          [[ -z $filter || $name == "$filter" ]] || continue
+          link="anytls://$(url_encode "$value")@${uri_host}:${port}/?sni=$(url_encode "$sni")#$(url_encode "${tag}-${name}")"
+          print_share_entry "$name" "链接" "$link"
+        done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
+      fi
       ;;
 
-    socks|http|mixed)
+    socks|http)
       if [[ $(jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users//[])|length' "$CONFIG_FILE") == 0 ]]; then
         case $type in
           socks) print_share_entry "无认证" "配置" "SOCKS5  ${uri_host}:${port}" ;;
           http) print_share_entry "无认证" "配置" "HTTP  ${uri_host}:${port}" ;;
-          mixed) print_share_entry "无认证" "配置" "Mixed(SOCKS+HTTP)  ${uri_host}:${port}" ;;
         esac
       else
         while IFS=$'\t' read -r name value; do
@@ -106,10 +116,12 @@ print_share() {
           case $type in
             socks) print_share_entry "$name" "配置" "SOCKS5  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
             http) print_share_entry "$name" "配置" "HTTP  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
-            mixed) print_share_entry "$name" "配置" "Mixed(SOCKS+HTTP)  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
           esac
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
+      ;;
+    *)
+      die "该入站协议不提供 sbctl 分享信息：${type}"
       ;;
   esac
   share_separator
