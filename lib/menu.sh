@@ -131,34 +131,17 @@ service_menu() {
   done
 }
 
-firewall_menu() {
-  local choice
-  while true; do
-    clear_screen; heading "防火墙"
-    printf '状态: %s\n\n' "$(firewall_state_summary)"
-    printf '1) 安装/启用\n2) 放行端口\n3) 关闭端口\n0) 返回\n'
-    read -r -p "请选择: " choice
-    case $choice in
-      1) run_menu_action install_firewall; pause;;
-      2) run_menu_action manage_firewall_port open; pause;;
-      3) run_menu_action manage_firewall_port close; pause;;
-      0) return;; *) warn "无效选项。"; pause;;
-    esac
-  done
-}
-
 system_menu() {
   local choice
   while true; do
     clear_screen; heading "系统工具"
-    printf 'BBR: %s  |  防火墙: %s\n\n' "$(bbr_state_summary)" "$(firewall_state_summary)"
-    printf '1) 防火墙管理\n2) 启用 BBR\n3) 系统诊断\n4) 修复快捷命令\n0) 返回\n'
+    printf 'BBR: %s\n\n' "$(bbr_state_summary)"
+    printf '1) BBR 开启/关闭\n2) 系统诊断\n3) 修复快捷命令\n0) 返回\n'
     read -r -p "请选择: " choice
     case $choice in
-      1) firewall_menu;;
-      2) run_menu_action enable_bbr; pause;;
-      3) run_menu_action system_diagnostics; pause;;
-      4) run_menu_action repair_quick_command; pause;;
+      1) run_menu_action toggle_bbr; pause;;
+      2) run_menu_action system_diagnostics; pause;;
+      3) run_menu_action repair_quick_command; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -242,8 +225,7 @@ sbctl - sing-box Linux 管理器
   sbctl cert delete [标识]
   sbctl backup [文件.tar.gz]
   sbctl restore [文件.tar.gz]
-  sbctl firewall install|open|close [端口] [tcp|udp|both]
-  sbctl bbr
+  sbctl bbr                            BBR 开启/关闭
   sbctl diagnose
   sbctl version
 
@@ -282,9 +264,7 @@ dispatch() {
       case ${1:-list} in list) list_certificates;; issue) issue_certificate "${2-}" "${3-}";; import) import_certificate "${2-}" "${3-}" "${4-}";;
         delete|remove) delete_certificate "${2-}";; renew-test|test) test_certificate_renewal;; *) die "未知 cert 子命令。";; esac;;
     backup) backup_all "${1-}";; restore) restore_backup "${1-}";;
-    firewall)
-      case ${1-} in install) install_firewall;; open) firewall_port_action open "${2:?请提供端口}" "${3:-tcp}";; close) firewall_port_action close "${2:?请提供端口}" "${3:-tcp}";; *) die "用法: sbctl firewall install|open|close PORT [tcp|udp|both]";; esac;;
-    bbr) enable_bbr;; diagnose|doctor) system_diagnostics;; quick-command) repair_quick_command;;
+    bbr) toggle_bbr;; diagnose|doctor) system_diagnostics;; quick-command) repair_quick_command;;
     *) error "未知命令：$cmd"; show_help; return 2;;
   esac
 }
