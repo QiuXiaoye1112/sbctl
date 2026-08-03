@@ -88,7 +88,7 @@ manage_inbound_menu() {
     printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
 
     case $type in
-      vless|trojan|hysteria2)
+      anytls|vless|trojan|hysteria2)
         printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
         read -r -p "请选择: " choice
         case $choice in
@@ -99,18 +99,7 @@ manage_inbound_menu() {
           0) return;; *) warn "无效选项。"; pause;;
         esac
         ;;
-      anytls)
-        printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
-        read -r -p "请选择: " choice
-        case $choice in
-          1) run_menu_action print_share "$tag"; pause;;
-          2) client_menu "$tag";;
-          3) modify_inbound_menu "$tag";;
-          4) run_menu_action show_inbound "$tag"; pause;;
-          0) return;; *) warn "无效选项。"; pause;;
-        esac
-        ;;
-      socks|http|mixed)
+      socks|http)
         if ((user_count > 0)); then
           printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
           read -r -p "请选择: " choice
