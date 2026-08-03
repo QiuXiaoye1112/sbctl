@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.2.9"
+readonly SBCTL_VERSION="0.2.10"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main/sbctl.sh}"
 readonly OFFICIAL_INSTALLER_URL="https://sing-box.app/install.sh"
