@@ -17,6 +17,7 @@ jobs:
         env:
           TERM: xterm
         run: |
+          bash tests/no-firewall.sh
           bash tests/ui.sh
           bash tests/smoke.sh
           bash tests/outbound.sh
