@@ -75,13 +75,12 @@ outbound_menu() {
     clear_screen
     heading "出站管理"
     list_outbound_overview
-    printf '\n1) 查看入站当前出站规则\n2) 选择入站并设置出站\n3) 添加 SOCKS5/HTTP 出站\n4) 删除出站\n0) 返回\n'
+    printf '\n1) 选择入站设置出站\n2) 添加代理出站 (SOCKS5/HTTP)\n3) 删除出站\n0) 返回\n'
     read -r -p "请选择: " choice
     case $choice in
-      1) run_menu_action list_outbound_overview; pause;;
-      2) run_menu_action assign_outbound; pause;;
-      3) run_menu_action add_outbound; pause;;
-      4) run_menu_action delete_outbound; pause;;
+      1) run_menu_action assign_outbound; pause;;
+      2) run_menu_action add_outbound; pause;;
+      3) run_menu_action delete_outbound; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -230,7 +229,7 @@ sbctl - sing-box Linux 管理器
   sbctl version
 
 支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP
-代理出站: SOCKS5、HTTP
+出站: SOCKS5/HTTP 代理、本地出口
 EOF_HELP
 }
 

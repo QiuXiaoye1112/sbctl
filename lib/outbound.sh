@@ -2,6 +2,65 @@ outbound_exists() {
   jq -e --arg tag "$1" '.outbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null
 }
 
+detect_local_ips() {
+  local iface ip line
+  if command_exists ip; then
+    while IFS= read -r line; do
+      iface=$(awk '{print $2}' <<<"$line")
+      ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
+      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      validate_ipv4 "$ip" || continue
+      [[ $ip =~ ^127\. ]] && continue
+      printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ip -o -4 addr show 2>/dev/null)
+    while IFS= read -r line; do
+      iface=$(awk '{print $2}' <<<"$line")
+      ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
+      ip=${ip%%%*}
+      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ -z $ip || $ip == ::1 || $ip == fe80:* ]] && continue
+      printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ip -o -6 addr show 2>/dev/null)
+  elif command_exists ifconfig; then
+    while IFS= read -r line; do
+      iface=$(awk '{print $1}' <<<"$line" | sed 's/:$//')
+      ip=$(awk '{print $2}' <<<"$line")
+      validate_ipv4 "$ip" || continue
+      [[ $ip =~ ^127\. ]] && continue
+      printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127\.')
+    while IFS= read -r line; do
+      iface=$(awk '{print $1}' <<<"$line" | sed 's/:$//')
+      ip=$(awk '{print $2}' <<<"$line")
+      ip=${ip%%%*}
+      [[ -z $ip || $ip == ::1 || $ip == fe80:* ]] && continue
+      printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ifconfig 2>/dev/null | grep 'inet6 ' | grep -v '::1\|fe80:')
+  fi
+}
+
+_local_tag_for_ip() {
+  local ip=$1
+  printf 'local-%s' "$(printf '%s' "$ip" | tr ':.' '-')"
+}
+
+_ensure_local_outbound() {
+  local ip=$1 tag tmp
+  tag=$(_local_tag_for_ip "$ip")
+  outbound_exists "$tag" && { printf '%s' "$tag"; return 0; }
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg ip "$ip" \
+    '.outbounds += [{type:"direct",tag:$tag,bind:$ip}]' \
+    "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp" >&2; then
+    printf '%s' "$tag"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
 is_managed_inbound_route_rule() {
   local inbound=$1
   jq -e --arg inbound "$inbound" '
@@ -29,7 +88,12 @@ list_outbound_overview() {
     print_table_cell_clipped "入站" 26; printf '| 出站\n'
     while IFS= read -r inbound; do
       outbound=$(current_outbound_for_inbound "$inbound")
-      print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$outbound"
+      local display="$outbound"
+      if [[ $outbound =~ ^local- ]]; then
+        local ip; ip=$(jq -r --arg tag "$outbound" '.outbounds[]?|select(.tag==$tag)|.bind // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        display="${ip:-$outbound}"
+      fi
+      print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$display"
     done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
   fi
 
@@ -93,14 +157,52 @@ add_outbound() {
 
 select_outbound() {
   local __var=$1 include_direct=${2:-1} item answer selected
-  local tags=()
+  local tags=() local_ips=() local_ip_tags=() local_raw_ips=()
   ((include_direct == 0)) || tags+=(direct)
   while IFS= read -r item; do [[ -n $item ]] && tags+=("$item"); done < <(
     jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|.tag' "$CONFIG_FILE"
   )
+  # 检测本地 IP
+  while IFS=$'\t' read -r label ip iface; do
+    local tag; tag=$(_local_tag_for_ip "$ip")
+    local_ip_tags+=("$tag")
+    local found=0
+    for t in "${tags[@]}"; do [[ $t == "$tag" ]] && { found=1; break; }; done
+    if ((!found)); then tags+=("$tag"); fi
+    local_ips+=("$label")
+    local_raw_ips+=("$ip")
+  done < <(ensure_config 2>/dev/null || true; detect_local_ips 2>/dev/null)
   ((${#tags[@]})) || { warn "没有可选出站。"; return 1; }
-  choose answer "选择出站" "${tags[@]}"
+  # 构建显示标签
+  local display_labels=()
+  for t in "${tags[@]}"; do
+    if [[ $t == direct ]]; then
+      display_labels+=("direct")
+    elif [[ $t =~ ^local- ]]; then
+      local dlabel="" found=0 i
+      for ((i=0; i<${#local_ip_tags[@]}; i++)); do
+        [[ ${local_ip_tags[$i]} == "$t" ]] && { dlabel="${local_ips[$i]}"; found=1; break; }
+      done
+      if ((found)); then display_labels+=("${dlabel}"); else display_labels+=("$t"); fi
+    else
+      local stype; stype=$(jq -r --arg tag "$t" '.outbounds[]?|select(.tag==$tag)|.type' "$CONFIG_FILE" 2>/dev/null || printf '?')
+      local saddr; saddr=$(jq -r --arg tag "$t" '.outbounds[]?|select(.tag==$tag)|"\(.server // "?"):\(.server_port // "?")"' "$CONFIG_FILE" 2>/dev/null || printf '?:?')
+      display_labels+=("$t ($stype · $saddr)")
+    fi
+  done
+  choose answer "选择出站" "${display_labels[@]}"
   selected=${tags[$((answer-1))]}
+  if [[ $selected =~ ^local- ]]; then
+    local ip=""
+    ip=$(jq -r --arg tag "$selected" '.outbounds[]?|select(.tag==$tag)|.bind // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -z $ip ]]; then
+      for ((i=0; i<${#local_ip_tags[@]}; i++)); do
+        [[ ${local_ip_tags[$i]} == "$selected" ]] && { ip="${local_raw_ips[$i]}"; break; }
+      done
+    fi
+    [[ -n $ip ]] || { error "无法解析本地 IP。"; return 1; }
+    selected=$(_ensure_local_outbound "$ip") || { error "无法创建本地出口。"; return 1; }
+  fi
   printf -v "$__var" '%s' "$selected"
 }
 
