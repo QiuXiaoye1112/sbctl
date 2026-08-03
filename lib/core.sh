@@ -114,6 +114,37 @@ run_menu_action() {
   return 0
 }
 
+display_width() {
+  local __var=$1 value=$2 char code width=0 i
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}
+    printf -v code '%d' "'$char"
+    if ((code < 0 || code > 127)); then ((width+=2)); else ((width+=1)); fi
+  done
+  printf -v "$__var" '%s' "$width"
+}
+
+print_table_cell() {
+  local value=$1 target_width=$2 width padding
+  display_width width "$value"
+  padding=$((target_width-width))
+  ((padding > 0)) || padding=1
+  printf '%s%*s' "$value" "$padding" ''
+}
+
+print_table_cell_clipped() {
+  local value=$1 target_width=$2 width limit clipped="" used=0 char char_width i
+  display_width width "$value"
+  if ((width < target_width)); then print_table_cell "$value" "$target_width"; return; fi
+  limit=$((target_width-4)); ((limit > 0)) || limit=1
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}; display_width char_width "$char"
+    ((used+char_width <= limit)) || break
+    clipped+=$char; ((used+=char_width))
+  done
+  print_table_cell "${clipped}..." "$target_width"
+}
+
 validate_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
 validate_tag() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
 validate_domain() { [[ ${1:-} =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
