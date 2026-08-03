@@ -42,7 +42,10 @@ normalize_config_tags() {
   while IFS=$'\t' read -r idx type; do
     [[ -n $idx ]] || continue
     type=${type:-outbound}
-    base="legacy-out-${type}-$((idx+1))"
+    case $type in
+      direct|block|dns) base=$type ;;
+      *) base="legacy-out-${type}-$((idx+1))" ;;
+    esac
     _unique_config_tag generated "$base" "$work"
     jq --argjson idx "$idx" --arg tag "$generated" '.outbounds[$idx].tag=$tag' "$work" >"$next"
     mv -f "$next" "$work"
