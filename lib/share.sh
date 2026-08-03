@@ -1,20 +1,25 @@
-# Share-output overrides aligned with xrayctl's interaction style.
+# Share output aligned with xrayctl's interaction style.
 
-_share_separator() {
+share_separator() {
   printf '%s\n' '------------------------------------------------------------------------'
+}
+
+print_share_entry() {
+  local label=$1 field=$2 value=$3
+  share_separator
+  printf '用户: %s\n%s: %s\n' "$label" "$field" "$value"
 }
 
 print_share() {
   ensure_config
-  local tag=${1-} filter=${2-} type host h port name value flow sni public sid security tls_enabled obfs obfs_password
+  local tag=${1-} filter=${2-} type host uri_host port name value flow sni public sid security tls_enabled obfs obfs_password link json
   [[ -n $tag ]] || select_inbound tag || return
+  inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   host=$(public_host_for_tag "$tag") || die "无法确定入站 ${tag} 的客户端连接地址。"
-  h=$(uri_host "$host")
+  uri_host=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
-
   heading "${tag} 分享信息"
-  _share_separator
 
   case $type in
     vless)
@@ -22,7 +27,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || die "REALITY 公钥元数据缺失或与当前私钥不匹配。"
+        public=$(reality_public_key "$tag") || die "无法获得 REALITY 公钥。"
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -31,17 +36,14 @@ print_share() {
       fi
       while IFS=$'\t' read -r name value flow; do
         [[ -z $filter || $name == "$filter" ]] || continue
-        printf '用户: %s\n' "$name"
         if [[ $security == reality ]]; then
-          printf '链接: vless://%s@%s:%s?type=tcp&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&spx=%%2F' \
-            "$value" "$h" "$port" "$(url_encode "$sni")" "$(url_encode "$public")" "$(url_encode "$sid")"
-          [[ -z $flow ]] || printf '&flow=%s' "$(url_encode "$flow")"
-          printf '#%s\n' "$(url_encode "${tag}-${name}")"
+          link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
+          [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         else
-          printf '链接: vless://%s@%s:%s?type=tcp&security=tls&sni=%s#%s\n' \
-            "$value" "$h" "$port" "$(url_encode "$sni")" "$(url_encode "${tag}-${name}")"
+          link="vless://${value}@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
         fi
-        _share_separator
+        link+="#$(url_encode "${tag}-${name}")"
+        print_share_entry "$name" "链接" "$link"
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.uuid,(.flow//"")]|@tsv' "$CONFIG_FILE")
       ;;
 
@@ -50,7 +52,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || die "REALITY 公钥元数据缺失或与当前私钥不匹配。"
+        public=$(reality_public_key "$tag") || die "无法获得 REALITY 公钥。"
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -59,15 +61,13 @@ print_share() {
       fi
       while IFS=$'\t' read -r name value; do
         [[ -z $filter || $name == "$filter" ]] || continue
-        printf '用户: %s\n' "$name"
         if [[ $security == reality ]]; then
-          printf '链接: trojan://%s@%s:%s?type=tcp&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&spx=%%2F#%s\n' \
-            "$(url_encode "$value")" "$h" "$port" "$(url_encode "$sni")" "$(url_encode "$public")" "$(url_encode "$sid")" "$(url_encode "${tag}-${name}")"
+          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
         else
-          printf '链接: trojan://%s@%s:%s?type=tcp&security=tls&sni=%s#%s\n' \
-            "$(url_encode "$value")" "$h" "$port" "$(url_encode "$sni")" "$(url_encode "${tag}-${name}")"
+          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
         fi
-        _share_separator
+        link+="#$(url_encode "${tag}-${name}")"
+        print_share_entry "$name" "链接" "$link"
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
       ;;
 
@@ -78,34 +78,39 @@ print_share() {
       obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
       while IFS=$'\t' read -r name value; do
         [[ -z $filter || $name == "$filter" ]] || continue
-        printf '用户: %s\n链接: hysteria2://%s@%s:%s?sni=%s' "$name" "$(url_encode "$value")" "$h" "$port" "$(url_encode "$sni")"
-        [[ -z $obfs ]] || printf '&obfs=%s&obfs-password=%s' "$(url_encode "$obfs")" "$(url_encode "$obfs_password")"
-        printf '#%s\n' "$(url_encode "${tag}-${name}")"
-        _share_separator
+        link="hysteria2://$(url_encode "$value")@${uri_host}:${port}?sni=$(url_encode "$sni")"
+        [[ -z $obfs ]] || link+="&obfs=$(url_encode "$obfs")&obfs-password=$(url_encode "$obfs_password")"
+        link+="#$(url_encode "${tag}-${name}")"
+        print_share_entry "$name" "链接" "$link"
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
       ;;
 
     anytls)
       while IFS= read -r name; do
         [[ -z $filter || $name == "$filter" ]] || continue
-        printf '用户: %s\n客户端 outbound JSON:\n' "$name"
-        client_json_for_anytls "$tag" "$name"
-        printf '\n'
-        _share_separator
+        json=$(client_json_for_anytls "$tag" "$name")
+        print_share_entry "$name" "客户端 outbound JSON" "$json"
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
       ;;
 
     socks|http|mixed)
       if [[ $(jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users//[])|length' "$CONFIG_FILE") == 0 ]]; then
-        printf '链接: %s://%s:%s\n' "$type" "$h" "$port"
-        _share_separator
+        case $type in
+          socks) print_share_entry "无认证" "配置" "SOCKS5  ${uri_host}:${port}" ;;
+          http) print_share_entry "无认证" "配置" "HTTP  ${uri_host}:${port}" ;;
+          mixed) print_share_entry "无认证" "配置" "Mixed(SOCKS+HTTP)  ${uri_host}:${port}" ;;
+        esac
       else
         while IFS=$'\t' read -r name value; do
           [[ -z $filter || $name == "$filter" ]] || continue
-          printf '用户: %s\n链接: %s://%s:%s@%s:%s\n' "$name" "$type" "$(url_encode "$name")" "$(url_encode "$value")" "$h" "$port"
-          _share_separator
+          case $type in
+            socks) print_share_entry "$name" "配置" "SOCKS5  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
+            http) print_share_entry "$name" "配置" "HTTP  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
+            mixed) print_share_entry "$name" "配置" "Mixed(SOCKS+HTTP)  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
+          esac
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
       ;;
   esac
+  share_separator
 }
