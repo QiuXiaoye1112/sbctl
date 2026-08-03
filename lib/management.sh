@@ -136,7 +136,7 @@ enable_bbr() {
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF_BBR
-  sysctl --system >/dev/null
+  sysctl -p /etc/sysctl.d/99-sbctl-bbr.conf >/dev/null
   [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == bbr ]] || die "BBR 未成功启用；当前内核可能不支持。"
   info "BBR 已启用。"
 }
