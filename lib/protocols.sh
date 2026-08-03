@@ -2,9 +2,9 @@
 # Mixed(SOCKS+HTTP) is intentionally not offered or created by sbctl.
 
 build_inbound() {
-  local __json=$1 __host=$2 __public=$3 choice type tag listen port client_host
+  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host
   local tls="" reality_public="" name="" password="" uuid="" flow=""
-  local obfs_choice="" obfs_password="" up="" down=""
+  local obfs_choice="" obfs_password="" up="" down="" hop_choice="" hop_range=""
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
   case $choice in
     1) type=anytls;;
@@ -49,6 +49,18 @@ build_inbound() {
       prompt_optional_positive_int down "下行限制 Mbps（留空=不限）"
       choose obfs_choice "QUIC 混淆" "关闭" "Salamander"
       if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)"; fi
+      if [[ -t 0 ]]; then
+        choose hop_choice "端口跳跃" "关闭" "开启"
+        if [[ $hop_choice == 2 ]]; then
+          while true; do
+            prompt_value hop_range "跳跃端口范围" "20000-50000"
+            validate_hy2_hop_range "$hop_range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
+            hy2_hop_check_conflicts "$tag" "$hop_range" || { warn "请换一个不冲突的端口范围。"; continue; }
+            break
+          done
+          warn "该范围内的入站 UDP 流量会重定向到此 Hysteria2 入站；请勿覆盖其他 UDP 服务使用的端口。"
+        fi
+      fi
       printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --arg up "$up" --arg down "$down" --arg obfs "$obfs_password" --argjson tls "$tls" '
         {type:"hysteria2",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} |
         if $up!="" then .up_mbps=($up|tonumber) else . end |
@@ -74,6 +86,7 @@ build_inbound() {
 
   printf -v "$__host" '%s' "$client_host"
   printf -v "$__public" '%s' "$reality_public"
+  [[ -z $__hop ]] || printf -v "$__hop" '%s' "$hop_range"
 }
 
 show_help() {
