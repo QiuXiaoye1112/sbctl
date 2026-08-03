@@ -285,7 +285,7 @@ modify_inbound_menu() {
     else
       printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
     fi
-    read -r -p "请选择: " choice || { echo; continue; }
+    read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
       2) run_menu_action modify_inbound_basic "$tag"; pause;;

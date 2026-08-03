@@ -65,7 +65,7 @@ outbound_menu() {
     heading "出站管理"
     list_outbound_overview
     printf '\n1) 选择入站设置出站\n2) 添加 SOCKS5/HTTP 出站\n3) 删除出站\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; continue; }
+    read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action assign_outbound; pause;;
       2) run_menu_action add_outbound; pause;;
@@ -90,7 +90,7 @@ manage_inbound_menu() {
     case $type in
       anytls|vless|trojan|hysteria2)
         printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
-        read -r -p "请选择: " choice || { echo; continue; }
+        read -r -p "请选择: " choice || { echo; return; }
         case $choice in
           1) run_menu_action print_share "$tag"; pause;;
           2) client_menu "$tag";;
@@ -102,7 +102,7 @@ manage_inbound_menu() {
       socks|http)
         if ((user_count > 0)); then
           printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
-          read -r -p "请选择: " choice || { echo; continue; }
+          read -r -p "请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
             2) client_menu "$tag";;
@@ -112,7 +112,7 @@ manage_inbound_menu() {
           esac
         else
           printf '1) 客户端配置\n2) 修改入站信息\n3) 查看 JSON\n0) 返回列表\n'
-          read -r -p "请选择: " choice || { echo; continue; }
+          read -r -p "请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
             2) modify_inbound_menu "$tag";;
@@ -134,7 +134,7 @@ inbound_menu() {
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
     printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; continue; }
+    read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
       2) select_inbound tag && manage_inbound_menu "$tag";;

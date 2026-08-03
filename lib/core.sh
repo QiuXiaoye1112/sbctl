@@ -92,7 +92,7 @@ choose() {
   printf '%s\n' "$prompt"
   for ((i=0;i<${#options[@]};i++)); do printf '  %d) %s\n' "$((i+1))" "${options[$i]}"; done
   while true; do
-    read -r -p "请选择 [1-${#options[@]}]: " __choice || { echo; continue; }
+    read -r -p "请选择 [1-${#options[@]}]: " __choice || { echo; return 1; }
     if [[ $__choice =~ ^[0-9]+$ ]] && ((__choice>=1 && __choice<=${#options[@]})); then
       printf -v "$__var" '%s' "$__choice"; return 0
     fi
