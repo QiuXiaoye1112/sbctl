@@ -106,17 +106,13 @@ print_share() {
 
     socks|http)
       if [[ $(jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users//[])|length' "$CONFIG_FILE") == 0 ]]; then
-        case $type in
-          socks) print_share_entry "无认证" "配置" "SOCKS5  ${uri_host}:${port}" ;;
-          http) print_share_entry "无认证" "配置" "HTTP  ${uri_host}:${port}" ;;
-        esac
+        link="${type}://${uri_host}:${port}  无认证"
+        print_share_entry "无认证" "链接" "$link"
       else
         while IFS=$'\t' read -r name value; do
           [[ -z $filter || $name == "$filter" ]] || continue
-          case $type in
-            socks) print_share_entry "$name" "配置" "SOCKS5  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
-            http) print_share_entry "$name" "配置" "HTTP  ${uri_host}:${port}  用户: ${name}  密码: ${value}" ;;
-          esac
+          link="${type}://$(url_encode "$name"):$(url_encode "$value")@${uri_host}:${port}#$(url_encode "${tag}-${name}")"
+          print_share_entry "$name" "链接" "$link"
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
       ;;
