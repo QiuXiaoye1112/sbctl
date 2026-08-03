@@ -68,6 +68,7 @@ hy2_hop_ensure_backend() {
 hy2_hop_restore_all() {
   [[ $(uname -s) == Linux ]] || return 0
   init_meta
+  [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
   local count tag range target start end cmd
   count=$(hy2_hop_enabled_count)
   if ((count == 0)); then
@@ -107,6 +108,7 @@ hy2_hop_restore_all() {
 }
 
 hy2_hop_boot_service_install() {
+  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0
   local target=${QUICK_COMMAND:-/usr/local/sbin/sbctl}
   case $(init_system) in
     systemd)
@@ -145,6 +147,7 @@ EOF_RC
 }
 
 hy2_hop_boot_service_remove() {
+  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0
   case $(init_system) in
     systemd)
       systemctl disable sbctl-hy2-hop.service >/dev/null 2>&1 || true
@@ -169,7 +172,7 @@ hy2_hop_sync() {
 }
 
 hy2_hop_check_conflicts() {
-  local tag=$1 range=$2 start end other other_port
+  local tag=$1 range=$2 start end other other_port other_range other_start other_end
   start=${range%-*}; end=${range#*-}
   while IFS=$'\t' read -r other other_port; do
     [[ $other == "$tag" ]] && continue
@@ -178,6 +181,15 @@ hy2_hop_check_conflicts() {
       return 1
     fi
   done < <(jq -r '.inbounds[]?|select(.type=="hysteria2")|[.tag,(.listen_port|tostring)]|@tsv' "$CONFIG_FILE")
+
+  while IFS=$'\t' read -r other other_range; do
+    [[ $other == "$tag" || -z $other_range ]] && continue
+    other_start=${other_range%-*}; other_end=${other_range#*-}
+    if ((10#$start <= 10#$other_end && 10#$end >= 10#$other_start)); then
+      warn "跳跃范围与 ${other} 的 ${other_range} 重叠。"
+      return 1
+    fi
+  done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
 }
 
 hy2_hop_configure() {
@@ -197,21 +209,27 @@ hy2_hop_configure() {
   while true; do
     prompt_value range "跳跃端口范围" "${current:-20000-50000}"
     validate_hy2_hop_range "$range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
-    hy2_hop_check_conflicts "$tag" "$range" || { warn "请换一个不与其他 Hysteria2 监听端口冲突的范围。"; continue; }
+    hy2_hop_check_conflicts "$tag" "$range" || { warn "请换一个不冲突的端口范围。"; continue; }
     break
   done
   warn "该范围内的入站 UDP 流量会被重定向到 ${tag}；请勿覆盖其他 UDP 服务使用的端口。"
   hy2_hop_meta_set "$tag" "$range"
-  hy2_hop_sync
+  if ! hy2_hop_sync; then
+    warn "端口跳跃规则应用失败，正在回滚。"
+    hy2_hop_meta_disable "$tag"
+    hy2_hop_sync >/dev/null 2>&1 || true
+    return 1
+  fi
   info "Hysteria2 端口跳跃已启用：${range} -> UDP $(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")"
 }
 
-# Preserve the implementations loaded before this module and wrap their lifecycle
-# so port-hopping rules stay synchronized with config/meta changes.
+# Preserve implementations loaded before this module and wrap their lifecycle.
 eval "$(declare -f modify_inbound_basic | sed '1s/^modify_inbound_basic/original_modify_inbound_basic/')"
 eval "$(declare -f delete_inbound | sed '1s/^delete_inbound/original_delete_inbound/')"
 eval "$(declare -f rename_inbound | sed '1s/^rename_inbound/original_rename_inbound/')"
 eval "$(declare -f uninstall_sing_box | sed '1s/^uninstall_sing_box/original_uninstall_sing_box/')"
+eval "$(declare -f print_share | sed '1s/^print_share/original_print_share/')"
+eval "$(declare -f dispatch | sed '1s/^dispatch/original_dispatch/')"
 
 add_inbound() {
   ensure_dependencies inbound-add; require_supported_core; ensure_config
@@ -223,7 +241,7 @@ add_inbound() {
   jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then
     meta_set_inbound "$tag" "$host" "$public"
-    if [[ $type == hysteria2 ]]; then
+    if [[ $type == hysteria2 && -t 0 ]]; then
       if ! hy2_hop_configure "$tag" 1; then warn "端口跳跃配置未完成；Hysteria2 入站本身已创建。"; fi
     fi
     heading "入站已创建"
@@ -249,9 +267,11 @@ rename_inbound() {
 }
 
 uninstall_sing_box() {
-  hy2_hop_clear_rules
-  hy2_hop_boot_service_remove
   original_uninstall_sing_box "$@"
+  if ! sing_box_installed; then
+    hy2_hop_clear_rules
+    hy2_hop_boot_service_remove
+  fi
 }
 
 modify_inbound_menu() {
@@ -277,6 +297,32 @@ modify_inbound_menu() {
   done
 }
 
+print_share() {
+  ensure_config
+  local tag=${1-} filter=${2-} type host share_host port share_port name password sni obfs obfs_password link
+  [[ -n $tag ]] || select_inbound tag || return
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  [[ $type == hysteria2 ]] || { original_print_share "$tag" "$filter"; return; }
+
+  host=$(public_host_for_tag "$tag") || die "无法确定入站 ${tag} 的客户端连接地址。"
+  share_host=$(uri_host "$host")
+  port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  share_port=$(hy2_hop_client_port_spec "$tag" "$port")
+  sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
+  obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
+  obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
+  heading "${tag} 分享信息"
+  while IFS=$'\t' read -r name password; do
+    [[ -z $filter || $name == "$filter" ]] || continue
+    link="hysteria2://$(url_encode "$password")@${share_host}:${share_port}?sni=$(url_encode "$sni")"
+    [[ -z $obfs ]] || link+="&obfs=$(url_encode "$obfs")&obfs-password=$(url_encode "$obfs_password")"
+    link+="#$(url_encode "${tag}-${name}")"
+    print_share_entry "$name" "链接" "$link"
+  done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
+  share_separator
+}
+
 internal_hy2_hop_restore() {
   require_root internal-hy2-hop-restore
   hy2_hop_restore_all
@@ -285,4 +331,12 @@ internal_hy2_hop_restore() {
 internal_hy2_hop_clear() {
   require_root internal-hy2-hop-clear
   hy2_hop_clear_rules
+}
+
+dispatch() {
+  case ${1:-menu} in
+    internal-hy2-hop-restore) internal_hy2_hop_restore;;
+    internal-hy2-hop-clear) internal_hy2_hop_clear;;
+    *) original_dispatch "$@";;
+  esac
 }
