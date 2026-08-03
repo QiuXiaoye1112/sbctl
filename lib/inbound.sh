@@ -104,7 +104,7 @@ build_inbound() {
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" "Mixed(SOCKS+HTTP)"
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
-  prompt_value listen "监听地址" "::"
+  prompt_value listen "监听地址" "0.0.0.0"
   prompt_port port 443
   prompt_public_host client_host
 
@@ -237,7 +237,7 @@ modify_inbound_basic() {
   local tag=${1-} listen port host tmp
   [[ -n $tag ]] || select_inbound tag || return
   inbound_exists "$tag" || die "找不到入站：$tag"
-  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "::"' "$CONFIG_FILE")"
+  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")"
   prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag"
   prompt_public_host host "$(public_host_for_tag "$tag")"
   tmp=$(temp_file)
