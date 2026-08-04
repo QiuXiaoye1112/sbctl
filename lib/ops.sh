@@ -124,10 +124,10 @@ issue_certificate() {
   local certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email")
   if [[ $mode == ip ]]; then
     certbot_args+=(--preferred-profile shortlived --ip-address "$domain")
-    setup_certbot_renewal_timer
   else
     certbot_args+=(-d "$domain")
   fi
+  setup_certbot_renewal_timer
   if ! certbot "${certbot_args[@]}"; then
     if ((active)); then service_start; CERT_STOPPED_SERVICE=0; fi
     warn "证书签发失败，请查看上方 Certbot 输出的具体原因。"

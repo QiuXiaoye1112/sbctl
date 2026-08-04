@@ -116,12 +116,6 @@ sing_box_version_summary() {
   [[ -n $version ]] && printf '%s' "$version" || printf '已安装'
 }
 
-test_certificate_renewal() {
-  ensure_dependencies cert-renew
-  install_certbot
-  certbot renew --dry-run || { warn "续期测试失败，请查看上方 Certbot 输出的具体原因。"; return 0; }
-}
-
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
     [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'

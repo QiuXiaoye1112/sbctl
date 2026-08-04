@@ -91,14 +91,13 @@ certificate_menu() {
   while true; do
     clear_screen; heading "TLS 证书"
     printf '托管证书: %s\n\n' "$(managed_certificate_count)"
-    printf '1) Let\x27s Encrypt 自动签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n5) 测试自动续期\n0) 返回\n'
+    printf '1) Let\x27s Encrypt 自动签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action issue_certificate; pause;;
       2) run_menu_action import_certificate; pause;;
       3) run_menu_action list_certificates; pause;;
       4) run_menu_action delete_certificate; pause;;
-      5) run_menu_action test_certificate_renewal; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -218,7 +217,7 @@ sbctl - sing-box Linux 管理器
 
   sbctl link [标签] [用户]           输出分享信息/客户端 JSON
   sbctl config check|show|edit
-  sbctl cert list|renew-test
+  sbctl cert list
   sbctl cert issue [域名] [邮箱]
   sbctl cert import [标识] [证书] [私钥]
   sbctl cert delete [标识]
@@ -261,7 +260,7 @@ dispatch() {
       case ${1:-check} in check|test) check_config;; show) ensure_config; jq . "$CONFIG_FILE";; edit) edit_config;; *) die "未知 config 子命令。";; esac;;
     cert)
       case ${1:-list} in list) list_certificates;; issue) issue_certificate "${2-}" "${3-}";; import) import_certificate "${2-}" "${3-}" "${4-}";;
-        delete|remove) delete_certificate "${2-}";; renew-test|test) test_certificate_renewal;; *) die "未知 cert 子命令。";; esac;;
+        delete|remove) delete_certificate "${2-}";; *) die "未知 cert 子命令。";; esac;;
     backup) backup_all "${1-}";; restore) restore_backup "${1-}";;
     bbr) toggle_bbr;; diagnose|doctor) system_diagnostics;; quick-command) repair_quick_command;;
     *) error "未知命令：$cmd"; show_help; return 2;;
