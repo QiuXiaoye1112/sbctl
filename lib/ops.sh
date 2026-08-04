@@ -121,6 +121,12 @@ issue_certificate() {
   done
   install_certbot "$mode"
   if [[ -f ${CERT_DIR}/${domain}.crt && -f ${CERT_DIR}/${domain}.key ]]; then
+    local using_inbounds
+    using_inbounds=$(jq -r --arg cert "${CERT_DIR}/${domain}.crt" \
+      '.inbounds[]?|select(.tls.certificate_path==$cert)|.tag' "$CONFIG_FILE" 2>/dev/null | paste -sd ',')
+    if [[ -n $using_inbounds ]]; then
+      info "证书 ${domain} 正在被入站使用：${using_inbounds}"
+    fi
     confirm "证书 ${domain} 已存在，是否强制重新签发？" N || { info "已取消。"; return 0; }
   fi
   service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
