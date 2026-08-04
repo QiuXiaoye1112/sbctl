@@ -27,7 +27,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || warn "无法获得 REALITY 公钥。"; return 0
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -52,7 +52,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || warn "无法获得 REALITY 公钥。"; return 0
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -72,7 +72,7 @@ print_share() {
       ;;
 
     hysteria2)
-      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || warn "Hysteria2 必须启用 TLS。"; return 0
+      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "Hysteria2 必须启用 TLS。"; return 0; }
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
       obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
       obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
@@ -88,7 +88,7 @@ print_share() {
     anytls)
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
-      [[ $tls_enabled == true ]] || warn "AnyTLS 入站未启用 TLS，无法生成分享信息。"; return 0
+      [[ $tls_enabled == true ]] || { warn "AnyTLS 入站未启用 TLS，无法生成分享信息。"; return 0; }
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         while IFS= read -r name; do
           [[ -z $filter || $name == "$filter" ]] || continue
