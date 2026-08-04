@@ -305,7 +305,7 @@ print_share() {
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   [[ $type == hysteria2 ]] || { original_print_share "$tag" "$filter"; return; }
 
-  host=$(public_host_for_tag "$tag") || die "无法确定入站 ${tag} 的客户端连接地址。"
+  host=$(public_host_for_tag "$tag") || { warn "无法确定入站 ${tag} 的客户端连接地址。"; return 0; }
   share_host=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   share_port=$(hy2_hop_client_port_spec "$tag" "$port")

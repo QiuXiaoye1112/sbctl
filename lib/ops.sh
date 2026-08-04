@@ -5,7 +5,7 @@ import_certificate() {
   [[ $identifier =~ ^[A-Za-z0-9_.-]+$ ]] || die "证书标识无效。"
   [[ -n $cert ]] || prompt_value cert "证书文件路径"
   [[ -n $key ]] || prompt_value key "私钥文件路径"
-  validate_certificate_pair "$cert" "$key" || die "证书或私钥无效/不匹配。"
+  validate_certificate_pair "$cert" "$key" || { warn "证书或私钥无效/不匹配。"; return 0; }
   mkdir -p "$CERT_DIR"
   install -m 600 "$cert" "$CERT_DIR/${identifier}.crt"
   install -m 600 "$key" "$CERT_DIR/${identifier}.key"
@@ -177,7 +177,7 @@ restore_backup() {
   local archive=${1-} temp extract_config snapshot had_meta=0 had_certs=0
   [[ -n $archive ]] || prompt_value archive "备份文件路径"
   [[ -r $archive ]] || die "无法读取备份。"
-  tar -tzf "$archive" >/dev/null || die "不是有效 tar.gz。"
+  tar -tzf "$archive" >/dev/null || { warn "不是有效的 tar.gz 备份。"; return 0; }
   if tar -tzf "$archive" | awk 'BEGIN{bad=0} /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END{exit !bad}'; then die "备份包含不安全路径。"; fi
   extract_config="${CONFIG_FILE#/}"
   temp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-restore.XXXXXX")
