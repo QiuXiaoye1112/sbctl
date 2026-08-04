@@ -16,7 +16,7 @@ print_share() {
   [[ -n $tag ]] || select_inbound tag || return
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  host=$(public_host_for_tag "$tag") || die "无法确定入站 ${tag} 的客户端连接地址。"
+  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"
   uri_host=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   heading "${tag} 分享信息"
@@ -27,12 +27,12 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || die "无法获得 REALITY 公钥。"
+        public=$(reality_public_key "$tag") || warn "无法获得 REALITY 公钥。"; return 0
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
       else
-        die "VLESS 入站未启用 TLS/REALITY，无法生成分享链接。"
+        warn "VLESS 入站未启用 TLS/REALITY，无法生成分享链接。"; return 0
       fi
       while IFS=$'\t' read -r name value flow; do
         [[ -z $filter || $name == "$filter" ]] || continue
@@ -52,12 +52,12 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || die "无法获得 REALITY 公钥。"
+        public=$(reality_public_key "$tag") || warn "无法获得 REALITY 公钥。"; return 0
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
       else
-        die "Trojan 入站未启用 TLS/REALITY，无法生成分享链接。"
+        warn "Trojan 入站未启用 TLS/REALITY，无法生成分享链接。"; return 0
       fi
       while IFS=$'\t' read -r name value; do
         [[ -z $filter || $name == "$filter" ]] || continue
@@ -72,7 +72,7 @@ print_share() {
       ;;
 
     hysteria2)
-      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || die "Hysteria2 必须启用 TLS。"
+      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || warn "Hysteria2 必须启用 TLS。"; return 0
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
       obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
       obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
@@ -88,7 +88,7 @@ print_share() {
     anytls)
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
-      [[ $tls_enabled == true ]] || die "AnyTLS 入站未启用 TLS，无法生成分享信息。"
+      [[ $tls_enabled == true ]] || warn "AnyTLS 入站未启用 TLS，无法生成分享信息。"; return 0
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         while IFS= read -r name; do
           [[ -z $filter || $name == "$filter" ]] || continue
@@ -117,7 +117,7 @@ print_share() {
       fi
       ;;
     *)
-      die "该入站协议不提供 sbctl 分享信息：${type}"
+      warn "该入站协议不提供 sbctl 分享信息：${type}"; return 0
       ;;
   esac
   share_separator

@@ -238,10 +238,10 @@ delete_outbound() {
     ((${#tags[@]})) || { warn "没有可删除的代理出站。"; return 0; }
     if ((${#tags[@]} == 1)); then tag=${tags[0]}; else choose answer "选择出站" "${tags[@]}"; tag=${tags[$((answer-1))]}; fi
   fi
-  [[ $tag != direct ]] || die "direct 出站不能删除。"
+  [[ $tag != direct ]] || warn "direct 出站不能删除。"; return 0
   outbound_exists "$tag" || die "找不到出站：$tag"
   manual_refs=$(jq -r --arg tag "$tag" '[.route.rules[]? | select(.outbound==$tag) | select((.action=="route" and ((.inbound//[])|length)==1 and ((keys_unsorted|sort)==(["action","inbound","outbound"]|sort))) | not)] | length' "$CONFIG_FILE")
-  ((manual_refs == 0)) || die "该出站仍被自定义路由规则引用，请先在完整配置中处理。"
+  ((manual_refs == 0)) || warn "该出站仍被自定义路由规则引用，请先在完整配置中处理。"; return 0
   confirm "删除出站 ${tag}？使用它的 sbctl 入站绑定会恢复 direct。" N || return
   tmp=$(temp_file)
   jq --arg tag "$tag" '

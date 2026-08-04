@@ -19,7 +19,10 @@ certbot_supports_ip() {
 install_certbot() {
   local mode=${1:-domain}
   if command_exists certbot; then
-    [[ $mode != ip ]] || certbot_supports_ip || die "当前 Certbot 不支持 IP 证书，请升级 certbot 或使用域名证书。"
+    if [[ $mode == ip ]] && ! certbot_supports_ip; then
+      warn "当前 Certbot 不支持 IP 证书，请升级 certbot 或使用域名证书。"
+      return 0
+    fi
     return 0
   fi
   if [[ $mode == ip ]] && ! certbot_supports_ip 2>/dev/null; then
@@ -105,7 +108,7 @@ delete_certificate() {
   ensure_dependencies cert-delete
   local identifier=${1-}
   [[ -n $identifier ]] || select_managed_certificate identifier || return
-  if jq -e --arg cert "$CERT_DIR/${identifier}.crt" '.inbounds[]?|select(.tls.certificate_path==$cert)' "$CONFIG_FILE" >/dev/null; then die "该证书正在被入站使用，不能删除。"; fi
+  if jq -e --arg cert "$CERT_DIR/${identifier}.crt" '.inbounds[]?|select(.tls.certificate_path==$cert)' "$CONFIG_FILE" >/dev/null; then warn "该证书正在被入站使用，不能删除。"; return 0; fi
   confirm "删除托管证书 ${identifier}？" N || return
   rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" "/etc/letsencrypt/renewal-hooks/deploy/sbctl-${identifier}"
   info "证书已删除。"

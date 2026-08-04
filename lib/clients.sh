@@ -30,7 +30,7 @@ add_client() {
     socks|http|mixed)
       prompt_secret password "密码" "$(random_password)"
       user=$(jq -n --arg username "$name" --arg password "$password" '{username:$username,password:$password}') ;;
-    *) die "该协议不支持用户管理。";;
+    *) warn "该协议不支持用户管理。"; return 0;;
   esac
   tmp=$(temp_file)
   jq --arg tag "$tag" --argjson user "$user" '(.inbounds[]|select(.tag==$tag)|.users) += [$user]' "$CONFIG_FILE" >"$tmp"
@@ -90,12 +90,12 @@ rotate_client_credential() {
 
 client_json_for_anytls() {
   local tag=$1 name=$2 host port password sni public sid
-  host=$(public_host_for_tag "$tag") || die "无法确定入站 ${tag} 的客户端连接地址。"; port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"; port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   password=$(jq -r --arg tag "$tag" --arg name "$name" '.inbounds[]|select(.tag==$tag)|.users[]|select(.name==$name)|.password' "$CONFIG_FILE")
   sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
-  jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || die "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"
+  jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || warn "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"; return 0
   if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-    public=$(reality_public_key "$tag") || die "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"
+    public=$(reality_public_key "$tag") || warn "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"
     sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
     jq -n --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg public "$public" --arg sid "$sid" '{type:"anytls",tag:"proxy",server:$host,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$public,short_id:$sid}}}'
   else
@@ -108,7 +108,7 @@ print_share() {
   local tag=${1-} filter=${2-} type host h port name value sni public sid security tls_enabled obfs obfs_password
   [[ -n $tag ]] || select_inbound tag || return
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  host=$(public_host_for_tag "$tag") || die "无法确定入站 ${tag} 的客户端连接地址。"; h=$(uri_host "$host")
+  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"; h=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   heading "${tag} 分享信息"
   case $type in
@@ -116,9 +116,9 @@ print_share() {
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-        security=reality; public=$(reality_public_key "$tag") || die "REALITY 公钥元数据缺失或与当前私钥不匹配。"; sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
+        security=reality; public=$(reality_public_key "$tag") || warn "REALITY 公钥元数据缺失或与当前私钥不匹配。"; sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then security=tls
-      else die "VLESS 入站未启用 TLS/REALITY，sbctl 不生成不受支持的分享链接。"
+      else warn "VLESS 入站未启用 TLS/REALITY，sbctl 不生成不受支持的分享链接。"; return 0
       fi
       while IFS=$'\t' read -r name value; do
         [[ -z $filter || $name == "$filter" ]] || continue
@@ -133,9 +133,9 @@ print_share() {
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-        security=reality; public=$(reality_public_key "$tag") || die "REALITY 公钥元数据缺失或与当前私钥不匹配。"; sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
+        security=reality; public=$(reality_public_key "$tag") || warn "REALITY 公钥元数据缺失或与当前私钥不匹配。"; sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then security=tls
-      else die "Trojan 入站未启用 TLS/REALITY，sbctl 不生成不受支持的分享链接。"
+      else warn "Trojan 入站未启用 TLS/REALITY，sbctl 不生成不受支持的分享链接。"; return 0
       fi
       while IFS=$'\t' read -r name value; do
         [[ -z $filter || $name == "$filter" ]] || continue
@@ -155,7 +155,7 @@ print_share() {
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
       ;;
     hysteria2)
-      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || die "Hysteria2 必须启用 TLS。"
+      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || warn "Hysteria2 必须启用 TLS。"; return 0
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
       obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
       obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
