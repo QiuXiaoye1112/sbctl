@@ -120,8 +120,11 @@ issue_certificate() {
     email=""
   done
   install_certbot "$mode"
+  if [[ -f ${CERT_DIR}/${domain}.crt ]]; then
+    confirm "证书 ${domain} 已存在，是否强制重新签发？" N || { info "已取消。"; return 0; }
+  fi
   service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
-  local certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email")
+  local certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email" --force-renewal)
   if [[ $mode == ip ]]; then
     certbot_args+=(--preferred-profile shortlived --ip-address "$domain")
   else
