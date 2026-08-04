@@ -127,7 +127,7 @@ issue_certificate() {
   if [[ $mode == domain ]]; then
     choose verify_method "选择验证方式" "DNS (Cloudflare, 推荐)" "HTTP (需要 80 端口可访问)"
     if [[ $verify_method == 1 ]]; then
-      install_certbot_dns_plugin
+      install_certbot_dns_plugin || return 0
       if [[ ! -f $CF_CREDENTIALS_FILE ]]; then
         local cf_token
         prompt_secret cf_token "Cloudflare API Token (Zone:DNS:Edit 权限)"
@@ -184,7 +184,11 @@ issue_certificate() {
   install -m 600 "/etc/letsencrypt/live/${domain}/fullchain.pem" "$CERT_DIR/${domain}.crt"
   install -m 600 "/etc/letsencrypt/live/${domain}/privkey.pem" "$CERT_DIR/${domain}.key"
   write_certbot_hook "$domain"
-  if ((active)); then service_start; CERT_STOPPED_SERVICE=0; fi
+  if ((active)); then
+    service_start; CERT_STOPPED_SERVICE=0
+  elif [[ $verify_method == dns ]] && service_is_active; then
+    service_restart
+  fi
   info "证书已签发并托管：${domain}"
 }
 
