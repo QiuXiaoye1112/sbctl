@@ -130,7 +130,7 @@ issue_certificate() {
   fi
   if ! certbot "${certbot_args[@]}"; then
     if ((active)); then service_start; CERT_STOPPED_SERVICE=0; fi
-    warn "证书签发失败；确认 ${domain} 的 TCP 80 可从公网访问。"
+    warn "证书签发失败，请查看上方 Certbot 输出的具体原因。"
     return 0
   fi
   mkdir -p "$CERT_DIR"
