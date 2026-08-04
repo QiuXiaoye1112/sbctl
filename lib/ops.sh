@@ -97,9 +97,17 @@ EOF
   esac
 }
 
+CF_CREDENTIALS_FILE="${SBCTL_CF_CREDENTIALS:-/etc/letsencrypt/cloudflare.ini}"
+
+install_certbot_dns_plugin() {
+  command_exists pip3 || install_packages python3-pip
+  if python3 -c 'import certbot_dns_cloudflare' 2>/dev/null; then return 0; fi
+  pip3 install certbot-dns-cloudflare >/dev/null 2>&1 || die "certbot-dns-cloudflare 安装失败。"
+}
+
 issue_certificate() {
   ensure_dependencies cert-issue
-  local domain=${1-} email=${2-} active=0 mode=domain default_domain=""
+  local domain=${1-} email=${2-} active=0 mode=domain verify_method=http default_domain=""
   if [[ -z $domain ]]; then
     default_domain=$(detect_public_ipv4 || true)
     [[ -n $default_domain ]] || default_domain=$(detect_public_ipv6 || true)
@@ -113,6 +121,25 @@ issue_certificate() {
     if validate_ip_literal "$domain"; then mode=ip
     elif ! validate_domain "$domain"; then die "证书域名/IP 无效。"; fi
   fi
+
+  # 域名可选 DNS 验证，IP 只能用 HTTP
+  if [[ $mode == domain ]]; then
+    choose verify_method "选择验证方式" "DNS (Cloudflare, 推荐)" "HTTP (需要 80 端口可访问)"
+    if [[ $verify_method == 1 ]]; then
+      install_certbot_dns_plugin
+      if [[ ! -f $CF_CREDENTIALS_FILE ]]; then
+        local cf_token
+        prompt_secret cf_token "Cloudflare API Token (Zone:DNS:Edit 权限)"
+        [[ -n $cf_token ]] || { warn "API Token 不能为空。"; return 0; }
+        mkdir -p "$(dirname "$CF_CREDENTIALS_FILE")"
+        printf 'dns_cloudflare_api_token = %s\n' "$cf_token" >"$CF_CREDENTIALS_FILE"
+        chmod 600 "$CF_CREDENTIALS_FILE"
+        info "API Token 已保存至 ${CF_CREDENTIALS_FILE}"
+      fi
+      verify_method=dns
+    fi
+  fi
+
   while [[ -z $email ]]; do
     prompt_value email "Let's Encrypt 联系邮箱"
     if [[ $email == *@*.* && $email != *" "* ]]; then break; fi
@@ -130,12 +157,18 @@ issue_certificate() {
       confirm "证书 ${domain} 已存在，是否强制重新签发？" N || { info "已取消。"; return 0; }
     fi
   fi
-  service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
-  local certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email" --force-renewal)
+
+  local certbot_args
+  if [[ $verify_method == dns ]]; then
+    certbot_args=(certonly --non-interactive --agree-tos -m "$email" --force-renewal
+      --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDENTIALS_FILE" -d "$domain")
+  else
+    service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
+    certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email" --force-renewal -d "$domain")
+  fi
+
   if [[ $mode == ip ]]; then
     certbot_args+=(--preferred-profile shortlived --ip-address "$domain")
-  else
-    certbot_args+=(-d "$domain")
   fi
   setup_certbot_renewal_timer
   if ! certbot "${certbot_args[@]}"; then
