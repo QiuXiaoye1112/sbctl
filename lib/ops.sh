@@ -120,7 +120,7 @@ issue_certificate() {
     email=""
   done
   install_certbot "$mode"
-  if [[ -f ${CERT_DIR}/${domain}.crt ]]; then
+  if [[ -f ${CERT_DIR}/${domain}.crt && -f ${CERT_DIR}/${domain}.key ]]; then
     if [[ -f /etc/letsencrypt/renewal/${domain}.conf ]]; then
       confirm "证书 ${domain} 已存在，是否强制重新签发？" N || { info "已取消。"; return 0; }
     else
