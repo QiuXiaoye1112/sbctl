@@ -61,22 +61,70 @@ EOF_HOOK
   chmod 700 "$hook"
 }
 
+setup_certbot_renewal_timer() {
+  local certbot_path
+  certbot_path=$(command -v certbot) || return 1
+  case $(init_system) in
+    systemd)
+      cat >/etc/systemd/system/sbctl-certbot-renew.service <<EOF
+[Unit]
+Description=Renew certificates managed by sbctl
+[Service]
+Type=oneshot
+ExecStart=${certbot_path} renew --quiet
+EOF
+      cat >/etc/systemd/system/sbctl-certbot-renew.timer <<'EOF'
+[Unit]
+Description=Renew certificates managed by sbctl
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload
+      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
+      ;;
+    openrc)
+      mkdir -p /etc/periodic/daily
+      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF
+#!/bin/sh
+${certbot_path} renew --quiet
+EOF
+      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
+      ;;
+  esac
+}
+
 issue_certificate() {
   ensure_dependencies cert-issue
-  local domain=${1-} email=${2-} active=0 mode=domain
-  while true; do
-    [[ -n $domain ]] || prompt_value domain "证书域名/IP"
-    if validate_ip_literal "$domain"; then mode=ip; break; fi
-    if validate_domain "$domain"; then break; fi
-    warn "证书域名/IP 无效，请重新输入。"
-    domain=""
+  local domain=${1-} email=${2-} active=0 mode=domain default_domain=""
+  if [[ -z $domain ]]; then
+    default_domain=$(detect_public_ipv4 || true)
+    [[ -n $default_domain ]] || default_domain=$(detect_public_ipv6 || true)
+    while true; do
+      prompt_value domain "证书域名/IP" "$default_domain"
+      if validate_ip_literal "$domain"; then mode=ip; break; fi
+      if validate_domain "$domain"; then break; fi
+      warn "证书域名/IP 无效，请重新输入。"
+    done
+  else
+    if validate_ip_literal "$domain"; then mode=ip
+    elif ! validate_domain "$domain"; then die "证书域名/IP 无效。"; fi
+  fi
+  while [[ -z $email ]]; do
+    prompt_value email "Let's Encrypt 联系邮箱"
+    if [[ $email == *@*.* && $email != *" "* ]]; then break; fi
+    warn "邮箱格式无效，请重新输入。"
+    email=""
   done
-  [[ -n $email ]] || prompt_value email "Let's Encrypt 联系邮箱"
   install_certbot "$mode"
   service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
   local certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email")
   if [[ $mode == ip ]]; then
     certbot_args+=(--preferred-profile shortlived --ip-address "$domain")
+    setup_certbot_renewal_timer
   else
     certbot_args+=(-d "$domain")
   fi
