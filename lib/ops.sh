@@ -12,9 +12,23 @@ import_certificate() {
   info "证书已导入：${identifier}"
 }
 
+certbot_supports_ip() {
+  command_exists certbot && certbot --help all 2>/dev/null | grep -q -- '--ip-address'
+}
+
 install_certbot() {
-  command_exists certbot && return 0
-  install_packages certbot
+  local mode=${1:-domain}
+  if command_exists certbot; then
+    [[ $mode != ip ]] || certbot_supports_ip || die "当前 Certbot 不支持 IP 证书，请升级 certbot 或使用域名证书。"
+    return 0
+  fi
+  if [[ $mode == ip ]] && ! certbot_supports_ip 2>/dev/null; then
+    # 系统 certbot 可能太旧，用 pip 安装新版
+    install_packages python3 python3-pip || die "Python/pip 安装失败。"
+    pip3 install certbot >/dev/null 2>&1 || install_packages certbot
+  else
+    install_packages certbot
+  fi
 }
 
 write_certbot_hook() {
@@ -46,14 +60,25 @@ EOF_HOOK
 
 issue_certificate() {
   ensure_dependencies cert-issue
-  local domain=${1-} email=${2-} active=0
-  [[ -n $domain ]] || prompt_value domain "证书域名"
-  validate_domain "$domain" || die "目前自动签发只支持域名证书。"
+  local domain=${1-} email=${2-} active=0 mode=domain
+  [[ -n $domain ]] || prompt_value domain "证书域名/IP"
+  if validate_ip_literal "$domain"; then
+    mode=ip
+  elif ! validate_domain "$domain"; then
+    die "证书域名/IP 无效。"
+  fi
   [[ -n $email ]] || prompt_value email "Let's Encrypt 联系邮箱"
-  install_certbot
+  install_certbot "$mode"
   service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
-  if ! certbot certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email" -d "$domain"; then
-    die "证书签发失败；确认域名解析正确且 TCP 80 可访问。"
+  local certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email")
+  if [[ $mode == ip ]]; then
+    certbot_args+=(--preferred-profile shortlived --ip-address "$domain")
+  else
+    certbot_args+=(-d "$domain")
+  fi
+  if ! certbot "${certbot_args[@]}"; then
+    if ((active)); then service_start; CERT_STOPPED_SERVICE=0; fi
+    die "证书签发失败；确认 ${domain} 的 TCP 80 可从公网访问。"
   fi
   mkdir -p "$CERT_DIR"
   install -m 600 "/etc/letsencrypt/live/${domain}/fullchain.pem" "$CERT_DIR/${domain}.crt"
