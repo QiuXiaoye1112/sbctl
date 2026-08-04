@@ -61,12 +61,13 @@ EOF_HOOK
 issue_certificate() {
   ensure_dependencies cert-issue
   local domain=${1-} email=${2-} active=0 mode=domain
-  [[ -n $domain ]] || prompt_value domain "证书域名/IP"
-  if validate_ip_literal "$domain"; then
-    mode=ip
-  elif ! validate_domain "$domain"; then
-    die "证书域名/IP 无效。"
-  fi
+  while true; do
+    [[ -n $domain ]] || prompt_value domain "证书域名/IP"
+    if validate_ip_literal "$domain"; then mode=ip; break; fi
+    if validate_domain "$domain"; then break; fi
+    warn "证书域名/IP 无效，请重新输入。"
+    domain=""
+  done
   [[ -n $email ]] || prompt_value email "Let's Encrypt 联系邮箱"
   install_certbot "$mode"
   service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
@@ -78,7 +79,8 @@ issue_certificate() {
   fi
   if ! certbot "${certbot_args[@]}"; then
     if ((active)); then service_start; CERT_STOPPED_SERVICE=0; fi
-    die "证书签发失败；确认 ${domain} 的 TCP 80 可从公网访问。"
+    warn "证书签发失败；确认 ${domain} 的 TCP 80 可从公网访问。"
+    return 0
   fi
   mkdir -p "$CERT_DIR"
   install -m 600 "/etc/letsencrypt/live/${domain}/fullchain.pem" "$CERT_DIR/${domain}.crt"
