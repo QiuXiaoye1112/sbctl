@@ -45,12 +45,14 @@ _local_tag_for_ip() {
 }
 
 _ensure_local_outbound() {
-  local ip=$1 tag tmp
+  local ip=$1 tag tmp bind_field
   tag=$(_local_tag_for_ip "$ip")
   outbound_exists "$tag" && { printf '%s' "$tag"; return 0; }
+  # sing-box uses inet4_bind_address / inet6_bind_address
+  if [[ $ip == *:* ]]; then bind_field=inet6_bind_address; else bind_field=inet4_bind_address; fi
   tmp=$(temp_file)
-  jq --arg tag "$tag" --arg ip "$ip" \
-    '.outbounds += [{type:"direct",tag:$tag,bind:$ip}]' \
+  jq --arg tag "$tag" --arg ip "$ip" --arg field "$bind_field" \
+    '.outbounds += [{type:"direct",tag:$tag} + {($field):$ip}]' \
     "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp" >&2; then
     printf '%s' "$tag"
@@ -90,7 +92,7 @@ list_outbound_overview() {
       outbound=$(current_outbound_for_inbound "$inbound")
       local display="$outbound"
       if [[ $outbound =~ ^local- ]]; then
-        local ip; ip=$(jq -r --arg tag "$outbound" '.outbounds[]?|select(.tag==$tag)|.bind // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        local ip; ip=$(jq -r --arg tag "$outbound" '.outbounds[]?|select(.tag==$tag)|(.inet4_bind_address // .inet6_bind_address // empty)' "$CONFIG_FILE" 2>/dev/null || true)
         display="${ip:-$outbound}"
       fi
       print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$display"
@@ -194,7 +196,7 @@ select_outbound() {
   selected=${tags[$((answer-1))]}
   if [[ $selected =~ ^local- ]]; then
     local ip=""
-    ip=$(jq -r --arg tag "$selected" '.outbounds[]?|select(.tag==$tag)|.bind // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    ip=$(jq -r --arg tag "$selected" '.outbounds[]?|select(.tag==$tag)|(.inet4_bind_address // .inet6_bind_address // empty)' "$CONFIG_FILE" 2>/dev/null || true)
     if [[ -z $ip ]]; then
       for ((i=0; i<${#local_ip_tags[@]}; i++)); do
         [[ ${local_ip_tags[$i]} == "$selected" ]] && { ip="${local_raw_ips[$i]}"; break; }
