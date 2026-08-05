@@ -132,7 +132,7 @@ command_background="yes"
 pidfile="/run/${SERVICE_NAME}.pid"
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.log"
-depend() { need net; after firewall; }
+depend() { need net; }
 EOF_RC
       chmod 755 "${OPENRC_INIT_DIR}/$SERVICE_NAME"
       ;;
