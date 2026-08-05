@@ -106,7 +106,7 @@ bash -c '
   }
   prompt_hy2_internal_port() { printf -v "$1" "%s" 60000; }
   prompt_public_host() { printf -v "$1" "%s" 203.0.113.10; }
-  build_certificate_tls() { printf -v "$1" "%s" '{"enabled":true,"server_name":"example.com","certificate_path":"/tmp/a.crt","key_path":"/tmp/a.key"}'; }
+  build_certificate_tls() { printf -v "$1" "%s" "{\"enabled\":true,\"server_name\":\"example.com\",\"certificate_path\":\"/tmp/a.crt\",\"key_path\":\"/tmp/a.key\"}"; }
   prompt_secret() { printf -v "$1" "%s" secret; }
   prompt_optional_positive_int() { printf -v "$1" "%s" ""; }
   hy2_hop_check_conflicts() { return 0; }
