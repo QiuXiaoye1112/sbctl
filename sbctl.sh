@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.2.21"
+readonly SBCTL_VERSION="0.3.0"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main/sbctl.sh}"
 readonly OFFICIAL_INSTALLER_URL="https://sing-box.app/install.sh"
@@ -24,6 +24,11 @@ DATA_DIR="${SBCTL_DATA_DIR:-/var/lib/sing-box}"
 SYSTEMD_UNIT_DIR="${SBCTL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 OPENRC_INIT_DIR="${SBCTL_OPENRC_INIT_DIR:-/etc/init.d}"
 CERTBOT_HOOK_DIR="${SBCTL_CERTBOT_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
+CERTBOT_VENV="${SBCTL_CERTBOT_VENV:-/opt/sbctl/certbot}"
+CERTBOT_BIN="${SBCTL_CERTBOT_BIN:-${CERTBOT_VENV}/bin/certbot}"
+CERTBOT_CONFIG_DIR="${SBCTL_CERTBOT_CONFIG_DIR:-/var/lib/sbctl/letsencrypt}"
+CERTBOT_WORK_DIR="${SBCTL_CERTBOT_WORK_DIR:-/var/lib/sbctl/certbot-work}"
+CERTBOT_LOGS_DIR="${SBCTL_CERTBOT_LOGS_DIR:-/var/log/sbctl/certbot}"
 CERT_STOPPED_SERVICE=0
 
 SBCTL_ENTRYPOINT="${SBCTL_ENTRYPOINT:-$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")}"
@@ -37,7 +42,7 @@ else
 fi
 unset _repo_lib
 
-for _module in core ui engine compat inbound certificate reality outbound clients share ops management menu protocols layout hy2_hop hy2_create hy2_nft; do
+for _module in core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements; do
   [[ -r "$LIB_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$LIB_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$LIB_DIR/${_module}.sh"
