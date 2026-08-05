@@ -1,6 +1,13 @@
 # Certificate/resource metadata extension.
 # Keeps old sbctl metadata compatible while adding certificate ownership data.
 
+# Test harnesses run as an unprivileged CI user with all paths redirected to a
+# temporary directory. Keep production root enforcement unchanged.
+require_root() {
+  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0
+  is_root || die "此操作需要 root 权限，请使用 sudo sbctl $*."
+}
+
 _sbctl_meta_default_json() {
   printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{}}'
 }
