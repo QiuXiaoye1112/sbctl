@@ -5,10 +5,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 bash -n sbctl.sh
-bash -n lib/hardening.sh
+bash -n lib/network_guard.sh lib/state_guard.sh lib/system_guard.sh
 bash -n install.sh
 sh -n alpine/install.sh
-grep -Fq 'hardening' sbctl.sh
+grep -Fq 'network_guard state_guard system_guard' sbctl.sh
 grep -Fq 'commits/main' install.sh
 grep -Fq 'commits/main' alpine/install.sh
 
@@ -54,8 +54,7 @@ sing_box_installed() { return 1; }
 write_default_config
 [[ $SBCTL_VERSION == 0.4.0 ]]
 
-# Generated service definitions should include the security policy rather than
-# relying on the distro's package defaults.
+# Generated service definitions should include explicit sbctl hardening.
 create_service_definition
 unit="$SYSTEMD_UNIT_DIR/$SERVICE_NAME.service"
 grep -Fxq 'UMask=0077' "$unit"
@@ -81,8 +80,7 @@ curl() {
 [[ $(detect_public_ipv4) == 198.51.100.7 ]]
 unset -f curl
 
-# Config and metadata are one transaction: a failed service restart restores
-# both states, not just config.json.
+# Config and metadata are one transaction: restart failure restores both.
 cat >"$CONFIG_FILE" <<'JSON'
 {"log":{"level":"warn"},"inbounds":[{"type":"socks","tag":"old","listen":"127.0.0.1","listen_port":20001,"users":[]}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
 JSON
@@ -105,8 +103,7 @@ rm -f "$candidate" "$meta_candidate"
 service_is_active() { return 1; }
 restart_service_checked() { return 0; }
 
-# Deleting one inbound must clean every route reference while preserving a
-# shared rule for its remaining inbound(s).
+# Deleting one inbound cleans all route refs while preserving shared rules.
 cat >"$CONFIG_FILE" <<'JSON'
 {
   "inbounds":[
@@ -130,8 +127,7 @@ delete_inbound a 1
 [[ $(jq '[.route.rules[]?|select((.inbound // [])==["b"])]|length' "$CONFIG_FILE") == 2 ]]
 [[ $(jq -r '.inbounds.a // empty' "$META_FILE") == '' ]]
 
-# Multi-account Certbot behavior: existing lineage wins; otherwise explicit
-# non-interactive selection is passed through as --account.
+# Multi-account Certbot: lineage wins; otherwise explicit account is forwarded.
 mkdir -p "$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct1"
 mkdir -p "$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct2"
 printf '{}\n' >"$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct1/regr.json"
@@ -149,15 +145,13 @@ certbot_cmd() { printf '%s\n' "$@" >"$args_file"; }
 certbot_issue_cmd new.example certonly -d new.example
 awk 'p==1 && $0=="acct2"{ok=1} $0=="--account"{p=1;next} END{exit !ok}' "$args_file"
 
-# Erase must not alter host congestion control merely because BBR happens to
-# be active; without an sbctl-owned marker file this function is a no-op.
+# Erase must not alter congestion control without an sbctl-owned marker.
 if [[ ! -e /etc/sysctl.d/99-sbctl-bbr.conf ]]; then
   sysctl() { printf 'called\n' >>"$CASE/sysctl-called"; }
   _remove_bbr_settings
   [[ ! -e $CASE/sysctl-called ]]
 fi
 
-# APT hardening policy exists even when this test host is not Debian.
 declare -f apt_get_guarded | grep -Fq 'Acquire::Retries=2'
 declare -f apt_get_guarded | grep -Fq 'Acquire::ForceIPv4=true'
 BASH
