@@ -43,7 +43,7 @@ else
 fi
 unset _repo_lib
 
-for _module in core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare hardening; do
+for _module in core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare network_guard state_guard system_guard; do
   [[ -r "$LIB_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$LIB_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$LIB_DIR/${_module}.sh"
