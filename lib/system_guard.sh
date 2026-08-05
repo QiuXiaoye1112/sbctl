@@ -72,6 +72,10 @@ enable_bbr() {
   ensure_dependencies bbr
   command_exists sysctl || die "缺少 sysctl。"
   local config=/etc/sysctl.d/99-sbctl-bbr.conf qdisc_ok=0 available
+  if [[ -e $config ]] && ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
+    warn "检测到非 sbctl 管理的 BBR 配置，拒绝覆盖：$config"
+    return 1
+  fi
   [[ -w /proc/sys/net/ipv4/tcp_congestion_control ]] || { warn "当前容器/内核不允许修改拥塞控制参数。"; return 0; }
   if command_exists modprobe; then run_bounded 5 modprobe tcp_bbr >/dev/null 2>&1 || true; fi
   available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
@@ -124,7 +128,7 @@ _remove_bbr_settings() {
   if [[ $current == bbr && -w /proc/sys/net/ipv4/tcp_congestion_control ]]; then
     available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
     if grep -qw cubic <<<"$available"; then fallback=cubic; elif grep -qw reno <<<"$available"; then fallback=reno; fi
-    if [[ -n $fallback ]]; then run_bounded 5 sysctl -w net.ipv4/tcp_congestion_control="$fallback" >/dev/null 2>&1 || true; fi
+    if [[ -n $fallback ]]; then run_bounded 5 sysctl -w net.ipv4.tcp_congestion_control="$fallback" >/dev/null 2>&1 || true; fi
   fi
   rm -f "$config"
 }
