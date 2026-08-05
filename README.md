@@ -167,13 +167,14 @@ sbctl 的 Certbot 数据独立保存于 `/var/lib/sbctl/letsencrypt/`。当存�
 SBCTL_CERTBOT_ACCOUNT=ACCOUNT_ID sbctl cert issue example.com you@example.com
 ```
 
-不会因为 Certbot 存在多个账户就把失败误判成 80 端口问题。
+不会因为 Certbot 存在多个账户就把失败误判成 80 端口问题。独立环境同时检查 Certbot 主程序和 `certbot-nginx` 插件完整性，插件损坏或缺失时会修复/明确报错。
 
 ### BBR 安全边界
 
 - 先确认内核实际提供 BBR 和 `/proc` 参数可写。
 - NAT/LXC/OpenVZ 等受限环境无法写 sysctl 时仅提示，不让整个菜单异常退出。
 - sbctl 写入的 BBR 配置带 `# managed by sbctl` 标记并登记 metadata。
+- 如果 `/etc/sysctl.d/99-sbctl-bbr.conf` 已存在但不属于 sbctl，启用 BBR 会拒绝覆盖。
 - `sbctl uninstall --erase` 只有确认该配置确实属于 sbctl 时才会回退运行时拥塞控制并删除文件；不会因为系统当前恰好使用 BBR 就修改其他工具或管理员配置的状态。
 
 ## TLS 证书
@@ -305,7 +306,9 @@ lib/certops.sh           证书签发/导入/续期/删除
 lib/cloudflare.sh        Cloudflare Global API Key 与 DNS 验证
 lib/uninstall.sh         三级卸载与安全清理
 lib/enhancements.sh      生命周期兼容扩展
-lib/hardening.sh         事务、网络、服务、BBR、Certbot 多账户硬化
+lib/network_guard.sh     包管理器、网络、Certbot 多账户与签发边界
+lib/state_guard.sh       config + metadata 事务与路由引用安全
+lib/system_guard.sh      systemd/OpenRC、BBR、诊断与残留安全
 install.sh               systemd Linux bootstrap
 alpine/install.sh        Alpine bootstrap
 tests/lifecycle.sh       证书/卸载生命周期测试
