@@ -3,7 +3,7 @@ set -eu
 REPO="QiuXiaoye1112/sbctl"
 TARGET="/usr/local/sbin/sbctl"
 LIB_DIR="/usr/local/lib/sbctl"
-MODULES="core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare hardening"
+MODULES="core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare network_guard state_guard system_guard"
 [ "$(id -u)" -eq 0 ] || { echo '[sbctl] 请使用 root 运行。' >&2; exit 1; }
 [ -f /etc/alpine-release ] || { echo '[sbctl] 此入口仅用于 Alpine Linux。' >&2; exit 1; }
 apk add --no-cache bash curl jq openssl coreutils >/dev/null
@@ -33,6 +33,6 @@ cp "$tmp/lib/"*.sh "$LIB_DIR/"
 chmod 644 "$LIB_DIR"/*.sh
 cp "$tmp/sbctl.sh" "$TARGET"
 chmod 755 "$TARGET"
-rm -f "$LIB_DIR/system_ext.sh"
+rm -f "$LIB_DIR/system_ext.sh" "$LIB_DIR/hardening.sh"
 ln -sfn "$TARGET" /usr/local/bin/sbctl
 exec env SBCTL_LIB_DIR="$LIB_DIR" bash "$TARGET" install
