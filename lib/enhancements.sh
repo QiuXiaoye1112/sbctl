@@ -7,6 +7,8 @@ eval "$(declare -f create_service_definition | sed '1s/^create_service_definitio
 eval "$(declare -f backup_all | sed '1s/^backup_all[[:space:]]*()/_sbctl_base_backup_all ()/')"
 eval "$(declare -f restore_backup | sed '1s/^restore_backup[[:space:]]*()/_sbctl_base_restore_backup ()/')"
 eval "$(declare -f delete_certificate | sed '1s/^delete_certificate[[:space:]]*()/_sbctl_base_delete_certificate ()/')"
+eval "$(declare -f service_exists | sed '1s/^service_exists[[:space:]]*()/_sbctl_base_service_exists ()/')"
+eval "$(declare -f service_is_active | sed '1s/^service_is_active[[:space:]]*()/_sbctl_base_service_is_active ()/')"
 
 # Respect an explicitly configured binary. PATH discovery is only a fallback;
 # otherwise custom deployments and test harnesses can silently switch binaries.
@@ -16,6 +18,17 @@ refresh_binary_path() {
   else
     SING_BOX_BIN=$(command -v sing-box 2>/dev/null || printf '%s' "$SING_BOX_BIN")
   fi
+}
+
+# CI/tests redirect sbctl paths but may run on a host that already has a real
+# sing-box unit. Never let test mode inspect or restart that host service.
+service_exists() {
+  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 1
+  _sbctl_base_service_exists "$@"
+}
+service_is_active() {
+  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 1
+  _sbctl_base_service_is_active "$@"
 }
 
 install_quick_command() {
