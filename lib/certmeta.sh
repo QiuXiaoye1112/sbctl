@@ -95,7 +95,7 @@ meta_cert_delete() {
 
 meta_cert_get_field() {
   init_meta
-  jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] // empty' "$META_FILE"
+  jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] | if . == null then empty else . end' "$META_FILE"
 }
 
 meta_cert_list() {
