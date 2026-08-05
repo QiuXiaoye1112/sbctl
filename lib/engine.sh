@@ -1,5 +1,5 @@
 write_default_config() {
-  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CERT_DIR" "$(dirname "$META_FILE")"
+  mkdir -p "$CONFIG_DIR" "$CERT_DIR" "$(dirname "$META_FILE")"
   cat >"$CONFIG_FILE" <<'JSON'
 {
   "log": {
