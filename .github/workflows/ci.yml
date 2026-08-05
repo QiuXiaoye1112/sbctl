@@ -27,3 +27,4 @@ jobs:
           bash tests/reality-share.sh
           bash tests/hy2-hop.sh
           bash tests/lifecycle.sh
+          bash tests/cloudflare.sh
