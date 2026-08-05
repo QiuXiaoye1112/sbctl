@@ -16,6 +16,7 @@ jobs:
       - name: Run smoke tests
         env:
           TERM: xterm
+          SBCTL_TESTING: "1"
         run: |
           bash tests/no-firewall.sh
           bash tests/ui.sh
