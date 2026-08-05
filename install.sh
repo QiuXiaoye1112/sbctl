@@ -25,7 +25,6 @@ if [[ $commit =~ ^[0-9a-f]{40}$ ]]; then
   info "锁定源码提交：${commit:0:12}"
 else
   BASE_URL="https://github.com/${REPO}/raw/refs/heads/main"
-  warn=''
   info "无法解析 main 提交，使用 GitHub 实时分支下载。"
 fi
 info "正在下载并校验 sbctl..."
