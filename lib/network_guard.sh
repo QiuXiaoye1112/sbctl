@@ -3,7 +3,12 @@
 
 run_bounded() {
   local seconds=$1; shift
-  if command_exists timeout; then timeout "$seconds" "$@"; else "$@"; fi
+  # Tests and callers may provide a shell-function shim (for example an apk
+  # mock). External timeout cannot exec shell functions, so call those directly.
+  if declare -F "${1:-}" >/dev/null 2>&1; then "$@"
+  elif command_exists timeout; then timeout "$seconds" "$@"
+  else "$@"
+  fi
 }
 _cert_run_bounded() { run_bounded "$@"; }
 
