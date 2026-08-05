@@ -68,6 +68,7 @@ save_cloudflare_credentials() {
   printf 'dns_cloudflare_email = %s\ndns_cloudflare_api_key = %s\n' "$email" "$api_key" >"$tmp"
   install -m 600 "$tmp" "$CLOUDFLARE_INI"
   rm -f "$tmp"
+  meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
   meta_resource_register cloudflareCredentials "$CLOUDFLARE_INI"
   info "Cloudflare Global API Key 已保存：${CLOUDFLARE_INI}"
 }
@@ -188,7 +189,7 @@ issue_certificate() {
 }
 
 renew_one_certificate() {
-  local identifier=$1 __result_var=${2:-} validation cert_name before_serial="" after_serial="" changed=0 result=failed
+  local identifier=$1 __result_var=${2:-} validation cert_name before_serial="" after_serial="" changed=0 renewal_result_internal=failed
   validation=$(meta_cert_get_field "$identifier" validation 2>/dev/null || true)
   [[ $validation == dns-cloudflare ]] || { _sbctl_cf_base_renew_one_certificate "$@"; return; }
 
@@ -213,8 +214,8 @@ renew_one_certificate() {
   [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
   sync_managed_certificate "$identifier" "$cert_name" changed || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
   restart_sing_box_if_certificate_changed "$changed" || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
-  if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then result=renewed; else result=unchanged; fi
-  [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$result"
+  if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then renewal_result_internal=renewed; else renewal_result_internal=unchanged; fi
+  [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$renewal_result_internal"
 }
 
 certificate_menu() {
