@@ -10,9 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq openssl
+        run: sudo apt-get update && sudo apt-get install -y jq openssl shellcheck
+      - name: Static validation
+        run: |
+          bash -n sbctl.sh install.sh lib/*.sh tests/*.sh
+          sh -n alpine/install.sh
+          shellcheck -x sbctl.sh install.sh lib/*.sh tests/*.sh
+          shellcheck -s sh alpine/install.sh
+          git diff --check
       - name: Install current stable sing-box
-        run: curl -fsSL https://sing-box.app/install.sh | sudo sh
+        run: curl -fsSL --connect-timeout 10 --max-time 60 https://sing-box.app/install.sh | sudo sh
       - name: Run smoke tests
         env:
           TERM: xterm
@@ -28,3 +35,15 @@ jobs:
           bash tests/hy2-hop.sh
           bash tests/lifecycle.sh
           bash tests/cloudflare.sh
+          bash tests/maturity.sh
+      - name: Alpine/OpenRC compatibility tests
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.21 sh -ec '
+            apk add --no-cache bash curl jq openssl coreutils >/dev/null
+            export TERM=xterm SBCTL_TESTING=1
+            bash -n sbctl.sh lib/*.sh tests/*.sh
+            sh -n alpine/install.sh
+            bash tests/lifecycle.sh
+            bash tests/cloudflare.sh
+            bash tests/maturity.sh
+          '
