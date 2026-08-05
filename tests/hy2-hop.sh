@@ -68,6 +68,7 @@ JSON
   grep -Fq "hysteria2://secret@203.0.113.10:20000-50000?sni=example.com" <<<"$share"
 
   nft() { printf "%s\n" "$*" >>"$NFT_LOG"; }
+  command_exists() { [[ $1 == nft ]]; }
   hy2_hop_restore_all
   grep -Fq "add table inet sbctl_hy2_hop" "$NFT_LOG"
   grep -Fq "udp dport 20000-50000 redirect to :55556" "$NFT_LOG"
