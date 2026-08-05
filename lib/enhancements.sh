@@ -8,6 +8,16 @@ eval "$(declare -f backup_all | sed '1s/^backup_all[[:space:]]*()/_sbctl_base_ba
 eval "$(declare -f restore_backup | sed '1s/^restore_backup[[:space:]]*()/_sbctl_base_restore_backup ()/')"
 eval "$(declare -f delete_certificate | sed '1s/^delete_certificate[[:space:]]*()/_sbctl_base_delete_certificate ()/')"
 
+# Respect an explicitly configured binary. PATH discovery is only a fallback;
+# otherwise custom deployments and test harnesses can silently switch binaries.
+refresh_binary_path() {
+  if [[ -n ${SBCTL_SING_BOX_BIN:-} ]]; then
+    SING_BOX_BIN=$SBCTL_SING_BOX_BIN
+  else
+    SING_BOX_BIN=$(command -v sing-box 2>/dev/null || printf '%s' "$SING_BOX_BIN")
+  fi
+}
+
 install_quick_command() {
   _sbctl_base_install_quick_command "$@"
   meta_resource_register quickCommand "$QUICK_COMMAND"
