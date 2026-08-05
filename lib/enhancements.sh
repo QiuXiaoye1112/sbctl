@@ -5,6 +5,8 @@ eval "$(declare -f dispatch | sed '1s/^dispatch[[:space:]]*()/_sbctl_base_dispat
 eval "$(declare -f install_quick_command | sed '1s/^install_quick_command[[:space:]]*()/_sbctl_base_install_quick_command ()/')"
 eval "$(declare -f create_service_definition | sed '1s/^create_service_definition[[:space:]]*()/_sbctl_base_create_service_definition ()/')"
 eval "$(declare -f backup_all | sed '1s/^backup_all[[:space:]]*()/_sbctl_base_backup_all ()/')"
+eval "$(declare -f restore_backup | sed '1s/^restore_backup[[:space:]]*()/_sbctl_base_restore_backup ()/')"
+eval "$(declare -f delete_certificate | sed '1s/^delete_certificate[[:space:]]*()/_sbctl_base_delete_certificate ()/')"
 
 install_quick_command() {
   _sbctl_base_install_quick_command "$@"
@@ -21,6 +23,46 @@ create_service_definition() {
 backup_all() {
   _sbctl_base_backup_all "$@"
   meta_resource_register backupDir "$BACKUP_DIR"
+  info "提示：备份包含配置、metadata 和证书副本，不包含 Certbot 账户/lineage 数据。"
+}
+
+restore_backup() {
+  _sbctl_base_restore_backup "$@" || return $?
+  local id source auto_renew cert_name warned=0
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    source=$(meta_cert_get_field "$id" source)
+    auto_renew=$(meta_cert_get_field "$id" autoRenew)
+    [[ $source == letsencrypt && $auto_renew == true ]] || continue
+    cert_name=$(meta_cert_get_field "$id" certName)
+    if [[ -z $cert_name || ! -d $CERTBOT_CONFIG_DIR/live/$cert_name ]]; then
+      warn "证书 ${id}: 副本已恢复，但 Certbot lineage 缺失，无法自动续期；请重新签发。"
+      ((warned+=1))
+    fi
+  done < <(meta_cert_list)
+  ((warned == 0)) || warn "共 ${warned} 张自动证书缺少 Certbot 续期数据。"
+}
+
+_disable_renewal_job_if_unused() {
+  local remaining
+  remaining=$(meta_cert_auto_renew_certs | head -1 || true)
+  [[ -z $remaining ]] || return 0
+  case $(init_system) in
+    systemd)
+      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
+      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
+  esac
+}
+
+delete_certificate() {
+  local rc=0
+  _sbctl_base_delete_certificate "$@" || rc=$?
+  ((rc == 0)) && _disable_renewal_job_if_unused
+  return "$rc"
 }
 
 certificate_menu() {
