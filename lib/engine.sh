@@ -145,7 +145,7 @@ install_quick_command() {
   mkdir -p "$(dirname "$QUICK_COMMAND")" "$(dirname "$QUICK_SYMLINK")"
   if [[ -z $source || ! -r $source ]] || ! grep -q '^# sbctl - sing-box Linux terminal manager' "$source" 2>/dev/null; then
     downloaded=$(temp_file)
-    curl -fsSL --retry 3 "$SCRIPT_DOWNLOAD_URL" -o "$downloaded" || die "sbctl 下载失败。"
+    curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$SCRIPT_DOWNLOAD_URL" -o "$downloaded" || die "sbctl 下载失败。"
     grep -q '^# sbctl - sing-box Linux terminal manager' "$downloaded" || die "下载内容校验失败。"
     source=$downloaded
   fi
@@ -164,12 +164,17 @@ install_or_update_sing_box() {
   [[ -f $CONFIG_FILE ]] && had_config=1
   manager=$(pkg_manager)
   if [[ $manager == apk ]]; then
-    apk add --no-cache --upgrade sing-box
+    run_bounded 180 apk add --no-cache --upgrade sing-box || die "sing-box 安装/更新失败或超时。"
   else
     installer=$(temp_file)
-    curl -fsSL --retry 3 "$OFFICIAL_INSTALLER_URL" -o "$installer"
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 \
+      "$OFFICIAL_INSTALLER_URL" -o "$installer" || { rm -f "$installer"; die "sing-box 官方安装器下载失败或超时。"; }
     chmod 700 "$installer"
-    if [[ -n $version ]]; then bash "$installer" --version "${version#v}"; else bash "$installer"; fi
+    if [[ -n $version ]]; then
+      TERM=${TERM:-xterm} run_bounded 180 bash "$installer" --version "${version#v}" || { rm -f "$installer"; die "sing-box 安装失败或超时。"; }
+    else
+      TERM=${TERM:-xterm} run_bounded 180 bash "$installer" || { rm -f "$installer"; die "sing-box 安装失败或超时。"; }
+    fi
     rm -f "$installer"
   fi
   refresh_binary_path
@@ -178,8 +183,8 @@ install_or_update_sing_box() {
   if ((had_config)); then
     ensure_config
   else
-    # Some sing-box packages/installers create a demonstration config (commonly
-    # a Shadowsocks listener on 8080). A fresh sbctl install must start empty.
+    # Some sing-box packages/installers create a demonstration config. A fresh
+    # sbctl install deliberately starts from an empty managed configuration.
     write_default_config
   fi
   create_service_definition
@@ -190,6 +195,8 @@ install_or_update_sing_box() {
   info "sing-box 已就绪：$($SING_BOX_BIN version | sed -n '1p')"
 }
 
+# Legacy implementation retained for compatibility; lib/uninstall.sh replaces
+# this function after module loading with the ownership-aware three-level model.
 uninstall_sing_box() {
   ensure_dependencies uninstall
   local purge=${1:-0} manager hook
@@ -198,7 +205,6 @@ uninstall_sing_box() {
   else
     confirm "卸载 sing-box，保留配置、证书、元数据和 sbctl？" N || return 0
   fi
-
   service_stop >/dev/null 2>&1 || true
   service_disable >/dev/null 2>&1 || true
   manager=$(pkg_manager)
@@ -210,34 +216,21 @@ uninstall_sing_box() {
     pacman) pacman -Rns --noconfirm sing-box 2>/dev/null || true ;;
     zypper) zypper --non-interactive remove sing-box 2>/dev/null || true ;;
   esac
-
   case $(init_system) in
     systemd)
       rm -f "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
       systemctl daemon-reload >/dev/null 2>&1 || true
       ;;
-    openrc)
-      rm -f "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
-      ;;
+    openrc) rm -f "${OPENRC_INIT_DIR}/${SERVICE_NAME}" ;;
   esac
-
   if [[ $purge == 1 ]]; then
-    for hook in "$CERTBOT_HOOK_DIR"/sbctl-*; do
-      [[ -e $hook ]] && rm -f "$hook"
-    done
-
+    for hook in "$CERTBOT_HOOK_DIR"/sbctl-*; do [[ -e $hook ]] && rm -f "$hook"; done
     rm -rf "$CONFIG_DIR" "$DATA_DIR"
     rm -f "$META_FILE"
     rmdir "$(dirname "$META_FILE")" 2>/dev/null || true
-
-    if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then
-      rm -f "$QUICK_SYMLINK"
-    fi
-    if [[ $QUICK_COMMAND == /usr/local/sbin/sbctl ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then
-      rm -f "$QUICK_COMMAND"
-    fi
+    if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then rm -f "$QUICK_SYMLINK"; fi
+    if [[ $QUICK_COMMAND == /usr/local/sbin/sbctl ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then rm -f "$QUICK_COMMAND"; fi
     [[ $LIB_DIR != /usr/local/lib/sbctl ]] || rm -rf "$LIB_DIR"
-
     info "完全卸载完成；Let’s Encrypt 原始证书未删除，备份保留在 ${BACKUP_DIR}。"
   else
     info "sing-box 已卸载；配置、证书、元数据、sbctl 和备份均已保留。"
