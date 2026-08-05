@@ -11,4 +11,4 @@ awk '
   !skip { print }
 ' "$ROOT/tests/smoke.sh" >"$TMP"
 
-bash "$TMP"
+SBCTL_TESTING=1 bash "$TMP"
