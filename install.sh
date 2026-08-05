@@ -4,7 +4,7 @@ set -Eeuo pipefail
 readonly REPO="QiuXiaoye1112/sbctl"
 readonly TARGET="/usr/local/sbin/sbctl"
 readonly LIB_DIR="/usr/local/lib/sbctl"
-readonly MODULES="core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare hardening"
+readonly MODULES="core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare network_guard state_guard system_guard"
 info() { printf '[sbctl] %s\n' "$*"; }
 die() { printf '[sbctl] 错误: %s\n' "$*" >&2; exit 1; }
 fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$1" -o "$2"; }
@@ -40,7 +40,7 @@ for module in $MODULES; do bash -n "$tmp/lib/${module}.sh" || die "模块语法�
 install -d -m 755 "$LIB_DIR" /usr/local/sbin /usr/local/bin
 install -m 644 "$tmp/lib/"*.sh "$LIB_DIR/"
 install -m 755 "$tmp/sbctl.sh" "$TARGET"
-rm -f "$LIB_DIR/system_ext.sh"
+rm -f "$LIB_DIR/system_ext.sh" "$LIB_DIR/hardening.sh"
 ln -sfn "$TARGET" /usr/local/bin/sbctl
 info "正在安装/修复 sing-box..."
 SBCTL_LIB_DIR="$LIB_DIR" "$TARGET" install "${1-}"
