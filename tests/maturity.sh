@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
+
+bash -n sbctl.sh
+bash -n lib/hardening.sh
+bash -n install.sh
+sh -n alpine/install.sh
+grep -Fq 'hardening' sbctl.sh
+grep -Fq 'commits/main' install.sh
+grep -Fq 'commits/main' alpine/install.sh
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+MOCK="$TMP/mock"
+CASE="$TMP/case"
+mkdir -p "$MOCK" "$CASE/cfg" "$CASE/certs" "$CASE/bin" "$CASE/systemd" "$CASE/hooks"
+
+cat >"$MOCK/systemctl" <<'SH'
+#!/usr/bin/env sh
+case "$1" in
+  is-active|is-enabled|list-unit-files) exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$MOCK/systemctl"
+
+CASE="$CASE" \
+PATH="$MOCK:$PATH" \
+SBCTL_TESTING=1 \
+SBCTL_CONFIG_DIR="$CASE/cfg" \
+SBCTL_CONFIG_FILE="$CASE/cfg/config.json" \
+SBCTL_META_FILE="$CASE/meta.json" \
+SBCTL_CERT_DIR="$CASE/certs" \
+SBCTL_BACKUP_DIR="$CASE/backups" \
+SBCTL_DATA_DIR="$CASE/data" \
+SBCTL_SYSTEMD_UNIT_DIR="$CASE/systemd" \
+SBCTL_COMMAND_PATH="$CASE/bin/sbctl" \
+SBCTL_SYMLINK_PATH="$CASE/bin/sbctl-link" \
+SBCTL_LOCK_FILE="$CASE/lock" \
+SBCTL_CERTBOT_HOOK_DIR="$CASE/hooks" \
+SBCTL_CERTBOT_VENV="$CASE/certbot-venv" \
+SBCTL_CERTBOT_CONFIG_DIR="$CASE/certbot-config" \
+SBCTL_CERTBOT_WORK_DIR="$CASE/certbot-work" \
+SBCTL_CERTBOT_LOGS_DIR="$CASE/certbot-logs" \
+bash <<'BASH'
+set -Eeuo pipefail
+source ./sbctl.sh
+ensure_dependencies() { :; }
+sing_box_installed() { return 1; }
+
+write_default_config
+[[ $SBCTL_VERSION == 0.4.0 ]]
+
+# Generated service definitions should include the security policy rather than
+# relying on the distro's package defaults.
+create_service_definition
+unit="$SYSTEMD_UNIT_DIR/$SERVICE_NAME.service"
+grep -Fxq 'UMask=0077' "$unit"
+grep -Fxq 'NoNewPrivileges=true' "$unit"
+grep -Fxq 'ProtectSystem=strict' "$unit"
+grep -Fxq 'PrivateTmp=true' "$unit"
+grep -Fxq "ReadWritePaths=$DATA_DIR" "$unit"
+[[ $(meta_resource_get serviceDefinition) == "$unit" ]]
+[[ $(meta_resource_get dataDir) == "$DATA_DIR" ]]
+
+# Public IPv4 discovery must fail over instead of trusting one external site.
+curl() {
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      *api.ipify.org*) printf 'not-an-ip'; return 0;;
+      *checkip.amazonaws.com*) printf '198.51.100.7\n'; return 0;;
+      *cloudflare.com/cdn-cgi/trace*) printf 'ip=203.0.113.9\n'; return 0;;
+    esac
+  done
+  return 1
+}
+[[ $(detect_public_ipv4) == 198.51.100.7 ]]
+unset -f curl
+
+# Config and metadata are one transaction: a failed service restart restores
+# both states, not just config.json.
+cat >"$CONFIG_FILE" <<'JSON'
+{"log":{"level":"warn"},"inbounds":[{"type":"socks","tag":"old","listen":"127.0.0.1","listen_port":20001,"users":[]}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
+JSON
+init_meta
+meta_set_inbound old old.example.com ''
+candidate=$(temp_file)
+meta_candidate=$(temp_file)
+jq '(.inbounds[0].tag)="new"' "$CONFIG_FILE" >"$candidate"
+jq '.inbounds.new=.inbounds.old | del(.inbounds.old)' "$META_FILE" >"$meta_candidate"
+service_is_active() { return 0; }
+restart_service_checked() { return 1; }
+if apply_candidate_with_meta "$candidate" "$meta_candidate"; then
+  echo 'transaction unexpectedly succeeded' >&2
+  exit 1
+fi
+[[ $(jq -r '.inbounds[0].tag' "$CONFIG_FILE") == old ]]
+[[ $(jq -r '.inbounds.old.host' "$META_FILE") == old.example.com ]]
+[[ $(jq -r '.inbounds.new // empty' "$META_FILE") == '' ]]
+rm -f "$candidate" "$meta_candidate"
+service_is_active() { return 1; }
+restart_service_checked() { return 0; }
+
+# Deleting one inbound must clean every route reference while preserving a
+# shared rule for its remaining inbound(s).
+cat >"$CONFIG_FILE" <<'JSON'
+{
+  "inbounds":[
+    {"type":"socks","tag":"a","listen":"127.0.0.1","listen_port":21001,"users":[]},
+    {"type":"socks","tag":"b","listen":"127.0.0.1","listen_port":21002,"users":[]}
+  ],
+  "outbounds":[{"type":"direct","tag":"direct"},{"type":"direct","tag":"proxy"}],
+  "route":{"final":"direct","rules":[
+    {"inbound":["a"],"action":"route","outbound":"proxy"},
+    {"inbound":["a","b"],"action":"route","outbound":"proxy"},
+    {"inbound":["b"],"action":"route","outbound":"proxy"}
+  ]}
+}
+JSON
+init_meta
+meta_set_inbound a a.example.com ''
+meta_set_inbound b b.example.com ''
+delete_inbound a 1
+! jq -e '.inbounds[]|select(.tag=="a")' "$CONFIG_FILE" >/dev/null
+! jq -e '.route.rules[]?|select(((.inbound // [])|type)=="array" and ((.inbound // [])|index("a"))!=null)' "$CONFIG_FILE" >/dev/null
+[[ $(jq '[.route.rules[]?|select((.inbound // [])==["b"])]|length' "$CONFIG_FILE") == 2 ]]
+[[ $(jq -r '.inbounds.a // empty' "$META_FILE") == '' ]]
+
+# Multi-account Certbot behavior: existing lineage wins; otherwise explicit
+# non-interactive selection is passed through as --account.
+mkdir -p "$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct1"
+mkdir -p "$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct2"
+printf '{}\n' >"$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct1/regr.json"
+printf '{}\n' >"$CERTBOT_CONFIG_DIR/accounts/acme-v02.api.letsencrypt.org/directory/acct2/regr.json"
+mkdir -p "$CERTBOT_CONFIG_DIR/renewal"
+printf 'account = acct1\n' >"$CERTBOT_CONFIG_DIR/renewal/existing.example.conf"
+SBCTL_CERTBOT_ACCOUNT=acct2
+chosen=''
+select_certbot_account chosen existing.example
+[[ $chosen == acct1 ]]
+select_certbot_account chosen new.example
+[[ $chosen == acct2 ]]
+args_file="$CASE/certbot-args"
+certbot_cmd() { printf '%s\n' "$@" >"$args_file"; }
+certbot_issue_cmd new.example certonly -d new.example
+awk 'p==1 && $0=="acct2"{ok=1} $0=="--account"{p=1;next} END{exit !ok}' "$args_file"
+
+# Erase must not alter host congestion control merely because BBR happens to
+# be active; without an sbctl-owned marker file this function is a no-op.
+if [[ ! -e /etc/sysctl.d/99-sbctl-bbr.conf ]]; then
+  sysctl() { printf 'called\n' >>"$CASE/sysctl-called"; }
+  _remove_bbr_settings
+  [[ ! -e $CASE/sysctl-called ]]
+fi
+
+# APT hardening policy exists even when this test host is not Debian.
+declare -f apt_get_guarded | grep -Fq 'Acquire::Retries=2'
+declare -f apt_get_guarded | grep -Fq 'Acquire::ForceIPv4=true'
+BASH
+
+echo 'maturity hardening tests passed.'
