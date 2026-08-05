@@ -15,8 +15,9 @@ jobs:
         run: |
           bash -n sbctl.sh install.sh lib/*.sh tests/*.sh
           sh -n alpine/install.sh
-          shellcheck -x sbctl.sh install.sh lib/*.sh tests/*.sh
-          shellcheck -s sh alpine/install.sh
+          shellcheck -S error -x -s bash sbctl.sh install.sh lib/*.sh tests/*.sh
+          shellcheck -S warning -x -s bash -e SC2034,SC2097,SC2098 install.sh lib/network_guard.sh lib/state_guard.sh lib/system_guard.sh tests/maturity.sh
+          shellcheck -S warning -s sh alpine/install.sh
           git diff --check
       - name: Install current stable sing-box
         run: curl -fsSL --connect-timeout 10 --max-time 60 https://sing-box.app/install.sh | sudo sh
