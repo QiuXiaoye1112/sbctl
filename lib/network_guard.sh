@@ -110,9 +110,13 @@ prompt_public_host() {
   printf -v "$__var" '%s' "$value"
 }
 
+certbot_nginx_available() {
+  [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_nginx' >/dev/null 2>&1
+}
+
 ensure_certbot_environment() {
   local manager need_install=0
-  if [[ ! -x $CERTBOT_BIN ]] || ! certbot_supports_ip; then need_install=1; fi
+  if [[ ! -x $CERTBOT_BIN ]] || ! certbot_supports_ip || ! certbot_nginx_available; then need_install=1; fi
   if ((need_install)); then
     manager=$(pkg_manager) || die "无法准备 Certbot 环境：未知包管理器。"
     info "正在准备 sbctl 独立 Certbot 环境。"
@@ -136,10 +140,12 @@ ensure_certbot_environment() {
         rm -f "$bootstrap"
       fi
     fi
+    [[ -x $CERTBOT_VENV/bin/pip ]] || die "Certbot venv 缺少 pip，无法修复环境。"
     run_bounded 180 "$CERTBOT_VENV/bin/pip" install --disable-pip-version-check --timeout 20 --retries 2 \
       --upgrade 'certbot>=5.4' certbot-nginx >/dev/null || die "Certbot 安装失败。"
   fi
   certbot_supports_ip || die "当前 Certbot 不支持公网 IP 证书（需要 Certbot 5.4+）。"
+  certbot_nginx_available || die "Certbot nginx 插件不可用，请重新准备证书环境。"
   mkdir -p "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR"
   meta_resource_register certbotVenv "$CERTBOT_VENV"
   meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
