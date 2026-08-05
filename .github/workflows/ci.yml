@@ -25,3 +25,4 @@ jobs:
           bash tests/legacy-config.sh
           bash tests/reality-share.sh
           bash tests/hy2-hop.sh
+          bash tests/lifecycle.sh
