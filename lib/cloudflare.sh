@@ -1,12 +1,10 @@
 # Cloudflare DNS validation and credential management.
-# Loaded after enhancements.sh so it can extend the mature certificate lifecycle.
+# Loaded after enhancements.sh so it can extend the certificate lifecycle.
 
 CLOUDFLARE_INI="${SBCTL_CLOUDFLARE_INI:-${CERTBOT_CONFIG_DIR}/cloudflare.ini}"
 
-# Preserve the v0.3 certificate/UI implementations and extend only Cloudflare paths.
-eval "$(declare -f ensure_certbot_environment | sed '1s/^ensure_certbot_environment[[:space:]]*()/_sbctl_cf_base_ensure_certbot_environment ()/')"
+# Preserve the v0.3 certificate/CLI implementations and extend Cloudflare paths.
 eval "$(declare -f renew_one_certificate | sed '1s/^renew_one_certificate[[:space:]]*()/_sbctl_cf_base_renew_one_certificate ()/')"
-eval "$(declare -f certificate_menu | sed '1s/^certificate_menu[[:space:]]*()/_sbctl_cf_base_certificate_menu ()/')"
 eval "$(declare -f dispatch | sed '1s/^dispatch[[:space:]]*()/_sbctl_cf_base_dispatch ()/')"
 
 cloudflare_plugin_available() {
@@ -22,16 +20,10 @@ ensure_cloudflare_certbot_plugin() {
   cloudflare_plugin_available || { warn "Cloudflare DNS 插件安装后仍不可用。"; return 1; }
 }
 
-ensure_certbot_environment() {
-  _sbctl_cf_base_ensure_certbot_environment "$@"
-  # Cloudflare is optional for HTTP/manual DNS users. Try to prepare it here,
-  # but only make plugin absence fatal when Cloudflare validation is selected.
-  ensure_cloudflare_certbot_plugin || warn "Cloudflare DNS 自动验证暂不可用；HTTP/手动 DNS 仍可使用。"
-}
-
 load_cloudflare_credentials() {
   [[ -f $CLOUDFLARE_INI && -r $CLOUDFLARE_INI ]] || return 1
-  grep -Eq '^[[:space:]]*dns_cloudflare_api_token[[:space:]]*=[[:space:]]*[^[:space:]].*$' "$CLOUDFLARE_INI"
+  grep -Eq '^[[:space:]]*dns_cloudflare_email[[:space:]]*=[[:space:]]*[^[:space:]].*$' "$CLOUDFLARE_INI" || return 1
+  grep -Eq '^[[:space:]]*dns_cloudflare_api_key[[:space:]]*=[[:space:]]*[^[:space:]].*$' "$CLOUDFLARE_INI"
 }
 
 cloudflare_dependent_certificates() {
@@ -45,47 +37,51 @@ cloudflare_dependency_count() {
   [[ -n $deps ]] && printf '%s\n' "$deps" | grep -c . || printf '0'
 }
 
-prompt_cloudflare_api_token() {
-  local __var=$1 token=""
-  while [[ -z $token ]]; do
+prompt_cloudflare_api_key() {
+  local __var=$1 key=""
+  while [[ -z $key ]]; do
     if [[ -t 0 ]]; then
-      printf 'Cloudflare API Token: '
-      read -r -s token || { printf '\n'; return 1; }
+      printf 'Cloudflare Global API Key: '
+      read -r -s key || { printf '\n'; return 1; }
       printf '\n'
     else
-      read -r token || return 1
+      read -r key || return 1
     fi
-    [[ -n $token ]] || warn "API Token 不能为空。"
+    [[ -n $key ]] || warn "API Key 不能为空。"
   done
-  [[ $token != *$'\n'* && $token != *$'\r'* ]] || { warn "API Token 格式无效。"; return 1; }
-  printf -v "$__var" '%s' "$token"
+  [[ $key != *$'\n'* && $key != *$'\r'* ]] || { warn "API Key 格式无效。"; return 1; }
+  printf -v "$__var" '%s' "$key"
 }
 
 save_cloudflare_credentials() {
-  local token=${1-} tmp
-  [[ -n $token ]] || prompt_cloudflare_api_token token || return 1
-  [[ $token != *$'\n'* && $token != *$'\r'* ]] || { warn "API Token 格式无效。"; return 1; }
+  local email=${1-} api_key=${2-} tmp
+  while [[ -z $email ]]; do
+    prompt_value email "Cloudflare 邮箱" || return 1
+    validate_email_address "$email" || { warn "邮箱格式无效。"; email=""; }
+  done
+  validate_email_address "$email" || { warn "邮箱格式无效。"; return 1; }
+  [[ -n $api_key ]] || prompt_cloudflare_api_key api_key || return 1
+  [[ $api_key != *$'\n'* && $api_key != *$'\r'* ]] || { warn "API Key 格式无效。"; return 1; }
+
   mkdir -p "$(dirname "$CLOUDFLARE_INI")"
   tmp=$(temp_file)
-  printf 'dns_cloudflare_api_token = %s\n' "$token" >"$tmp"
+  printf 'dns_cloudflare_email = %s\ndns_cloudflare_api_key = %s\n' "$email" "$api_key" >"$tmp"
   install -m 600 "$tmp" "$CLOUDFLARE_INI"
   rm -f "$tmp"
   meta_resource_register cloudflareCredentials "$CLOUDFLARE_INI"
-  meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
-  info "Cloudflare API Token 已保存：${CLOUDFLARE_INI}"
-  info "建议 Token 仅授予目标 Zone 的 Zone:DNS:Edit 权限。"
+  info "Cloudflare Global API Key 已保存：${CLOUDFLARE_INI}"
 }
 
 delete_cloudflare_credentials() {
   local deps
-  load_cloudflare_credentials || { info "尚未配置 Cloudflare API Token。"; return 0; }
+  load_cloudflare_credentials || { info "尚未配置 Cloudflare Global API Key。"; return 0; }
   deps=$(cloudflare_dependent_certificates)
   if [[ -n $deps ]]; then
     warn "以下证书依赖 Cloudflare 凭据自动续期："
     while IFS= read -r id; do [[ -n $id ]] && printf '  - %s\n' "$id" >&2; done <<<"$deps"
     confirm "删除后这些证书将无法自动续期，仍然删除？" N || { info "已取消。"; return 0; }
   else
-    confirm "删除 Cloudflare API Token？" N || return 0
+    confirm "删除 Cloudflare Global API Key？" N || return 0
   fi
   rm -f "$CLOUDFLARE_INI"
   meta_resource_remove cloudflareCredentials
@@ -93,12 +89,17 @@ delete_cloudflare_credentials() {
 }
 
 cloudflare_credentials_menu() {
-  local choice
+  local choice email=""
   while true; do
     clear_screen; heading "Cloudflare DNS 凭据"
-    if load_cloudflare_credentials; then printf 'API Token: 已配置\n'; else printf 'API Token: 未配置\n'; fi
+    if load_cloudflare_credentials; then
+      email=$(sed -n 's/^[[:space:]]*dns_cloudflare_email[[:space:]]*=[[:space:]]*//p' "$CLOUDFLARE_INI" | head -1)
+      printf 'Cloudflare 邮箱: %s\nGlobal API Key: 已配置\n' "${email:-未知}"
+    else
+      printf 'Cloudflare 凭据: 未配置\n'
+    fi
     printf '依赖自动续期证书: %s\n\n' "$(cloudflare_dependency_count)"
-    printf '1) 设置/替换 API Token\n2) 删除 API Token\n0) 返回\n'
+    printf '1) 设置/替换邮箱和 Global API Key\n2) 删除凭据\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action save_cloudflare_credentials; pause;;
@@ -110,7 +111,7 @@ cloudflare_credentials_menu() {
 
 _issue_domain_cloudflare() {
   local domain=$1 email=$2 force=$3
-  load_cloudflare_credentials || { warn "Cloudflare API Token 未配置。"; return 1; }
+  load_cloudflare_credentials || { warn "Cloudflare 邮箱 / Global API Key 未配置。"; return 1; }
   ensure_cloudflare_certbot_plugin || return 1
   local args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_INI" \
     --dns-cloudflare-propagation-seconds 10 --non-interactive --agree-tos --cert-name "$domain" -m "$email" -d "$domain")
@@ -146,7 +147,7 @@ issue_certificate() {
       3) verify_method=dns-manual;;
     esac
     if [[ $verify_method == dns-cloudflare ]] && ! load_cloudflare_credentials; then
-      info "首次使用 Cloudflare DNS 自动验证，需要配置 API Token。"
+      info "首次使用 Cloudflare DNS 自动验证，需要配置 Cloudflare 邮箱和 Global API Key。"
       save_cloudflare_credentials || return 1
     fi
   fi
@@ -192,7 +193,7 @@ renew_one_certificate() {
   [[ $validation == dns-cloudflare ]] || { _sbctl_cf_base_renew_one_certificate "$@"; return; }
 
   if ! load_cloudflare_credentials; then
-    warn "${identifier}: Cloudflare API Token 缺失，自动续期阻塞。"
+    warn "${identifier}: Cloudflare 邮箱 / Global API Key 缺失，自动续期阻塞。"
     [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked
     return 0
   fi
@@ -262,7 +263,7 @@ sbctl - sing-box Linux 管理器
   sbctl cert delete [标识] [--yes]
   sbctl cert renew [标识]
   sbctl cert renew-auto              检查并续期所有自动证书
-  sbctl cert cloudflare              管理 Cloudflare DNS API Token
+  sbctl cert cloudflare              管理 Cloudflare DNS 邮箱 / Global API Key
 
   sbctl backup [文件.tar.gz]
   sbctl restore [文件.tar.gz]
@@ -272,7 +273,7 @@ sbctl - sing-box Linux 管理器
 
 证书说明:
   - 域名支持 Cloudflare DNS 自动验证/续期、HTTP 自动验证/续期、DNS 手动 TXT 验证。
-  - Cloudflare 使用受限 API Token，凭据文件权限为 600。
+  - Cloudflare 使用账号邮箱 + Global API Key，凭据文件权限为 600。
   - DNS 手动验证证书不会被标记为自动续期。
   - 公网 IP 证书使用 Certbot 5.4+ short-lived profile + HTTP 验证。
   - Certbot 使用 /opt/sbctl/certbot 独立环境，不污染系统 Certbot。
