@@ -125,7 +125,16 @@ build_inbound() {
   #   REALITY    → prompt_public_host (client_host may differ from SNI)
   #   no TLS     → prompt_public_host
   case $type in
-    vless|anytls|trojan)
+    vless)
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密"
+      case $choice in
+        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host ;;
+        2) build_certificate_tls tls client_host || return 1 ;;
+        3) tls=""; prompt_public_host client_host ;;
+      esac
+      prompt_port port 443
+      ;;
+    anytls|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
@@ -169,8 +178,12 @@ build_inbound() {
     vless)
       prompt_value name "用户名称" "user-$(random_hex 2)"
       uuid=$(generate_uuid)
-      [[ $(jq -r '.reality.enabled // false' <<<"$tls") == true ]] && flow=xtls-rprx-vision || flow=""
-      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls" '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}],tls:$tls}')"
+      if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
+      if [[ -z $tls ]]; then
+        printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]}')"
+      else
+        printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls" '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}],tls:$tls}')"
+      fi
       ;;
     hysteria2)
       prompt_value name "用户名称" "user-$(random_hex 2)"
