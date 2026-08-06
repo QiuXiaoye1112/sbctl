@@ -308,23 +308,25 @@ add_inbound() {
 # Does NOT call ensure_config/init_meta — callers must ensure config is valid.
 list_inbounds() {
   [[ -f $CONFIG_FILE ]] || { info "还没有入站。"; return 0; }
-  local rows tag_width=24 type_width=14 port_width=8 security_width=12 users_width=6
+  local rows tag_width=20 type_width=12 port_width=8 security_width=10 transport_width=8 users_width=6
 
   # One jq call: produces TSV, empty means no inbounds
-  rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
+  rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),(.transport.type // (if .type=="hysteria2" then "quic" else "tcp" end)),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
   if [[ -z $rows ]]; then info "还没有入站。"; return 0; fi
 
   print_table_cell_clipped "标签" "$tag_width"; printf '| '
   print_table_cell_clipped "协议" "$type_width"; printf '| '
   print_table_cell "端口" "$port_width"; printf '| '
   print_table_cell_clipped "安全" "$security_width"; printf '| '
+  print_table_cell_clipped "传输" "$transport_width"; printf '| '
   printf '用户\n'
 
-  while IFS=$'\t' read -r tag type port security users; do
+  while IFS=$'\t' read -r tag type port security transport users; do
     print_table_cell_clipped "$tag" "$tag_width"; printf '| '
     print_table_cell_clipped "$type" "$type_width"; printf '| '
     print_table_cell "$port" "$port_width"; printf '| '
     print_table_cell_clipped "$security" "$security_width"; printf '| '
+    print_table_cell_clipped "$transport" "$transport_width"; printf '| '
     printf '%s\n' "$users"
   done <<<"$rows"
 }
