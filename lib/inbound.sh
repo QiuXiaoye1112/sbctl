@@ -308,7 +308,7 @@ add_inbound() {
 # Does NOT call ensure_config/init_meta — callers must ensure config is valid.
 list_inbounds() {
   [[ -f $CONFIG_FILE ]] || { info "还没有入站。"; return 0; }
-  local rows tag_width=20 type_width=12 port_width=8 security_width=10 transport_width=8 users_width=6
+  local rows tag_width=16 type_width=10 port_width=6 security_width=8 transport_width=7 users_width=4
 
   # One jq call: produces TSV, empty means no inbounds
   rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),(.transport.type // (if .type=="hysteria2" then "quic" else "tcp" end)),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
