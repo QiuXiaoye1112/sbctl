@@ -286,7 +286,7 @@ delete_inbound() {
   local tag=${1-} yes=${2:-0} tmp meta_tmp rc=0
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
-  [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return
+  [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return 0
   tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
   jq --arg tag "$tag" '
     .inbounds |= map(select(.tag!=$tag)) |

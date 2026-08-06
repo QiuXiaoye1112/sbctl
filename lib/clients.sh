@@ -97,7 +97,7 @@ delete_client() {
     select_client name "$tag" || return 0
   fi
   client_exists "$tag" "$name" || die "找不到用户：${name}"
-  confirm "删除用户 ${name}？" N || return
+  confirm "删除用户 ${name}？" N || return 0
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg name "$name" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users) |= map(select(.[$field]!=$name))' "$CONFIG_FILE" >"$tmp"
   apply_candidate "$tmp"; rm -f "$tmp"

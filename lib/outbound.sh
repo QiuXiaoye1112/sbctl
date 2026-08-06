@@ -214,7 +214,7 @@ assign_outbound() {
   local inbound=${1-} outbound=${2-} tmp
   [[ -n $inbound ]] || select_inbound inbound || return 0
   inbound_exists "$inbound" || die "找不到入站：$inbound"
-  [[ -n $outbound ]] || select_outbound outbound 1 || return
+  [[ -n $outbound ]] || select_outbound outbound 1 || return 0
   [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
 
   tmp=$(temp_file)
@@ -243,7 +243,7 @@ delete_outbound() {
   outbound_exists "$tag" || die "找不到出站：$tag"
   manual_refs=$(jq -r --arg tag "$tag" '[.route.rules[]? | select(.outbound==$tag) | select((.action=="route" and ((.inbound//[])|length)==1 and ((keys_unsorted|sort)==(["action","inbound","outbound"]|sort))) | not)] | length' "$CONFIG_FILE")
   ((manual_refs == 0)) || { warn "该出站仍被自定义路由规则引用，请先在完整配置中处理。"; return 0; }
-  confirm "删除出站 ${tag}？使用它的 sbctl 入站绑定会恢复 direct。" N || return
+  confirm "删除出站 ${tag}？使用它的 sbctl 入站绑定会恢复 direct。" N || return 0
   tmp=$(temp_file)
   jq --arg tag "$tag" '
     .outbounds |= map(select(.tag!=$tag)) |
