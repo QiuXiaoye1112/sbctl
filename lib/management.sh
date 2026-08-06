@@ -116,6 +116,42 @@ sing_box_version_summary() {
   [[ -n $version ]] && printf '%s' "$version" || printf '已安装'
 }
 
+_service_summary_all() {
+  case $(init_system) in
+    systemd)
+      local show load active unitfile svc="未安装" boot="未安装" ver="未安装"
+      show=$(systemctl show "$SERVICE_NAME" --property=LoadState,ActiveState,UnitFileState --no-pager 2>/dev/null || true)
+      load=$(awk -F= '/^LoadState=/{print $2}' <<<"$show")
+      active=$(awk -F= '/^ActiveState=/{print $2}' <<<"$show")
+      unitfile=$(awk -F= '/^UnitFileState=/{print $2}' <<<"$show")
+      if [[ $load == loaded ]]; then
+        [[ $active == active ]] && svc="运行中" || svc="已停止"
+        [[ $unitfile == enabled || $unitfile == static ]] && boot="已开启" || boot="已关闭"
+      fi
+      refresh_binary_path
+      if sing_box_installed; then
+        ver=$($SING_BOX_BIN version 2>/dev/null | sed -n '1s/^sing-box version //p')
+        [[ -n $ver ]] || ver="已安装"
+      fi
+      printf '%s %s %s' "$svc" "$boot" "$ver"
+      ;;
+    openrc)
+      local svc="未安装" boot="未安装" ver="未安装"
+      if service_exists; then
+        service_is_active && svc="运行中" || svc="已停止"
+        service_is_enabled && boot="已开启" || boot="已关闭"
+      fi
+      refresh_binary_path
+      if sing_box_installed; then
+        ver=$($SING_BOX_BIN version 2>/dev/null | sed -n '1s/^sing-box version //p')
+        [[ -n $ver ]] || ver="已安装"
+      fi
+      printf '%s %s %s' "$svc" "$boot" "$ver"
+      ;;
+    *) printf '未安装 未安装 未安装' ;;
+  esac
+}
+
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
     [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'

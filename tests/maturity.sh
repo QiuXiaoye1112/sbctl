@@ -156,4 +156,70 @@ declare -f apt_get_guarded | grep -Fq 'Acquire::Retries=2'
 declare -f apt_get_guarded | grep -Fq 'Acquire::ForceIPv4=true'
 BASH
 
+# Production systemd service summary ─ single systemctl show call
+CASE2="$TMP/systemd-prod"
+MOCK2="$CASE2/bin"
+mkdir -p "$MOCK2" "$CASE2/cfg" "$CASE2/certs"
+
+cat >"$MOCK2/systemctl" <<'SH'
+#!/usr/bin/env bash
+printf 'called\n' >>"${CASE2}/syscalls"
+case "$*" in
+  *show*LoadState*|*show*ActiveState*|*show*UnitFileState*)
+    printf 'LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n'
+    exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$MOCK2/systemctl"
+
+cat >"$MOCK2/sing-box" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *version*) printf 'sing-box version 1.14.0\n' ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$MOCK2/sing-box"
+
+CASE="$CASE2" \
+CASE2="$CASE2" \
+PATH="$MOCK2:$PATH" \
+SBCTL_TESTING=0 \
+SBCTL_SING_BOX_BIN="$MOCK2/sing-box" \
+SBCTL_CONFIG_DIR="$CASE2/cfg" \
+SBCTL_CONFIG_FILE="$CASE2/cfg/config.json" \
+SBCTL_META_FILE="$CASE2/meta.json" \
+SBCTL_CERT_DIR="$CASE2/certs" \
+SBCTL_BACKUP_DIR="$CASE2/backups" \
+SBCTL_DATA_DIR="$CASE2/data" \
+SBCTL_SYSTEMD_UNIT_DIR="$CASE2/systemd" \
+SBCTL_COMMAND_PATH="$CASE2/bin/sbctl" \
+SBCTL_SYMLINK_PATH="$CASE2/bin/sbctl-link" \
+SBCTL_LOCK_FILE="$CASE2/lock" \
+SBCTL_CERTBOT_HOOK_DIR="$CASE2/hooks" \
+SBCTL_CERTBOT_VENV="$CASE2/certbot-venv" \
+SBCTL_CERTBOT_CONFIG_DIR="$CASE2/certbot-config" \
+SBCTL_CERTBOT_WORK_DIR="$CASE2/certbot-work" \
+SBCTL_CERTBOT_LOGS_DIR="$CASE2/certbot-logs" \
+bash <<'BASH2'
+set -Eeuo pipefail
+source ./sbctl.sh
+
+init_system() { printf 'systemd'; }
+sing_box_installed() { return 0; }
+
+result=$(_service_summary_all)
+calls=$(wc -l <"$CASE2/syscalls" 2>/dev/null || printf 0)
+
+if [[ $result != "运行中 已开启 1.14.0" ]]; then
+  printf 'FAIL: expected "运行中 已开启 1.14.0", got "%s"\n' "$result" >&2
+  exit 1
+fi
+if ((calls != 1)); then
+  printf 'FAIL: expected 1 systemctl call, got %d\n' "$calls" >&2
+  exit 1
+fi
+BASH2
+
 echo 'maturity hardening tests passed.'
