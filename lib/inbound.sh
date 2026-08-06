@@ -120,32 +120,23 @@ build_inbound() {
   prompt_tag tag "${type}-$(random_hex 2)"
   prompt_value listen "监听地址" "0.0.0.0"
 
-  # VLESS: decide TLS before asking for client host
-  #   REALITY → prompt_public_host (client_host may differ from SNI)
-  #   cert TLS → client_host comes from certificate server_name
-  if [[ $type == vless ]]; then
-    choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-    if [[ $choice == 1 ]]; then
-      build_reality_tls tls reality_public || return 1
-      prompt_public_host client_host
-    else
-      build_certificate_tls tls client_host || return 1
-    fi
-    prompt_port port 443
-  else
-    prompt_public_host client_host
-  fi
-
+  # ---- client_host resolution ----
+  #   cert TLS   → auto from certificate server_name (no prompt_public_host)
+  #   REALITY    → prompt_public_host (client_host may differ from SNI)
+  #   no TLS     → prompt_public_host
   case $type in
-    anytls|trojan)
+    vless|anytls|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-      if [[ $choice == 1 ]]; then build_reality_tls tls reality_public || return 1; else build_certificate_tls tls || return 1; fi
+      if [[ $choice == 1 ]]; then
+        build_reality_tls tls reality_public || return 1
+        prompt_public_host client_host
+      else
+        build_certificate_tls tls client_host || return 1
+      fi
       prompt_port port 443
       ;;
-    vless)
-      ;; # TLS and port already handled above
     hysteria2)
-      build_certificate_tls tls || return 1
+      build_certificate_tls tls client_host || return 1
       local hop_choice
       choose hop_choice "端口模式" "普通端口" "端口跳跃"
       if [[ $hop_choice == 2 ]]; then
@@ -163,7 +154,8 @@ build_inbound() {
         prompt_port port 443
       fi
       ;;
-    *)
+    socks|http|mixed)
+      prompt_public_host client_host
       prompt_port port 443
       ;;
   esac
