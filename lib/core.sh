@@ -42,7 +42,7 @@ cleanup_session_on_exit() {
     rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
   fi
   if [[ -n ${_SBC_LOCK_DIR:-} && -d ${_SBC_LOCK_DIR:-} ]]; then
-    rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
+    rm -rf "$_SBC_LOCK_DIR" 2>/dev/null || true
   fi
   cleanup_action_on_exit
 }
@@ -321,38 +321,28 @@ ensure_dependencies() {
   acquire_lock
 }
 
-_lock_is_stale() {
-  local path=$1
-  [[ -e $path ]] && find "$path" -prune -mmin +4 2>/dev/null | grep -q .
-}
-
 acquire_lock() {
   # Re-entrant: if we already hold the lock, return immediately
   [[ ${_SBC_LOCK_HELD:-0} == 1 ]] && return 0
   mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
   if command_exists flock; then
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-      if _lock_is_stale "$LOCK_FILE"; then
-        warn "检测到过期锁文件，自动清除。"
-        exec 9>&-; rm -f "$LOCK_FILE"
-        exec 9>"$LOCK_FILE"
-        flock -n 9 || die "另一个 sbctl 操作正在运行。"
-      else
-        die "另一个 sbctl 操作正在运行。"
-      fi
-    fi
+    flock -n 9 || die "另一个 sbctl 操作正在运行。"
   else
     _SBC_LOCK_DIR="${LOCK_FILE}.d"
     if ! mkdir "$_SBC_LOCK_DIR" 2>/dev/null; then
-      if _lock_is_stale "$_SBC_LOCK_DIR"; then
-        warn "检测到过期锁目录，自动清除。"
+      # Check if the lock holder is still alive
+      local pid
+      pid=$(cat "$_SBC_LOCK_DIR/pid" 2>/dev/null || true)
+      if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+        warn "检测到过期锁（PID ${pid} 已不存在），自动清除。"
         rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
         mkdir "$_SBC_LOCK_DIR" 2>/dev/null || die "另一个 sbctl 操作正在运行。"
       else
         die "另一个 sbctl 操作正在运行。"
       fi
     fi
+    printf '%s' "$$" > "$_SBC_LOCK_DIR/pid"
   fi
   _SBC_LOCK_HELD=1
 }
