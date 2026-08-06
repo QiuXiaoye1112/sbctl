@@ -30,8 +30,8 @@ ensure_certbot_environment() {
     esac || die "Python/venv 安装失败。"
     install -d -m 755 "$(dirname "$CERTBOT_VENV")"
     if [[ ! -x $CERTBOT_VENV/bin/python ]]; then
-      if ! python3 -m venv "$CERTBOT_VENV" 2>/dev/null; then
-        python3 -m venv --without-pip "$CERTBOT_VENV" || die "无法创建 Certbot venv。"
+      if ! run_bounded 120 python3 -m venv "$CERTBOT_VENV" 2>/dev/null; then
+        run_bounded 120 python3 -m venv --without-pip "$CERTBOT_VENV" || die "无法创建 Certbot venv。"
         local bootstrap
         bootstrap=$(temp_file)
         curl --fail --location --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 15 --max-time 60 \
