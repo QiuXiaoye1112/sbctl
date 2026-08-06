@@ -1,30 +1,37 @@
 # shellcheck shell=bash
 # Session-level cache for values that don't change during sbctl's lifetime.
-# Uses files under /tmp (not global variables) so cache survives $(...) subshells.
-# Cache directory is cleaned up on shell exit — no persistent files.
+# Uses mktemp-created directory under /tmp — survives $(...) subshells.
+# Cleanup is handled by core.sh's unified cleanup_on_exit (single EXIT trap).
 
-_SBC_CACHE_DIR="${TMPDIR:-/tmp}/sbctl-cache-$$"
-mkdir -p "$_SBC_CACHE_DIR" 2>/dev/null || true
-# shellcheck disable=SC2064
-trap "rm -rf $_SBC_CACHE_DIR" EXIT
+_SBC_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cache.XXXXXX") || {
+  printf '[错误] 无法创建 sbctl 缓存目录\n' >&2
+  _SBC_CACHE_DIR=""
+}
+if [[ -n $_SBC_CACHE_DIR ]]; then
+  chmod 700 "$_SBC_CACHE_DIR" 2>/dev/null || true
+fi
 
 _sbc_cached() {
   local key=$1
-  [[ -f $_SBC_CACHE_DIR/$key ]] && cat "$_SBC_CACHE_DIR/$key" 2>/dev/null
+  [[ -n $_SBC_CACHE_DIR && -f $_SBC_CACHE_DIR/$key ]] && cat "$_SBC_CACHE_DIR/$key" 2>/dev/null
 }
 
 _sbc_cache() {
   local key=$1 value=$2
+  [[ -n $_SBC_CACHE_DIR ]] || return
   printf '%s' "$value" > "$_SBC_CACHE_DIR/$key" 2>/dev/null || true
 }
 
 sbc_invalidate_install_cache() {
+  [[ -n $_SBC_CACHE_DIR ]] || return
   rm -f "$_SBC_CACHE_DIR/_sbc_sing_box_bin" "$_SBC_CACHE_DIR/_sbc_sing_box_version" 2>/dev/null || true
 }
 
 sbc_cache_flush() {
-  rm -rf "$_SBC_CACHE_DIR" 2>/dev/null || true
-  mkdir -p "$_SBC_CACHE_DIR" 2>/dev/null || true
+  [[ -n $_SBC_CACHE_DIR ]] || return
+  rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
+  _SBC_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cache.XXXXXX") || _SBC_CACHE_DIR=""
+  [[ -z $_SBC_CACHE_DIR ]] || chmod 700 "$_SBC_CACHE_DIR" 2>/dev/null || true
 }
 
 # Cached init_system — runs once per session
@@ -82,12 +89,25 @@ sing_box_installed() {
   [[ -x $SING_BOX_BIN ]] || command_exists sing-box
 }
 
-# Fetch all service states in one call — returns "LoadState ActiveState UnitFileState"
+# ---- service state: single systemctl show, pure-bash parsing ----
+
+# Fetch all service states. Output: "load active unitfile" (three words).
+# systemd: one systemctl show call, parsed with bash parameter expansion.
+# openrc:  one rc-service + one rc-update call.
 _service_states() {
   case $(init_system) in
     systemd)
-      systemctl show "$SERVICE_NAME" -p LoadState -p ActiveState -p UnitFileState --no-pager 2>/dev/null \
-        | awk -F= '{printf "%s ", $2}'
+      local output load active unitfile
+      output=$(systemctl show "$SERVICE_NAME" -p LoadState -p ActiveState -p UnitFileState --no-pager 2>/dev/null) || {
+        printf 'not-found inactive disabled'
+        return
+      }
+      # Pure-bash extraction from systemctl show output lines.
+      # Format: LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n
+      load=${output#*LoadState=}; load=${load%%$'\n'*}
+      active=${output#*ActiveState=}; active=${active%%$'\n'*}
+      unitfile=${output#*UnitFileState=}; unitfile=${unitfile%%$'\n'*}
+      printf '%s %s %s' "${load:-not-found}" "${active:-inactive}" "${unitfile:-disabled}"
       ;;
     openrc)
       local active=inactive enabled=disabled
@@ -103,44 +123,40 @@ _service_states() {
 service_exists() {
   if [[ ${SBCTL_TESTING:-0} == 1 ]]; then return 1; fi
   local load
-  load=$(_service_states | awk '{print $1}')
+  read -r load _ <<< "$(_service_states)"
   [[ $load != not-found ]]
 }
 
 service_is_active() {
   if [[ ${SBCTL_TESTING:-0} == 1 ]]; then return 1; fi
-  local active
-  active=$(_service_states | awk '{print $2}')
+  local _load active
+  read -r _load active _ <<< "$(_service_states)"
   [[ $active == active ]]
 }
 
 service_is_enabled() {
-  local unitfile
-  unitfile=$(_service_states | awk '{print $3}')
+  local _load _active unitfile
+  read -r _load _active unitfile <<< "$(_service_states)"
   [[ $unitfile == enabled ]]
 }
 
-# Combined service state summaries — single systemctl call for all states
+# Single call returns all three summaries as space-separated tokens.
+# Callers use `read -r svc boot ver <<< "$(_service_summary_all)"`.
 _service_summary_all() {
-  # Output: "running_state startup_state version"
   if [[ ${SBCTL_TESTING:-0} == 1 ]]; then
     printf '未安装 未安装 %s' "$(sing_box_version_summary)"
     return
   fi
-  local states load active unitfile
-  states=$(_service_states)
-  load=$(echo "$states" | awk '{print $1}')
-  active=$(echo "$states" | awk '{print $2}')
-  unitfile=$(echo "$states" | awk '{print $3}')
-
-  local service_str startup_str
-  if [[ $load == not-found ]]; then service_str=未安装; elif [[ $active == active ]]; then service_str=运行中; else service_str=已停止; fi
-  if [[ $unitfile == enabled ]]; then startup_str=已开启; else startup_str=已关闭; fi
-  printf '%s %s %s' "$service_str" "$startup_str" "$(sing_box_version_summary)"
+  local load active unitfile svc boot ver
+  read -r load active unitfile <<< "$(_service_states)"
+  if [[ $load == not-found ]]; then svc=未安装; elif [[ $active == active ]]; then svc=运行中; else svc=已停止; fi
+  if [[ $unitfile == enabled ]]; then boot=已开启; else boot=已关闭; fi
+  ver=$(sing_box_version_summary)
+  printf '%s %s %s' "$svc" "$boot" "$ver"
 }
 
-service_state_summary() { _service_summary_all | awk '{print $1}'; }
-startup_state_summary() { _service_summary_all | awk '{print $2}'; }
+service_state_summary() { local s; read -r s _ <<< "$(_service_summary_all)"; printf '%s' "$s"; }
+startup_state_summary() { local _ s; read -r _ s _ <<< "$(_service_summary_all)"; printf '%s' "$s"; }
 
 sing_box_version_summary() {
   local v
@@ -149,19 +165,17 @@ sing_box_version_summary() {
 }
 
 node_summary() {
-  local service_str count=0 version_str
+  local svc count=0 ver
   if [[ ${SBCTL_TESTING:-0} != 1 ]]; then
-    local states load active
-    states=$(_service_states)
-    load=$(echo "$states" | awk '{print $1}')
-    active=$(echo "$states" | awk '{print $2}')
-    if [[ $load == not-found ]]; then service_str=未安装
-    elif [[ $active == active ]]; then service_str=运行中
-    else service_str=已停止; fi
+    local load active
+    read -r load active _ <<< "$(_service_states)"
+    if [[ $load == not-found ]]; then svc=未安装
+    elif [[ $active == active ]]; then svc=运行中
+    else svc=已停止; fi
   else
-    service_str=未安装
+    svc=未安装
   fi
   [[ -f $CONFIG_FILE ]] && count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf 0)
-  version_str=$(sing_box_version_summary)
-  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$service_str" "$count" "${version_str:-已安装}"
+  ver=$(sing_box_version_summary)
+  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$svc" "$count" "${ver:-已安装}"
 }

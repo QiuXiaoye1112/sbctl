@@ -26,7 +26,17 @@ on_error() {
 }
 trap on_error ERR
 
+# Single unified EXIT cleanup — covers cache dir, lock dir, cert service restore.
 cleanup_on_exit() {
+  # Cache directory cleanup (from lib/cache.sh)
+  if [[ -n ${_SBC_CACHE_DIR:-} && -d ${_SBC_CACHE_DIR:-} ]]; then
+    rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
+  fi
+  # Lock directory cleanup (from acquire_lock, mkdir-based fallback)
+  if [[ -n ${_SBC_LOCK_DIR:-} && -d ${_SBC_LOCK_DIR:-} ]]; then
+    rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
+  fi
+  # Certbot stopped-service restore
   if [[ ${CERT_STOPPED_SERVICE:-0} == 1 ]]; then
     service_start >/dev/null 2>&1 || true
     CERT_STOPPED_SERVICE=0
@@ -301,9 +311,8 @@ acquire_lock() {
     exec 9>"$LOCK_FILE"
     flock -n 9 || die "另一个 sbctl 操作正在运行。"
   else
-    local lock_dir="${LOCK_FILE}.d"
-    mkdir "$lock_dir" 2>/dev/null || die "另一个 sbctl 操作正在运行。"
-    trap 'rmdir "'"$lock_dir"'" 2>/dev/null || true; cleanup_on_exit' EXIT
+    _SBC_LOCK_DIR="${LOCK_FILE}.d"
+    mkdir "$_SBC_LOCK_DIR" 2>/dev/null || die "另一个 sbctl 操作正在运行。"
   fi
   _SBC_LOCK_HELD=1
 }

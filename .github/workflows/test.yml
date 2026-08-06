@@ -1,0 +1,64 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bash-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: |
+          for f in sbctl.sh lib/*.sh; do
+            bash -n "$f" || { echo "FAIL: $f"; exit 1; }
+          done
+          echo "All syntax OK"
+
+  perf-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq openssl
+      - name: perf baseline
+        run: bash tests/perf-baseline.sh
+
+  core-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq openssl
+      - name: smoke
+        run: sudo bash tests/smoke-current.sh
+      - name: lifecycle
+        run: sudo bash tests/lifecycle.sh
+      - name: cloudflare
+        run: sudo bash tests/cloudflare.sh
+      - name: maturity
+        run: sudo bash tests/maturity.sh
+      - name: outbound
+        run: sudo bash tests/outbound.sh
+      - name: legacy-config
+        run: sudo bash tests/legacy-config.sh
+      - name: reality-share
+        run: sudo bash tests/reality-share.sh
+      - name: protocol-surface
+        run: sudo bash tests/protocol-surface.sh
+      - name: no-firewall
+        run: sudo bash tests/no-firewall.sh
+      - name: ui
+        run: sudo bash tests/ui.sh
+
+  alpine-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sh syntax check
+        run: |
+          sh -n alpine/install.sh
+          echo "Alpine install.sh syntax OK"
