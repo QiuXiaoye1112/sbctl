@@ -1,4 +1,4 @@
-# Compatibility and migration helpers for pre-sbctl / hand-written sing-box configs.
+# Normalization helpers called from ensure_config (engine.sh).
 
 _config_has_missing_tags() {
   jq -e '
@@ -64,16 +64,4 @@ normalize_config_tags() {
   install -m 600 "$work" "$CONFIG_FILE"
   rm -f "$work"
   warn "检测到旧配置缺少 tag，已自动补全 ${changed} 个标签；原配置备份：${backup}"
-}
-
-# Override engine.sh's base ensure_config with legacy-config normalization.
-ensure_config() {
-  [[ -f $CONFIG_FILE ]] || write_default_config
-  jq -e 'type=="object" and (.inbounds|type=="array") and (.outbounds|type=="array")' "$CONFIG_FILE" >/dev/null || die "配置不是有效的 sing-box JSON：$CONFIG_FILE"
-  normalize_config_tags
-  jq -e '
-    all(.inbounds[]?; ((.tag // "")|type)=="string" and ((.tag // "")!="")) and
-    all(.outbounds[]?; ((.tag // "")|type)=="string" and ((.tag // "")!=""))
-  ' "$CONFIG_FILE" >/dev/null || die "配置中的入站/出站标签仍不完整。"
-  init_meta
 }

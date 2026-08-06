@@ -76,9 +76,10 @@ print_share() {
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
       obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
       obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
+      share_port=$(hy2_hop_client_port_spec "$tag" "$port")
       while IFS=$'\t' read -r name value; do
         [[ -z $filter || $name == "$filter" ]] || continue
-        link="hysteria2://$(url_encode "$value")@${uri_host}:${port}?sni=$(url_encode "$sni")"
+        link="hysteria2://$(url_encode "$value")@${uri_host}:${share_port}?sni=$(url_encode "$sni")"
         [[ -z $obfs ]] || link+="&obfs=$(url_encode "$obfs")&obfs-password=$(url_encode "$obfs_password")"
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"

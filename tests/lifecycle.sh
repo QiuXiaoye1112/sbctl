@@ -8,7 +8,7 @@ bash -n sbctl.sh
 bash -n lib/certmeta.sh
 bash -n lib/certops.sh
 bash -n lib/uninstall.sh
-bash -n lib/enhancements.sh
+bash -n lib/menu.sh
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

@@ -236,6 +236,7 @@ HY="$MOCK/hy2"
 mkdir -p "$HY/certs"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=example.com' \
   -keyout "$HY/certs/example.com.key" -out "$HY/certs/example.com.crt" >/dev/null 2>&1
+SBCTL_TESTING=1 \
 SBCTL_SING_BOX_BIN="$MOCK/sing-box" \
 SBCTL_CONFIG_DIR="$HY/cfg" \
 SBCTL_CONFIG_FILE="$HY/cfg/config.json" \

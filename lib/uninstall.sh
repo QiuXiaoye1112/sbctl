@@ -229,4 +229,9 @@ uninstall_sing_box() {
     2) _sbctl_uninstall_level_2;;
     *) die "无效卸载级别：$level";;
   esac
+  # Clean up Hysteria2 port hopping rules if sing-box was removed
+  if ! sing_box_installed; then
+    hy2_hop_clear_rules
+    hy2_hop_boot_service_remove
+  fi
 }

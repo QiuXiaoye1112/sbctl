@@ -43,7 +43,10 @@ else
 fi
 unset _repo_lib
 
-for _module in core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare network_guard state_guard system_guard; do
+# Module loading order: cache → core → ui → engine → compat → certmeta →
+# inbound → outbound → clients → share → reality → certops → cloudflare →
+# hy2_hop → hy2_create → hy2_nft → network_guard → protocols → menu → uninstall → system_guard
+for _module in cache core ui engine compat certmeta inbound certificate reality outbound clients share ops certops cloudflare hy2_hop hy2_create hy2_nft network_guard protocols system_guard menu uninstall; do
   [[ -r "$LIB_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$LIB_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$LIB_DIR/${_module}.sh"

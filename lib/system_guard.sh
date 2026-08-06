@@ -1,72 +1,6 @@
 # shellcheck shell=bash
-# Service sandboxing, BBR safety, diagnostics and residual scanning.
-
-create_service_definition() {
-  refresh_binary_path
-  mkdir -p "$DATA_DIR" "$CONFIG_DIR"
-  case $(init_system) in
-    systemd)
-      mkdir -p "$SYSTEMD_UNIT_DIR"
-      cat >"${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" <<EOF_UNIT
-[Unit]
-Description=sing-box service managed by sbctl
-Documentation=https://sing-box.sagernet.org/
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-ExecStart=${SING_BOX_BIN} run -D ${DATA_DIR} -c ${CONFIG_FILE}
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=infinity
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectHostname=true
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictRealtime=true
-ReadWritePaths=${DATA_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF_UNIT
-      systemctl daemon-reload
-      meta_resource_register serviceDefinition "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
-      ;;
-    openrc)
-      mkdir -p "$OPENRC_INIT_DIR"
-      cat >"${OPENRC_INIT_DIR}/$SERVICE_NAME" <<EOF_RC
-#!/sbin/openrc-run
-name="sing-box"
-description="sing-box service managed by sbctl"
-command="${SING_BOX_BIN}"
-command_args="run -D ${DATA_DIR} -c ${CONFIG_FILE}"
-command_user="root:root"
-supervisor="supervise-daemon"
-respawn_delay=3
-respawn_max=0
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.log"
-umask 077
-depend() { need net; }
-EOF_RC
-      chmod 755 "${OPENRC_INIT_DIR}/$SERVICE_NAME"
-      meta_resource_register serviceDefinition "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
-      ;;
-    *) die "未检测到 systemd 或 OpenRC。";;
-  esac
-  meta_resource_register dataDir "$DATA_DIR"
-}
+# BBR safety, diagnostics and residual scanning.
+# Service definition lives in engine.sh (canonical, hardened version).
 
 enable_bbr() {
   ensure_dependencies bbr
@@ -119,44 +53,8 @@ disable_bbr() {
   meta_resource_remove bbrConfig
   info "BBR 已关闭；当前拥塞控制算法：${fallback}。"
 }
-
-_remove_bbr_settings() {
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback="" current=""
-  [[ -f $config ]] || return 0
-  grep -q '^# managed by sbctl$' "$config" 2>/dev/null || { warn "BBR 配置不属于 sbctl，跳过：$config"; return 0; }
-  current=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
-  if [[ $current == bbr && -w /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-    available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
-    if grep -qw cubic <<<"$available"; then fallback=cubic; elif grep -qw reno <<<"$available"; then fallback=reno; fi
-    if [[ -n $fallback ]]; then run_bounded 5 sysctl -w net.ipv4.tcp_congestion_control="$fallback" >/dev/null 2>&1 || true; fi
-  fi
-  rm -f "$config"
-}
-
-_scan_sbctl_residuals() {
-  local __count_var=$1 include_backups=${2:-0} count=0 path data_path service_path cf_path
-  local paths=("$QUICK_COMMAND" "$QUICK_SYMLINK" "$CONFIG_FILE" "$META_FILE" "$CERT_DIR" "$CERTBOT_VENV" "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR" \
-    "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" /etc/periodic/daily/sbctl-certbot-renew /var/log/sing-box.log)
-  case $(init_system) in
-    systemd) service_path="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service";;
-    openrc) service_path="${OPENRC_INIT_DIR}/${SERVICE_NAME}";;
-  esac
-  [[ -z ${service_path:-} ]] || paths+=("$service_path")
-  [[ $LIB_DIR != /usr/local/lib/sbctl ]] || paths+=("$LIB_DIR")
-  data_path=$(_snapshot_meta_resource_get dataDir 2>/dev/null || true)
-  [[ -z $data_path ]] || paths+=("$data_path")
-  cf_path=$(_snapshot_meta_resource_get cloudflareCredentials 2>/dev/null || true)
-  [[ -z $cf_path ]] || paths+=("$cf_path")
-  ((include_backups == 0)) || paths+=("$BACKUP_DIR" /etc/sysctl.d/99-sbctl-bbr.conf)
-  for path in "${paths[@]}"; do
-    [[ ! -e $path && ! -L $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }
-  done
-  for path in "$CERTBOT_HOOK_DIR"/sbctl-*; do
-    [[ ! -e $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }
-  done
-  if pgrep -x sing-box >/dev/null 2>&1; then printf '  ✗ 残留: sing-box 进程仍在运行\n'; ((count+=1)); fi
-  printf -v "$__count_var" '%s' "$count"
-}
+# Canonical _remove_bbr_settings lives in uninstall.sh
+# Canonical _scan_sbctl_residuals lives in uninstall.sh
 
 system_diagnostics() {
   ensure_dependencies diagnose

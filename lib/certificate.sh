@@ -1,21 +1,6 @@
-# TLS certificate interaction aligned with xrayctl.
-
-select_managed_certificate() {
-  local __var=$1 always_choose=${2:-0} cert answer cert_identifier
-  local identifiers=()
-  for cert in "$CERT_DIR"/*.crt; do
-    [[ -e $cert && -r $cert && -r ${cert%.crt}.key ]] || continue
-    cert_identifier=$(basename "$cert" .crt)
-    identifiers+=("$cert_identifier")
-  done
-  ((${#identifiers[@]} > 0)) || { warn "没有可用的托管证书。"; return 1; }
-  if ((${#identifiers[@]} == 1)) && [[ $always_choose != 1 ]]; then
-    printf -v "$__var" '%s' "${identifiers[0]}"
-    return 0
-  fi
-  choose answer "选择证书" "${identifiers[@]}"
-  printf -v "$__var" '%s' "${identifiers[$((answer-1))]}"
-}
+# shellcheck shell=bash
+# TLS certificate server-name helpers aligned with xrayctl.
+# Canonical select_managed_certificate and build_certificate_tls live in inbound.sh.
 
 certificate_server_names() {
   local cert=$1 san concrete
@@ -81,10 +66,4 @@ prompt_tls_certificate() {
   printf -v "$__cert" '%s' "$cert_value"
   printf -v "$__key" '%s' "$key_value"
   printf -v "$__sni" '%s' "$sni_value"
-}
-
-build_certificate_tls() {
-  local __json=$1 cert key sni
-  prompt_tls_certificate cert key sni || return 1
-  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$cert" --arg key "$key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
 }

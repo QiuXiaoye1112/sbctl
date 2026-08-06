@@ -1,197 +1,5 @@
-import_certificate() {
-  ensure_dependencies cert-import
-  local identifier=${1-} cert=${2-} key=${3-}
-  [[ -n $identifier ]] || prompt_value identifier "证书标识/域名"
-  [[ $identifier =~ ^[A-Za-z0-9_.-]+$ ]] || die "证书标识无效。"
-  [[ -n $cert ]] || prompt_value cert "证书文件路径"
-  [[ -n $key ]] || prompt_value key "私钥文件路径"
-  validate_certificate_pair "$cert" "$key" || { warn "证书或私钥无效/不匹配。"; return 0; }
-  mkdir -p "$CERT_DIR"
-  install -m 600 "$cert" "$CERT_DIR/${identifier}.crt"
-  install -m 600 "$key" "$CERT_DIR/${identifier}.key"
-  info "证书已导入：${identifier}"
-}
-
-certbot_supports_ip() {
-  command_exists certbot && certbot --help all 2>/dev/null | grep -q -- '--ip-address'
-}
-
-install_certbot() {
-  local mode=${1:-domain}
-  if command_exists certbot; then
-    if [[ $mode == ip ]] && ! certbot_supports_ip; then
-      warn "当前 Certbot 不支持 IP 证书，请升级 certbot 或使用域名证书。"
-      return 0
-    fi
-    return 0
-  fi
-  if [[ $mode == ip ]] && ! certbot_supports_ip 2>/dev/null; then
-    # 系统 certbot 可能太旧，用 pip 安装新版
-    install_packages python3 python3-pip || die "Python/pip 安装失败。"
-    pip3 install certbot >/dev/null 2>&1 || install_packages certbot
-  else
-    install_packages certbot
-  fi
-}
-
-write_certbot_hook() {
-  local domain=$1 hook
-  hook="${CERTBOT_HOOK_DIR}/sbctl-${domain}"
-  mkdir -p "$(dirname "$hook")"
-  case $(init_system) in
-    systemd)
-      cat >"$hook" <<EOF_HOOK
-#!/usr/bin/env bash
-set -e
-install -m 600 /etc/letsencrypt/live/${domain}/fullchain.pem ${CERT_DIR}/${domain}.crt
-install -m 600 /etc/letsencrypt/live/${domain}/privkey.pem ${CERT_DIR}/${domain}.key
-systemctl try-restart ${SERVICE_NAME}.service || true
-EOF_HOOK
-      ;;
-    openrc)
-      cat >"$hook" <<EOF_HOOK
-#!/usr/bin/env bash
-set -e
-install -m 600 /etc/letsencrypt/live/${domain}/fullchain.pem ${CERT_DIR}/${domain}.crt
-install -m 600 /etc/letsencrypt/live/${domain}/privkey.pem ${CERT_DIR}/${domain}.key
-rc-service ${SERVICE_NAME} restart || true
-EOF_HOOK
-      ;;
-  esac
-  chmod 700 "$hook"
-}
-
-setup_certbot_renewal_timer() {
-  local certbot_path
-  certbot_path=$(command -v certbot) || return 1
-  case $(init_system) in
-    systemd)
-      cat >/etc/systemd/system/sbctl-certbot-renew.service <<EOF
-[Unit]
-Description=Renew certificates managed by sbctl
-[Service]
-Type=oneshot
-ExecStart=${certbot_path} renew --quiet
-EOF
-      cat >/etc/systemd/system/sbctl-certbot-renew.timer <<'EOF'
-[Unit]
-Description=Renew certificates managed by sbctl
-[Timer]
-OnCalendar=*-*-* 00,12:00:00
-RandomizedDelaySec=1h
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOF
-      systemctl daemon-reload
-      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
-      ;;
-    openrc)
-      mkdir -p /etc/periodic/daily
-      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF
-#!/bin/sh
-${certbot_path} renew --quiet
-EOF
-      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
-      ;;
-  esac
-}
-
-issue_certificate() {
-  ensure_dependencies cert-issue
-  local domain=${1-} email=${2-} active=0 mode=domain verify_method=http default_domain=""
-  if [[ -z $domain ]]; then
-    default_domain=$(detect_public_ipv4 || true)
-    [[ -n $default_domain ]] || default_domain=$(detect_public_ipv6 || true)
-    while true; do
-      prompt_value domain "证书域名/IP" "$default_domain"
-      if validate_ip_literal "$domain"; then mode=ip; break; fi
-      if validate_domain "$domain"; then break; fi
-      warn "证书域名/IP 无效，请重新输入。"
-    done
-  else
-    if validate_ip_literal "$domain"; then mode=ip
-    elif ! validate_domain "$domain"; then die "证书域名/IP 无效。"; fi
-  fi
-
-  # 域名可选 DNS 验证，IP 只能用 HTTP
-  if [[ $mode == domain ]]; then
-    choose verify_method "选择验证方式" "DNS (手动添加 TXT 记录)" "HTTP (需要 80 端口可访问)"
-    if [[ $verify_method == 1 ]]; then
-      verify_method=dns-manual
-    fi
-  fi
-
-  while [[ -z $email ]]; do
-    prompt_value email "Let's Encrypt 联系邮箱"
-    if [[ $email == *@*.* && $email != *" "* ]]; then break; fi
-    warn "邮箱格式无效，请重新输入。"
-    email=""
-  done
-  install_certbot "$mode"
-  if [[ -f ${CERT_DIR}/${domain}.crt && -f ${CERT_DIR}/${domain}.key ]]; then
-    local using_inbounds
-    using_inbounds=$(jq -r --arg cert "${CERT_DIR}/${domain}.crt" \
-      '.inbounds[]?|select(.tls.certificate_path==$cert)|.tag' "$CONFIG_FILE" 2>/dev/null | paste -sd ',')
-    if [[ -n $using_inbounds ]]; then
-      confirm "证书 ${domain} 正在被 ${using_inbounds} 使用，是否强制重新签发？" N || { info "已取消。"; return 0; }
-    else
-      confirm "证书 ${domain} 已存在，是否强制重新签发？" N || { info "已取消。"; return 0; }
-    fi
-  fi
-
-  local certbot_args
-  if [[ $verify_method == dns-manual ]]; then
-    info "Certbot 将提示添加 TXT 记录，请在 DNS 面板添加后回车继续。"
-    certbot_args=(certonly --manual --agree-tos -m "$email" --force-renewal
-      --preferred-challenges dns -d "$domain")
-  else
-    service_is_active && { active=1; service_stop; CERT_STOPPED_SERVICE=1; }
-    certbot_args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http -m "$email" --force-renewal)
-    if [[ $mode == ip ]]; then
-      certbot_args+=(--preferred-profile shortlived --ip-address "$domain")
-    else
-      certbot_args+=(-d "$domain")
-    fi
-  fi
-  setup_certbot_renewal_timer
-  if ! certbot "${certbot_args[@]}"; then
-    if ((active)); then service_start; CERT_STOPPED_SERVICE=0; fi
-    warn "证书签发失败，请查看上方 Certbot 输出的具体原因。"
-    return 0
-  fi
-  mkdir -p "$CERT_DIR"
-  install -m 600 "/etc/letsencrypt/live/${domain}/fullchain.pem" "$CERT_DIR/${domain}.crt"
-  install -m 600 "/etc/letsencrypt/live/${domain}/privkey.pem" "$CERT_DIR/${domain}.key"
-  write_certbot_hook "$domain"
-  if ((active)); then
-    service_start; CERT_STOPPED_SERVICE=0
-  elif [[ $verify_method == dns-manual ]] && service_is_active; then
-    service_restart
-  fi
-  info "证书已签发并托管：${domain}"
-}
-
-list_certificates() {
-  local cert found=0
-  for cert in "$CERT_DIR"/*.crt; do
-    [[ -r $cert ]] || continue
-    found=1
-    printf '%s\n' "$(basename "$cert" .crt)"
-    openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
-  done
-  ((found)) || info "没有托管证书。"
-}
-
-delete_certificate() {
-  ensure_dependencies cert-delete
-  local identifier=${1-}
-  [[ -n $identifier ]] || select_managed_certificate identifier || return
-  if jq -e --arg cert "$CERT_DIR/${identifier}.crt" '.inbounds[]?|select(.tls.certificate_path==$cert)' "$CONFIG_FILE" >/dev/null; then warn "该证书正在被入站使用，不能删除。"; return 0; fi
-  confirm "删除托管证书 ${identifier}？" N || return
-  rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" "/etc/letsencrypt/renewal-hooks/deploy/sbctl-${identifier}"
-  info "证书已删除。"
-}
+# shellcheck shell=bash
+# sbctl backup/restore operations — canonical implementations.
 
 backup_all() {
   require_root backup; ensure_config
@@ -200,7 +8,9 @@ backup_all() {
   [[ ! -d $CERT_DIR ]] || paths+=("${CERT_DIR#/}")
   tar -czf "$target" -C / "${paths[@]}" || die "备份失败。"
   chmod 600 "$target"
+  meta_resource_register backupDir "$BACKUP_DIR"
   info "备份已创建：$target"
+  info "提示：备份包含配置、metadata 和证书副本，不包含 Certbot 账户/lineage 数据。"
 }
 
 restore_backup() {
@@ -236,49 +46,20 @@ restore_backup() {
     rm -rf "$temp"
     die "恢复失败，已回滚 config/meta/certs。"
   fi
+  # Post-restore: warn about missing Certbot lineages (from enhancements.sh)
+  local id source auto_renew cert_name warned=0
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    source=$(meta_cert_get_field "$id" source)
+    auto_renew=$(meta_cert_get_field "$id" autoRenew)
+    [[ $source == letsencrypt && $auto_renew == true ]] || continue
+    cert_name=$(meta_cert_get_field "$id" certName)
+    if [[ -z $cert_name || ! -d $CERTBOT_CONFIG_DIR/live/$cert_name ]]; then
+      warn "证书 ${id}: 副本已恢复，但 Certbot lineage 缺失，无法自动续期；请重新签发。"
+      ((warned+=1))
+    fi
+  done < <(meta_cert_list)
+  ((warned == 0)) || warn "共 ${warned} 张自动证书缺少 Certbot 续期数据。"
   rm -rf "$temp"
   info "备份已恢复。"
-}
-
-edit_config() {
-  ensure_dependencies config-edit; ensure_config
-  local editor=${EDITOR:-vi} tmp
-  tmp=$(temp_file); cp -a "$CONFIG_FILE" "$tmp"
-  "$editor" "$tmp"
-  if cmp -s "$tmp" "$CONFIG_FILE"; then info "配置未更改。"; else apply_candidate "$tmp"; fi
-  rm -f "$tmp"
-}
-check_config() { ensure_config; require_supported_core; validate_candidate "$CONFIG_FILE" && info "配置检查通过。"; }
-
-service_action() {
-  ensure_dependencies service
-  local action=$1
-  service_exists || die "sing-box 服务不存在。"
-  case $action in
-    start) service_start;; stop) service_stop;; restart) service_restart;;
-    enable) service_enable; service_start;; disable) service_disable; service_stop;;
-    *) die "未知服务操作：$action";;
-  esac
-  info "服务操作完成：${action}"
-}
-
-show_status() {
-  heading "sing-box 状态"
-  refresh_binary_path
-  if sing_box_installed; then "$SING_BOX_BIN" version | sed -n '1,2p'; else printf 'sing-box: 未安装\n'; fi
-  printf '初始化系统: %s\n' "$(init_system)"
-  if service_exists; then
-    if service_is_active; then printf '服务: 运行中\n'; else printf '服务: 已停止\n'; fi
-    if service_is_enabled; then printf '开机自启: 已开启\n'; else printf '开机自启: 已关闭\n'; fi
-  else printf '服务: 未安装\n'; fi
-  [[ -f $CONFIG_FILE ]] && printf '入站数: %s\n配置: %s\n' "$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?')" "$CONFIG_FILE"
-}
-
-node_summary() {
-  refresh_binary_path
-  local version=未安装 service=未安装 count=0
-  sing_box_installed && version=$($SING_BOX_BIN version 2>/dev/null | sed -n '1s/^sing-box version //p')
-  service_exists && { service_is_active && service=运行中 || service=已停止; }
-  [[ -f $CONFIG_FILE ]] && count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf 0)
-  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$service" "$count" "${version:-已安装}"
 }

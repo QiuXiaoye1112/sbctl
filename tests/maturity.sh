@@ -8,7 +8,7 @@ bash -n sbctl.sh
 bash -n lib/network_guard.sh lib/state_guard.sh lib/system_guard.sh
 bash -n install.sh
 sh -n alpine/install.sh
-grep -Fq 'network_guard state_guard system_guard' sbctl.sh
+grep -Fq 'network_guard protocols system_guard menu uninstall' sbctl.sh
 grep -Fq 'commits/main' install.sh
 grep -Fq 'commits/main' alpine/install.sh
 

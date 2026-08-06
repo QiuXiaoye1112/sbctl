@@ -1,35 +1,77 @@
+# shellcheck shell=bash
+# sbctl menus — canonical interactive UI, dispatch, and help.
+# All menus are defined exactly once. No overrides.
+
+# ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
 manage_inbound_menu() {
-  local tag=$1 choice type port security
+  local tag=$1 choice row
   while inbound_exists "$tag"; do
     clear_screen
-    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-    port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
-    security=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end' "$CONFIG_FILE")
+    # Single-jq: fetch type, port, security, user_count in one call
+    row=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|[.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),((.users//[])|length|tostring)]|@tsv' "$CONFIG_FILE")
+    IFS=$'\t' read -r type port security user_count <<<"$row"
     heading "入站 · ${tag}"
     printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
-    printf '1) 分享信息 / 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
-    read -r -p "请选择: " choice || { echo; return; }
-    case $choice in
-      1) run_menu_action print_share "$tag" ""; pause;;
-      2) client_menu "$tag";;
-      3) modify_inbound_menu "$tag";;
-      4) run_menu_action show_inbound "$tag"; pause;;
-      0) return;; *) warn "无效选项。"; pause;;
+
+    case $type in
+      anytls|vless|trojan|hysteria2)
+        printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        read -r -p "请选择: " choice || { echo; return; }
+        case $choice in
+          1) run_menu_action print_share "$tag"; pause;;
+          2) client_menu "$tag";;
+          3) modify_inbound_menu "$tag";;
+          4) run_menu_action show_inbound "$tag"; pause;;
+          0) return;; *) warn "无效选项。"; pause;;
+        esac
+        ;;
+      socks|http)
+        if ((user_count > 0)); then
+          printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+          read -r -p "请选择: " choice || { echo; return; }
+          case $choice in
+            1) run_menu_action print_share "$tag"; pause;;
+            2) client_menu "$tag";;
+            3) modify_inbound_menu "$tag";;
+            4) run_menu_action show_inbound "$tag"; pause;;
+            0) return;; *) warn "无效选项。"; pause;;
+          esac
+        else
+          printf '1) 客户端配置\n2) 修改入站信息\n3) 查看 JSON\n0) 返回列表\n'
+          read -r -p "请选择: " choice || { echo; return; }
+          case $choice in
+            1) run_menu_action print_share "$tag"; pause;;
+            2) modify_inbound_menu "$tag";;
+            3) run_menu_action show_inbound "$tag"; pause;;
+            0) return;; *) warn "无效选项。"; pause;;
+          esac
+        fi
+        ;;
+      *) warn "不支持的入站协议：${type}"; return;;
     esac
   done
 }
 
+# ---- modify inbound menu (from hy2_hop.sh — adds port hopping for hysteria2) ----
 modify_inbound_menu() {
-  local tag=$1 choice
+  local tag=$1 choice type
   while inbound_exists "$tag"; do
-    clear_screen; heading "修改入站信息 · ${tag}"
-    printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+    clear_screen
+    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+    heading "修改入站信息 · ${tag}"
+    if [[ $type == hysteria2 ]]; then
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
+    else
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+    fi
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
       2) run_menu_action modify_inbound_basic "$tag"; pause;;
       3) run_menu_action modify_inbound_security "$tag"; pause;;
-      0) return;; *) warn "无效选项。"; pause;;
+      4) [[ $type == hysteria2 ]] && { run_menu_action hy2_hop_configure "$tag"; pause; } || { warn "无效选项。"; pause; };;
+      0) return;;
+      *) warn "无效选项。"; pause;;
     esac
   done
 }
@@ -41,7 +83,7 @@ inbound_menu() {
     heading "入站管理"
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
-    printf '1) 新增入站\n2) 管理已有入站\n3) 全部分享信息\n4) 删除入站\n0) 返回\n'
+    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
@@ -75,29 +117,33 @@ outbound_menu() {
     clear_screen
     heading "出站管理"
     list_outbound_overview
-    printf '\n1) 选择入站设置出站\n2) 添加代理出站 (SOCKS5/HTTP)\n3) 删除出站\n0) 返回\n'
+    printf '\n1) 选择入站设置出站\n2) 添加 SOCKS5/HTTP 出站\n3) 删除出站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action assign_outbound; pause;;
       2) run_menu_action add_outbound; pause;;
       3) run_menu_action delete_outbound; pause;;
-      0) return;; *) warn "无效选项。"; pause;;
+      0) return;;
+      *) warn "无效选项。"; pause;;
     esac
   done
 }
 
+# ---- certificate menu (from cloudflare.sh — adds Cloudflare credentials option) ----
 certificate_menu() {
   local choice
   while true; do
     clear_screen; heading "TLS 证书"
     printf '托管证书: %s\n\n' "$(managed_certificate_count)"
-    printf '1) Let\x27s Encrypt 自动签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n0) 返回\n'
+    printf "1) Let's Encrypt 签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n5) Cloudflare DNS 凭据\n6) 立即检查/续期自动证书\n0) 返回\n"
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action issue_certificate; pause;;
       2) run_menu_action import_certificate; pause;;
       3) run_menu_action list_certificates; pause;;
       4) run_menu_action delete_certificate; pause;;
+      5) cloudflare_credentials_menu;;
+      6) run_menu_action renew_managed_certificates; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -145,15 +191,20 @@ system_menu() {
   done
 }
 
+# ---- uninstall menu (from enhancements.sh — three-level model) ----
 uninstall_menu() {
   local choice
   while true; do
     clear_screen; heading "卸载"
-    printf '1) 卸载 sing-box（保留配置）\n2) 彻底卸载\n0) 返回\n'
+    printf '1) 卸载程序 — 仅删除 sing-box 核心，保留配置/证书/sbctl\n'
+    printf '2) 完全卸载 — 删除 sing-box/sbctl/配置/证书，保留备份\n'
+    printf '3) 彻底删除 — 清除全部 sbctl 数据和备份\n'
+    printf '0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action uninstall_sing_box 0; pause;;
       2) run_menu_action uninstall_sing_box 1; return;;
+      3) run_menu_action uninstall_sing_box 2; return;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -183,6 +234,7 @@ main_menu() {
   done
 }
 
+# ---- canonical show_help (merged from all modules) ----
 show_help() {
   cat <<'EOF_HELP'
 sbctl - sing-box Linux 管理器
@@ -190,7 +242,9 @@ sbctl - sing-box Linux 管理器
 用法:
   sbctl                              打开交互菜单
   sbctl install [版本]               安装/更新 sing-box
-  sbctl uninstall [--purge]          卸载；--purge 完全删除 sbctl 管理内容
+  sbctl uninstall                    仅卸载 sing-box 核心，保留配置
+  sbctl uninstall --purge            完全卸载，保留备份
+  sbctl uninstall --erase            彻底删除全部 sbctl 数据和备份
   sbctl status                       查看状态
   sbctl start|stop|restart           服务控制
   sbctl enable|disable               开关开机自启
@@ -218,51 +272,108 @@ sbctl - sing-box Linux 管理器
   sbctl link [标签] [用户]           输出分享信息/客户端 JSON
   sbctl config check|show|edit
   sbctl cert list
-  sbctl cert issue [域名] [邮箱]
+  sbctl cert issue [域名/IP] [邮箱]
   sbctl cert import [标识] [证书] [私钥]
-  sbctl cert delete [标识]
+  sbctl cert delete [标识] [--yes]
+  sbctl cert renew [标识]
+  sbctl cert renew-auto              检查并续期所有自动证书
+  sbctl cert cloudflare              管理 Cloudflare DNS 邮箱 / Global API Key
   sbctl backup [文件.tar.gz]
   sbctl restore [文件.tar.gz]
-  sbctl bbr                            BBR 开启/关闭
+  sbctl bbr                           BBR 开启/关闭
   sbctl diagnose
   sbctl version
 
-支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP
+证书说明:
+  - 域名支持 Cloudflare DNS 自动验证/续期、HTTP 自动验证/续期、DNS 手动 TXT 验证。
+  - Cloudflare 使用账号邮箱 + Global API Key，凭据文件权限为 600。
+  - DNS 手动验证证书不会被标记为自动续期。
+  - 公网 IP 证书使用 Certbot 5.4+ short-lived profile + HTTP 验证。
+  - Certbot 使用 /opt/sbctl/certbot 独立环境，不污染系统 Certbot。
+
+支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP、Mixed
 出站: SOCKS5/HTTP 代理、本地出口
 EOF_HELP
 }
 
+# ---- canonical dispatch (merged from all modules) ----
 dispatch() {
   local cmd=${1:-menu}; shift || true
   case $cmd in
-    menu) main_menu;; help|-h|--help) show_help;; version|-v|--version) printf 'sbctl %s\n' "$SBCTL_VERSION";;
+    menu) main_menu;;
+    help|-h|--help) show_help;;
+    version|-v|--version) printf 'sbctl %s\n' "$SBCTL_VERSION";;
     install|update|upgrade) install_or_update_sing_box "${1-}";;
-    uninstall) [[ ${1-} == --purge ]] && uninstall_sing_box 1 || uninstall_sing_box 0;;
-    status) show_status;; start|stop|restart|enable|disable) service_action "$cmd";; logs) service_logs "${1:-100}";;
+    uninstall)
+      case ${1-} in
+        "") uninstall_sing_box 0;;
+        --purge) uninstall_sing_box 1;;
+        --erase) uninstall_sing_box 2;;
+        *) die "未知卸载选项：${1}";;
+      esac
+      ;;
+    status) show_status;;
+    start|stop|restart|enable|disable) service_action "$cmd";;
+    logs) service_logs "${1:-100}";;
     inbound)
       case ${1:-list} in
-        list) ensure_config; list_inbounds;; add) add_inbound;; show) ensure_config; show_inbound "${2:?请提供标签}";;
-        rename) rename_inbound "${2-}" "${3-}";; modify|edit) modify_inbound_basic "${2-}";;
+        list) ensure_config; list_inbounds;;
+        add) add_inbound;;
+        show) ensure_config; show_inbound "${2:?请提供标签}";;
+        rename) rename_inbound "${2-}" "${3-}";;
+        modify|edit) modify_inbound_basic "${2-}";;
         security|tls) modify_inbound_security "${2-}";;
         delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
-        *) die "未知 inbound 子命令：${1}";; esac;;
+        *) die "未知 inbound 子命令：${1}";;
+      esac
+      ;;
     outbound)
       case ${1:-list} in
-        list) list_outbound_overview;; add) add_outbound;; assign|set) assign_outbound "${2-}" "${3-}";;
-        delete|remove) delete_outbound "${2-}";; *) die "未知 outbound 子命令：${1}";; esac;;
+        list) list_outbound_overview;;
+        add) add_outbound;;
+        assign|set) assign_outbound "${2-}" "${3-}";;
+        delete|remove) delete_outbound "${2-}";;
+        *) die "未知 outbound 子命令：${1}";;
+      esac
+      ;;
     client)
       case ${1:-list} in
-        list) list_clients "${2-}";; add) add_client "${2-}";; rename) rename_client "${2-}" "${3-}" "${4-}";;
-        rotate|reset) rotate_client_credential "${2-}" "${3-}";; delete|remove) delete_client "${2-}" "${3-}";;
-        *) die "未知 client 子命令：${1}";; esac;;
+        list) list_clients "${2-}";;
+        add) add_client "${2-}";;
+        rename) rename_client "${2-}" "${3-}" "${4-}";;
+        rotate|reset) rotate_client_credential "${2-}" "${3-}";;
+        delete|remove) delete_client "${2-}" "${3-}";;
+        *) die "未知 client 子命令：${1}";;
+      esac
+      ;;
     link|share) print_share "${1-}" "${2-}";;
     config)
-      case ${1:-check} in check|test) check_config;; show) ensure_config; jq . "$CONFIG_FILE";; edit) edit_config;; *) die "未知 config 子命令。";; esac;;
+      case ${1:-check} in
+        check|test) check_config;;
+        show) ensure_config; jq . "$CONFIG_FILE";;
+        edit) edit_config;;
+        *) die "未知 config 子命令。";;
+      esac
+      ;;
     cert)
-      case ${1:-list} in list) list_certificates;; issue) issue_certificate "${2-}" "${3-}";; import) import_certificate "${2-}" "${3-}" "${4-}";;
-        delete|remove) delete_certificate "${2-}";; *) die "未知 cert 子命令。";; esac;;
-    backup) backup_all "${1-}";; restore) restore_backup "${1-}";;
-    bbr) toggle_bbr;; diagnose|doctor) system_diagnostics;; quick-command) repair_quick_command;;
+      case ${1:-list} in
+        list) list_certificates;;
+        issue) issue_certificate "${2-}" "${3-}";;
+        import) import_certificate "${2-}" "${3-}" "${4-}";;
+        delete|remove) delete_certificate "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
+        renew-auto) renew_managed_certificates;;
+        renew) renew_certificate_command "${2-}";;
+        cloudflare) cloudflare_credentials_menu;;
+        *) die "未知 cert 子命令。";;
+      esac
+      ;;
+    backup) backup_all "${1-}";;
+    restore) restore_backup "${1-}";;
+    bbr) toggle_bbr;;
+    diagnose|doctor) system_diagnostics;;
+    quick-command) repair_quick_command;;
+    internal-hy2-hop-restore) internal_hy2_hop_restore;;
+    internal-hy2-hop-clear) internal_hy2_hop_clear;;
     *) error "未知命令：$cmd"; show_help; return 2;;
   esac
 }

@@ -1,5 +1,7 @@
-# Hysteria2 UDP port hopping support.
-# This module only manages a dedicated NAT redirect table/chain for HY2.
+# shellcheck shell=bash
+# Hysteria2 UDP port hopping support — NAT redirect table/chain for HY2.
+# No function overrides. Hooks into canonical CRUD via hy2_hop_sync and
+# hy2_hop_configure which are called directly from inbound.sh and uninstall.sh.
 
 validate_hy2_hop_range() {
   local value=${1:-} start end
@@ -45,19 +47,6 @@ hy2_hop_enabled_count() {
   jq '[.inbounds[]?|select(.hysteria2PortHopping.enabled==true and (.hysteria2PortHopping.range//"")!="")]|length' "$META_FILE"
 }
 
-hy2_hop_clear_rules() {
-  if command_exists nft; then
-    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
-  fi
-  local cmd
-  for cmd in iptables ip6tables; do
-    command_exists "$cmd" || continue
-    "$cmd" -t nat -D PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || true
-    "$cmd" -t nat -F SBCTL_HY2_HOP >/dev/null 2>&1 || true
-    "$cmd" -t nat -X SBCTL_HY2_HOP >/dev/null 2>&1 || true
-  done
-}
-
 hy2_hop_ensure_backend() {
   if command_exists nft || command_exists iptables; then return 0; fi
   info "端口跳跃需要 nftables/iptables，正在安装 nftables..."
@@ -65,264 +54,134 @@ hy2_hop_ensure_backend() {
   command_exists nft || die "nftables 安装失败，无法启用 Hysteria2 端口跳跃。"
 }
 
-hy2_hop_restore_all() {
-  [[ $(uname -s) == Linux ]] || return 0
-  init_meta
-  [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
-  local count tag range target start end cmd
-  count=$(hy2_hop_enabled_count)
-  if ((count == 0)); then
-    hy2_hop_clear_rules
-    return 0
-  fi
-
-  hy2_hop_ensure_backend
+hy2_hop_clear_rules() {
   if command_exists nft; then
     nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
-    nft add table inet sbctl_hy2_hop
-    nft 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }'
-    while IFS=$'\t' read -r tag range; do
-      [[ -n $tag && -n $range ]] || continue
-      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
-      validate_port "$target" || continue
-      nft add rule inet sbctl_hy2_hop prerouting udp dport "$range" redirect to ":${target}" comment "sbctl:${tag}"
-    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
-  else
-    for cmd in iptables ip6tables; do
-      command_exists "$cmd" || continue
-      "$cmd" -t nat -N SBCTL_HY2_HOP >/dev/null 2>&1 || true
-      "$cmd" -t nat -F SBCTL_HY2_HOP
-      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP
-    done
-    while IFS=$'\t' read -r tag range; do
-      [[ -n $tag && -n $range ]] || continue
-      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
-      validate_port "$target" || continue
-      start=${range%-*}; end=${range#*-}
-      for cmd in iptables ip6tables; do
-        command_exists "$cmd" || continue
-        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target"
-      done
-    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  elif command_exists iptables; then
+    iptables -t nat -F SBCTL_HY2_HOP 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j SBCTL_HY2_HOP 2>/dev/null || true
+    iptables -t nat -X SBCTL_HY2_HOP 2>/dev/null || true
   fi
 }
 
-hy2_hop_boot_service_install() {
-  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0
-  local target=${QUICK_COMMAND:-/usr/local/sbin/sbctl}
+hy2_hop_boot_service_remove() {
   case $(init_system) in
     systemd)
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop.service" <<EOF_UNIT
+      systemctl disable --now sbctl-hy2-hop-restore.service >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc)
+      rc-update del sbctl-hy2-hop-restore default >/dev/null 2>&1 || true
+      rm -f "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
+      ;;
+  esac
+}
+
+hy2_hop_boot_service_ensure() {
+  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  case $(init_system) in
+    systemd)
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service" <<EOF_UNIT
 [Unit]
-Description=sbctl Hysteria2 port hopping redirects
+Description=Restore sbctl Hysteria2 port hopping NAT rules
 After=network-online.target
 Wants=network-online.target
-Before=${SERVICE_NAME}.service
 
 [Service]
 Type=oneshot
-ExecStart=${target} internal-hy2-hop-restore
-ExecStop=${target} internal-hy2-hop-clear
+ExecStart=${QUICK_COMMAND} internal-hy2-hop-restore
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF_UNIT
-      systemctl daemon-reload >/dev/null
-      systemctl enable sbctl-hy2-hop.service >/dev/null
+      systemctl daemon-reload
+      systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || true
       ;;
     openrc)
-      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop" <<EOF_RC
+      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC'
 #!/sbin/openrc-run
-name="sbctl Hysteria2 port hopping"
-description="Restore sbctl Hysteria2 UDP port hopping redirects"
-depend() { need net; before ${SERVICE_NAME}; }
-start() { ebegin "Restoring Hysteria2 port hopping"; ${target} internal-hy2-hop-restore; eend \$?; }
-stop() { ebegin "Removing Hysteria2 port hopping"; ${target} internal-hy2-hop-clear; eend \$?; }
+name="sbctl-hy2-hop-restore"
+description="Restore sbctl Hysteria2 port hopping NAT rules"
+depend() { need net; }
+start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }
 EOF_RC
-      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop"
-      rc-update add sbctl-hy2-hop default >/dev/null 2>&1 || true
+      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
+      rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || true
       ;;
   esac
 }
 
-hy2_hop_boot_service_remove() {
-  [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0
-  case $(init_system) in
-    systemd)
-      systemctl disable sbctl-hy2-hop.service >/dev/null 2>&1 || true
-      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop.service"
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      ;;
-    openrc)
-      rc-update del sbctl-hy2-hop default >/dev/null 2>&1 || true
-      rm -f "${OPENRC_INIT_DIR}/sbctl-hy2-hop"
-      ;;
-  esac
-}
+# Canonical hy2_hop_restore_all lives in hy2_nft.sh (nftables-aware version)
 
+# Sync all hop rules after CRUD operations (called from inbound.sh)
 hy2_hop_sync() {
-  if (( $(hy2_hop_enabled_count) > 0 )); then
-    hy2_hop_boot_service_install
+  hy2_hop_clear_rules
+  local count
+  count=$(hy2_hop_enabled_count)
+  if ((count > 0)); then
     hy2_hop_restore_all
+    hy2_hop_boot_service_ensure
   else
-    hy2_hop_clear_rules
     hy2_hop_boot_service_remove
   fi
-}
-
-hy2_hop_check_conflicts() {
-  local tag=$1 range=$2 start end other other_port other_range other_start other_end
-  start=${range%-*}; end=${range#*-}
-  while IFS=$'\t' read -r other other_port; do
-    [[ $other == "$tag" ]] && continue
-    if ((10#$other_port >= 10#$start && 10#$other_port <= 10#$end)); then
-      warn "跳跃范围包含其他 Hysteria2 入站端口 ${other_port}（${other}）。"
-      return 1
-    fi
-  done < <(jq -r '.inbounds[]?|select(.type=="hysteria2")|[.tag,(.listen_port|tostring)]|@tsv' "$CONFIG_FILE")
-
-  while IFS=$'\t' read -r other other_range; do
-    [[ $other == "$tag" || -z $other_range ]] && continue
-    other_start=${other_range%-*}; other_end=${other_range#*-}
-    if ((10#$start <= 10#$other_end && 10#$end >= 10#$other_start)); then
-      warn "跳跃范围与 ${other} 的 ${other_range} 重叠。"
-      return 1
-    fi
-  done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
 }
 
 hy2_hop_configure() {
-  local tag=$1 initial=${2:-0} type choice range current
+  local tag=$1 assume_yes=${2:-0} type range current
+  inbound_exists "$tag" || { warn "入站不存在：$tag"; return 1; }
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  [[ $type == hysteria2 ]] || die "只有 Hysteria2 入站支持端口跳跃。"
-  current=$(hy2_hop_range_for_tag "$tag")
+  [[ $type == hysteria2 ]] || { warn "端口跳跃仅支持 Hysteria2 入站。"; return 1; }
 
-  choose choice "端口跳跃" "关闭" "开启"
-  if [[ $choice == 1 ]]; then
-    hy2_hop_meta_disable "$tag"
-    hy2_hop_sync
-    ((initial)) || info "Hysteria2 端口跳跃已关闭。"
-    return 0
+  current=$(hy2_hop_range_for_tag "$tag")
+  if [[ -n $current ]]; then
+    printf '当前端口跳跃范围: %s\n' "$current"
+    if [[ $assume_yes != 1 ]]; then
+      printf '1) 修改范围\n2) 关闭\n0) 返回\n'
+      local choice
+      read -r -p "请选择: " choice || { echo; return; }
+      case $choice in
+        1) :;;
+        2) hy2_hop_meta_disable "$tag"; hy2_hop_sync; info "端口跳跃已关闭。"; return 0;;
+        0) return 0;;
+        *) warn "无效选项。"; return 1;;
+      esac
+    fi
   fi
 
   while true; do
-    prompt_value range "跳跃端口范围" "${current:-20000-50000}"
-    validate_hy2_hop_range "$range" || { warn "请输入合法范围，例如 20000-50000。"; continue; }
-    hy2_hop_check_conflicts "$tag" "$range" || { warn "请换一个不冲突的端口范围。"; continue; }
-    break
+    prompt_value range "端口跳跃范围（如 20000-21000）" "${current:-}"
+    validate_hy2_hop_range "$range" && break
+    warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
   done
-  warn "该范围内的入站 UDP 流量会被重定向到 ${tag}；请勿覆盖其他 UDP 服务使用的端口。"
-  hy2_hop_meta_set "$tag" "$range"
-  if ! hy2_hop_sync; then
-    warn "端口跳跃规则应用失败，正在回滚。"
-    hy2_hop_meta_disable "$tag"
-    hy2_hop_sync >/dev/null 2>&1 || true
-    return 1
-  fi
-  info "Hysteria2 端口跳跃已启用：${range} -> UDP $(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")"
-}
 
-# Preserve implementations loaded before this module and wrap their lifecycle.
-eval "$(declare -f modify_inbound_basic | sed '1s/^modify_inbound_basic/original_modify_inbound_basic/')"
-eval "$(declare -f delete_inbound | sed '1s/^delete_inbound/original_delete_inbound/')"
-eval "$(declare -f rename_inbound | sed '1s/^rename_inbound/original_rename_inbound/')"
-eval "$(declare -f uninstall_sing_box | sed '1s/^uninstall_sing_box/original_uninstall_sing_box/')"
-eval "$(declare -f print_share | sed '1s/^print_share/original_print_share/')"
-eval "$(declare -f dispatch | sed '1s/^dispatch/original_dispatch/')"
-
-add_inbound() {
-  ensure_dependencies inbound-add; require_supported_core; ensure_config
-  local inbound host public tag tmp type
-  build_inbound inbound host public
-  tag=$(jq -r '.tag' <<<"$inbound")
-  type=$(jq -r '.type' <<<"$inbound")
-  tmp=$(temp_file)
-  jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then
-    meta_set_inbound "$tag" "$host" "$public"
-    if [[ $type == hysteria2 && -t 0 ]]; then
-      if ! hy2_hop_configure "$tag" 1; then warn "端口跳跃配置未完成；Hysteria2 入站本身已创建。"; fi
-    fi
-    heading "入站已创建"
-    show_inbound "$tag"
-    print_share "$tag" "" || true
-  fi
-  rm -f "$tmp"
-}
-
-modify_inbound_basic() {
-  original_modify_inbound_basic "$@"
-  hy2_hop_sync
-}
-
-delete_inbound() {
-  original_delete_inbound "$@"
-  hy2_hop_sync
-}
-
-rename_inbound() {
-  original_rename_inbound "$@"
-  hy2_hop_sync
-}
-
-uninstall_sing_box() {
-  original_uninstall_sing_box "$@"
-  if ! sing_box_installed; then
-    hy2_hop_clear_rules
-    hy2_hop_boot_service_remove
-  fi
-}
-
-modify_inbound_menu() {
-  local tag=$1 choice type
-  while inbound_exists "$tag"; do
-    clear_screen
-    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-    heading "修改入站信息 · ${tag}"
-    if [[ $type == hysteria2 ]]; then
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
+  local listen_port internal_port
+  listen_port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  if hy2_port_in_range "$listen_port" "$range"; then
+    warn "listen_port ${listen_port} 在跳跃范围内，需要重新选择内部端口。"
+    hy2_pick_internal_port internal_port "$range" || { warn "无法分配可用端口。"; return 1; }
+    local tmp
+    tmp=$(temp_file)
+    jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp"
+    if apply_candidate "$tmp"; then
+      hy2_hop_meta_set "$tag" "$range"
+      hy2_hop_sync
+      info "Hysteria2 端口跳跃已启用：${range} -> UDP ${internal_port}（外部端口通过 NAT 重定向）"
     else
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+      rm -f "$tmp"
+      return 1
     fi
-    read -r -p "请选择: " choice || { echo; return; }
-    case $choice in
-      1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
-      2) run_menu_action modify_inbound_basic "$tag"; pause;;
-      3) run_menu_action modify_inbound_security "$tag"; pause;;
-      4) [[ $type == hysteria2 ]] && { run_menu_action hy2_hop_configure "$tag"; pause; } || { warn "无效选项。"; pause; };;
-      0) return;;
-      *) warn "无效选项。"; pause;;
-    esac
-  done
+    rm -f "$tmp"
+    return 0
+  fi
+
+  hy2_hop_meta_set "$tag" "$range"
+  hy2_hop_sync
+  info "Hysteria2 端口跳跃已启用：${range} -> UDP ${listen_port}"
 }
 
-print_share() {
-  ensure_config
-  local tag=${1-} filter=${2-} type host share_host port share_port name password sni obfs obfs_password link
-  [[ -n $tag ]] || select_inbound tag || return 0
-  inbound_exists "$tag" || die "找不到入站：$tag"
-  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  [[ $type == hysteria2 ]] || { original_print_share "$tag" "$filter"; return; }
-
-  host=$(public_host_for_tag "$tag") || { warn "无法确定入站 ${tag} 的客户端连接地址。"; return 0; }
-  share_host=$(uri_host "$host")
-  port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
-  share_port=$(hy2_hop_client_port_spec "$tag" "$port")
-  sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
-  obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
-  obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
-  heading "${tag} 分享信息"
-  while IFS=$'\t' read -r name password; do
-    [[ -z $filter || $name == "$filter" ]] || continue
-    link="hysteria2://$(url_encode "$password")@${share_host}:${share_port}?sni=$(url_encode "$sni")"
-    [[ -z $obfs ]] || link+="&obfs=$(url_encode "$obfs")&obfs-password=$(url_encode "$obfs_password")"
-    link+="#$(url_encode "${tag}-${name}")"
-    print_share_entry "$name" "链接" "$link"
-  done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
-  share_separator
-}
-
+# Internal commands (called via dispatch)
 internal_hy2_hop_restore() {
   require_root internal-hy2-hop-restore
   hy2_hop_restore_all
@@ -331,12 +190,4 @@ internal_hy2_hop_restore() {
 internal_hy2_hop_clear() {
   require_root internal-hy2-hop-clear
   hy2_hop_clear_rules
-}
-
-dispatch() {
-  case ${1:-menu} in
-    internal-hy2-hop-restore) internal_hy2_hop_restore;;
-    internal-hy2-hop-clear) internal_hy2_hop_clear;;
-    *) original_dispatch "$@";;
-  esac
 }

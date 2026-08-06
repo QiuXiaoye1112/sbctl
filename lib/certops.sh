@@ -1,86 +1,33 @@
-# Mature certificate lifecycle for sbctl.
-# Deliberately keeps sbctl's manual-DNS decision; no Cloudflare automation is reintroduced.
+# shellcheck shell=bash
+# sbctl certificate lifecycle — canonical implementation.
+# Includes Let's Encrypt, Cloudflare DNS, manual DNS, and IP certificate flows.
 
 validate_email_address() { [[ ${1:-} == *@*.* && ${1:-} != *" "* ]]; }
 validate_certificate_identifier() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
 
-validate_certificate_pair() {
-  local cert=$1 key=$2 cert_pub key_pub
-  [[ -r $cert && -r $key ]] || return 1
-  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
-  openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1 || return 1
-  openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
-  cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl sha256)
-  key_pub=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | openssl sha256)
-  [[ -n $cert_pub && $cert_pub == "$key_pub" ]]
-}
-
-managed_certificate_count() { init_meta; jq -r '.certificates | length' "$META_FILE" 2>/dev/null || printf '0'; }
-
-select_managed_certificate() {
-  local __var=$1 always_choose=${2:-0} id answer
-  local ids=()
-  while IFS= read -r id; do
-    [[ -n $id ]] || continue
-    [[ -r "$CERT_DIR/${id}.crt" && -r "$CERT_DIR/${id}.key" ]] && ids+=("$id")
-  done < <(meta_cert_list)
-  ((${#ids[@]} > 0)) || { warn "没有可用的托管证书，请先运行 sbctl cert import/issue。"; return 1; }
-  if ((${#ids[@]} == 1)) && [[ $always_choose != 1 ]]; then
-    printf -v "$__var" '%s' "${ids[0]}"; return 0
-  fi
-  choose answer "选择证书" "${ids[@]}" || return 1
-  printf -v "$__var" '%s' "${ids[$((answer-1))]}"
-}
-
-prompt_certificate_server_name() {
-  local __var=$1 cert=$2 answer selected default_name name
-  local names=()
-  while IFS= read -r name; do [[ -n $name ]] && names+=("$name"); done < <(certificate_server_names "$cert")
-  if ((${#names[@]} == 0)); then
-    while true; do
-      prompt_value selected "TLS serverName/SNI" || return 1
-      validate_host "$selected" && break
-      warn "SNI 必须是有效域名/IP。"
-    done
-  elif ((${#names[@]} == 1)); then
-    selected=${names[0]}
-  else
-    choose answer "选择 TLS serverName/SNI" "${names[@]}" || return 1
-    selected=${names[$((answer-1))]}
-  fi
-  if [[ $selected == \*.* ]]; then
-    default_name="www.${selected#*.}"
-    while true; do
-      prompt_value selected "通配符证书需要填写具体 TLS serverName/SNI" "$default_name" || return 1
-      validate_domain "$selected" && [[ $selected != \*.* ]] && break
-      warn "请输入证书覆盖的具体子域名。"
-    done
-  fi
-  printf -v "$__var" '%s' "$selected"
-}
-
-_cert_run_bounded() {
-  local seconds=$1; shift
-  if command_exists timeout; then timeout --signal=TERM "$seconds" "$@"; else "$@"; fi
-}
-
 certbot_supports_ip() { [[ -x $CERTBOT_BIN ]] && "$CERTBOT_BIN" --help all 2>/dev/null | grep -q -- '--ip-address'; }
+
+certbot_cmd() {
+  "$CERTBOT_BIN" --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" --logs-dir "$CERTBOT_LOGS_DIR" "$@"
+}
+
+certbot_nginx_available() {
+  [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_nginx' >/dev/null 2>&1
+}
 
 ensure_certbot_environment() {
   local manager need_install=0
-  if [[ ! -x $CERTBOT_BIN ]] || ! certbot_supports_ip; then need_install=1; fi
+  if [[ ! -x $CERTBOT_BIN ]] || ! certbot_supports_ip || ! certbot_nginx_available; then need_install=1; fi
   if ((need_install)); then
     manager=$(pkg_manager) || die "无法准备 Certbot 环境：未知包管理器。"
     info "正在准备 sbctl 独立 Certbot 环境。"
     case $manager in
-      apt) DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv >/dev/null ;;
-      apk) apk add --no-cache python3 py3-pip py3-virtualenv >/dev/null ;;
-      dnf) dnf install -y python3 python3-pip >/dev/null ;;
-      yum) yum install -y python3 python3-pip >/dev/null ;;
-      pacman) pacman -Sy --noconfirm --needed python python-pip >/dev/null ;;
-      zypper) zypper --non-interactive install python3 python3-pip >/dev/null ;;
+      apt) install_packages python3 python3-venv;;
+      apk) install_packages python3 py3-pip py3-virtualenv;;
+      dnf|yum) install_packages python3 python3-pip;;
+      pacman) install_packages python python-pip;;
+      zypper) install_packages python3 python3-pip;;
     esac || die "Python/venv 安装失败。"
-
     install -d -m 755 "$(dirname "$CERTBOT_VENV")"
     if [[ ! -x $CERTBOT_VENV/bin/python ]]; then
       if ! python3 -m venv "$CERTBOT_VENV" 2>/dev/null; then
@@ -94,10 +41,12 @@ ensure_certbot_environment() {
         rm -f "$bootstrap"
       fi
     fi
-    _cert_run_bounded 180 "$CERTBOT_VENV/bin/pip" install --disable-pip-version-check --timeout 20 --retries 2 \
+    [[ -x $CERTBOT_VENV/bin/pip ]] || die "Certbot venv 缺少 pip，无法修复环境。"
+    run_bounded 180 "$CERTBOT_VENV/bin/pip" install --disable-pip-version-check --timeout 20 --retries 2 \
       --upgrade 'certbot>=5.4' certbot-nginx >/dev/null || die "Certbot 安装失败。"
   fi
   certbot_supports_ip || die "当前 Certbot 不支持公网 IP 证书（需要 Certbot 5.4+）。"
+  certbot_nginx_available || die "Certbot nginx 插件不可用，请重新准备证书环境。"
   mkdir -p "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR"
   meta_resource_register certbotVenv "$CERTBOT_VENV"
   meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
@@ -107,50 +56,116 @@ ensure_certbot_environment() {
 
 install_certbot() { ensure_certbot_environment; }
 
-certbot_cmd() {
-  "$CERTBOT_BIN" --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" --logs-dir "$CERTBOT_LOGS_DIR" "$@"
+certbot_account_ids() {
+  local file id
+  for file in "$CERTBOT_CONFIG_DIR"/accounts/*/*/*/regr.json; do
+    [[ -f $file ]] || continue
+    id=$(basename "$(dirname "$file")")
+    printf '%s\n' "$id"
+  done | sort -u
 }
 
-setup_certbot_renewal_timer() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+certbot_account_exists() {
+  local wanted=$1 id
+  while IFS= read -r id; do [[ $id == "$wanted" ]] && return 0; done < <(certbot_account_ids)
+  return 1
+}
+
+certbot_lineage_account() {
+  local cert_name=$1
+  local conf="$CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf"
+  [[ -r $conf ]] || return 1
+  sed -n 's/^[[:space:]]*account[[:space:]]*=[[:space:]]*//p' "$conf" | sed -n '1p'
+}
+
+select_certbot_account() {
+  local __var=$1 cert_name=${2:-} configured=${SBCTL_CERTBOT_ACCOUNT:-} lineage="" id answer
+  local ids=()
+  if [[ -n $cert_name ]]; then
+    lineage=$(certbot_lineage_account "$cert_name" 2>/dev/null || true)
+    if [[ -n $lineage ]]; then
+      if certbot_account_exists "$lineage"; then printf -v "$__var" '%s' "$lineage"; return 0; fi
+      warn "证书 ${cert_name} 记录的 Certbot 账户 ${lineage} 已不存在。"
+    fi
+  fi
+  if [[ -n $configured ]]; then
+    certbot_account_exists "$configured" || { warn "SBCTL_CERTBOT_ACCOUNT 指定的账户不存在：$configured"; return 1; }
+    printf -v "$__var" '%s' "$configured"
+    return 0
+  fi
+  while IFS= read -r id; do [[ -n $id ]] && ids+=("$id"); done < <(certbot_account_ids)
+  case ${#ids[@]} in
+    0) printf -v "$__var" '%s' ""; return 0;;
+    1) printf -v "$__var" '%s' "${ids[0]}"; return 0;;
+  esac
+  if [[ ! -t 0 ]]; then
+    warn "检测到多个 Certbot 账户；非交互模式请设置 SBCTL_CERTBOT_ACCOUNT=<账户ID>。"
+    return 1
+  fi
+  choose answer "选择 Let's Encrypt / Certbot 账户" "${ids[@]}" || return 1
+  printf -v "$__var" '%s' "${ids[$((answer-1))]}"
+}
+
+certbot_issue_cmd() {
+  local cert_name=$1; shift
+  local account="" args=("$@")
+  select_certbot_account account "$cert_name" || return 1
+  [[ -z $account ]] || args+=(--account "$account")
+  certbot_cmd "${args[@]}"
+}
+
+detect_port80_owner() {
+  local pid pname="" line
+  if command_exists ss; then
+    line=$(ss -H -ltnp 2>/dev/null | awk '$4 ~ /:80$/ || $4 ~ /\]:80$/ {print; exit}')
+    pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$line" | head -1)
+    [[ -z $pid ]] || pname=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')
+    [[ -n $line ]] || { printf free; return; }
+  elif command_exists netstat; then
+    line=$(netstat -ltnp 2>/dev/null | awk '$4 ~ /:80$/ {print; exit}')
+    [[ -n $line ]] || { printf free; return; }
+    pname=$(awk '{print $7}' <<<"$line" | sed 's#^[0-9]*/##')
+  else
+    printf unknown; return
+  fi
+  case $pname in
+    sing-box) printf sing-box;;
+    nginx) printf nginx;;
+    httpd|apache2) printf apache;;
+    "") printf other;;
+    *) printf other;;
+  esac
+}
+
+# ---- cert renewal helpers ----
+
+# Legacy hook writer — creates per-cert deploy hook for Certbot.
+# Still available for compatibility; canonical renewal uses setup_certbot_renewal_timer.
+write_certbot_hook() {
+  local domain=$1 hook
+  hook="${CERTBOT_HOOK_DIR}/sbctl-${domain}"
+  mkdir -p "$(dirname "$hook")"
   case $(init_system) in
     systemd)
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE
-[Unit]
-Description=Renew certificates managed by sbctl
-
-[Service]
-Type=oneshot
-ExecStart=${QUICK_COMMAND} cert renew-auto
-EOF_SERVICE
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER'
-[Unit]
-Description=Renew certificates managed by sbctl
-
-[Timer]
-OnCalendar=*-*-* 00,12:00:00
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF_TIMER
-      systemctl daemon-reload
-      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
-      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service"
-      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      cat >"$hook" <<EOF_HOOK
+#!/usr/bin/env bash
+set -e
+install -m 600 /etc/letsencrypt/live/${domain}/fullchain.pem ${CERT_DIR}/${domain}.crt
+install -m 600 /etc/letsencrypt/live/${domain}/privkey.pem ${CERT_DIR}/${domain}.key
+systemctl try-restart ${SERVICE_NAME}.service || true
+EOF_HOOK
       ;;
     openrc)
-      mkdir -p /etc/periodic/daily
-      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON
-#!/bin/sh
-${QUICK_COMMAND} cert renew-auto
-EOF_CRON
-      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
-      meta_resource_register renewPeriodic /etc/periodic/daily/sbctl-certbot-renew
+      cat >"$hook" <<EOF_HOOK
+#!/usr/bin/env bash
+set -e
+install -m 600 /etc/letsencrypt/live/${domain}/fullchain.pem ${CERT_DIR}/${domain}.crt
+install -m 600 /etc/letsencrypt/live/${domain}/privkey.pem ${CERT_DIR}/${domain}.key
+rc-service ${SERVICE_NAME} restart || true
+EOF_HOOK
       ;;
-    *) die "无法配置证书自动续期：未检测到 systemd/OpenRC。";;
   esac
+  chmod 700 "$hook"
 }
 
 replace_certificate_pair() {
@@ -203,29 +218,49 @@ certificate_identifier_for_subject() {
   else printf '%s' "$subject"; fi
 }
 
-detect_port80_owner() {
-  local pid pname="" line
-  if command_exists ss; then
-    line=$(ss -H -ltnp 2>/dev/null | awk '$4 ~ /:80$/ || $4 ~ /\]:80$/ {print; exit}')
-    pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$line" | head -1)
-    [[ -z $pid ]] || pname=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')
-    [[ -n $line ]] || { printf free; return; }
-  elif command_exists netstat; then
-    line=$(netstat -ltnp 2>/dev/null | awk '$4 ~ /:80$/ {print; exit}')
-    [[ -n $line ]] || { printf free; return; }
-    pname=$(awk '{print $7}' <<<"$line" | sed 's#^[0-9]*/##')
-  else
-    printf unknown; return
-  fi
-  case $pname in
-    sing-box) printf sing-box;;
-    nginx) printf nginx;;
-    httpd|apache2) printf apache;;
-    "") printf other;;
-    *) printf other;;
+setup_certbot_renewal_timer() {
+  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  case $(init_system) in
+    systemd)
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE
+[Unit]
+Description=Renew certificates managed by sbctl
+
+[Service]
+Type=oneshot
+ExecStart=${QUICK_COMMAND} cert renew-auto
+EOF_SERVICE
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER'
+[Unit]
+Description=Renew certificates managed by sbctl
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+      systemctl daemon-reload
+      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
+      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service"
+      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      ;;
+    openrc)
+      mkdir -p /etc/periodic/daily
+      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON
+#!/bin/sh
+${QUICK_COMMAND} cert renew-auto
+EOF_CRON
+      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
+      meta_resource_register renewPeriodic /etc/periodic/daily/sbctl-certbot-renew
+      ;;
+    *) die "无法配置证书自动续期：未检测到 systemd/OpenRC。";;
   esac
 }
 
+# ---- cert issuance sub-flows ----
 _issue_domain_http() {
   local domain=$1 email=$2 force=$3 __validation=$4 owner was_active=0
   owner=$(detect_port80_owner)
@@ -235,13 +270,13 @@ _issue_domain_http() {
     free)
       args+=(--standalone --preferred-challenges http)
       printf -v "$__validation" '%s' http-standalone
-      certbot_cmd "${args[@]}"
+      certbot_issue_cmd "$domain" "${args[@]}"
       ;;
     sing-box)
       service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; }
       args+=(--standalone --preferred-challenges http)
       printf -v "$__validation" '%s' http-standalone
-      if ! certbot_cmd "${args[@]}"; then
+      if ! certbot_issue_cmd "$domain" "${args[@]}"; then
         ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }
         return 1
       fi
@@ -251,7 +286,7 @@ _issue_domain_http() {
       printf -v "$__validation" '%s' nginx
       local nginx_args=(certonly --nginx --non-interactive --agree-tos --cert-name "$domain" -m "$email" -d "$domain")
       [[ $force == 1 ]] && nginx_args+=(--force-renewal)
-      certbot_cmd "${nginx_args[@]}"
+      certbot_issue_cmd "$domain" "${nginx_args[@]}"
       ;;
     apache) warn "80 端口被 Apache 占用；请改用 DNS 手动验证。"; return 1;;
     *) warn "80 端口被其他程序占用或无法识别；请改用 DNS 手动验证。"; return 1;;
@@ -263,7 +298,7 @@ _issue_domain_manual_dns() {
   local args=(certonly --manual --agree-tos --cert-name "$domain" -m "$email" --preferred-challenges dns -d "$domain")
   [[ $force == 1 ]] && args+=(--force-renewal)
   info "Certbot 将提示添加 TXT 记录；验证完成后该证书不会被标记为自动续期。"
-  certbot_cmd "${args[@]}"
+  certbot_issue_cmd "$domain" "${args[@]}"
 }
 
 _issue_ip_certificate() {
@@ -274,10 +309,10 @@ _issue_ip_certificate() {
     --cert-name "$identifier" -m "$email" --preferred-profile shortlived --ip-address "$ip")
   [[ $force == 1 ]] && args+=(--force-renewal)
   case $owner in
-    free) certbot_cmd "${args[@]}";;
+    free) certbot_issue_cmd "$identifier" "${args[@]}";;
     sing-box)
       service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; }
-      if ! certbot_cmd "${args[@]}"; then
+      if ! certbot_issue_cmd "$identifier" "${args[@]}"; then
         ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }; return 1
       fi
       ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
@@ -286,6 +321,17 @@ _issue_ip_certificate() {
   esac
 }
 
+_issue_domain_cloudflare() {
+  local domain=$1 email=$2 force=$3
+  load_cloudflare_credentials || { warn "Cloudflare 邮箱 / Global API Key 未配置。"; return 1; }
+  ensure_cloudflare_certbot_plugin || return 1
+  local args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_INI" \
+    --dns-cloudflare-propagation-seconds 10 --non-interactive --agree-tos --cert-name "$domain" -m "$email" -d "$domain")
+  [[ $force == 1 ]] && args+=(--force-renewal)
+  certbot_issue_cmd "$domain" "${args[@]}"
+}
+
+# ---- canonical issue_certificate (includes Cloudflare DNS path) ----
 issue_certificate() {
   ensure_dependencies cert-issue
   ensure_certbot_environment
@@ -304,9 +350,21 @@ issue_certificate() {
   [[ $mode == domain ]] && cert_name=$subject
 
   if [[ $mode == domain ]]; then
-    choose verify_method "选择验证方式" "DNS（手动添加 TXT，不自动续期）" "HTTP（自动续期，需要 80 端口）" || return 1
-    [[ $verify_method == 1 ]] && verify_method=dns-manual || verify_method=http
+    choose verify_method "选择验证方式" \
+      "Cloudflare DNS（自动验证/自动续期）" \
+      "HTTP（自动续期，需要 80 端口）" \
+      "DNS（手动添加 TXT，不自动续期）" || return 1
+    case $verify_method in
+      1) verify_method=dns-cloudflare;;
+      2) verify_method=http;;
+      3) verify_method=dns-manual;;
+    esac
+    if [[ $verify_method == dns-cloudflare ]] && ! load_cloudflare_credentials; then
+      info "首次使用 Cloudflare DNS 自动验证，需要配置 Cloudflare 邮箱和 Global API Key。"
+      save_cloudflare_credentials || return 1
+    fi
   fi
+
   while [[ -z $email ]]; do
     prompt_value email "Let's Encrypt 联系邮箱" || return 1
     validate_email_address "$email" || { warn "邮箱格式无效。"; email=""; }
@@ -324,6 +382,9 @@ issue_certificate() {
   if [[ $mode == ip ]]; then
     validation=http-standalone; auto_renew=true
     _issue_ip_certificate "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+  elif [[ $verify_method == dns-cloudflare ]]; then
+    validation=dns-cloudflare; auto_renew=true
+    _issue_domain_cloudflare "$subject" "$email" "$force" || { warn "Cloudflare DNS 证书签发失败。"; return 1; }
   elif [[ $verify_method == dns-manual ]]; then
     validation=dns-manual; auto_renew=false
     _issue_domain_manual_dns "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
@@ -384,9 +445,25 @@ certificate_inbound_users() {
   ' "$CONFIG_FILE"
 }
 
+# Disable renewal timer if no certs need it
+_disable_renewal_job_if_unused() {
+  local remaining
+  remaining=$(meta_cert_auto_renew_certs | head -1 || true)
+  [[ -z $remaining ]] || return 0
+  case $(init_system) in
+    systemd)
+      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
+      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
+  esac
+}
+
 delete_certificate() {
   ensure_dependencies cert-delete
-  local identifier=${1-} assume_yes=${2:-0} users source cert_name subject tag
+  local identifier=${1-} assume_yes=${2:-0} users source cert_name subject tag rc=0
   [[ -n $identifier ]] || select_managed_certificate identifier 1 || return 0
   validate_certificate_identifier "$identifier" || die "证书标识无效。"
   meta_cert_exists "$identifier" || { warn "该证书不在 sbctl 托管列表中。"; return 1; }
@@ -402,19 +479,49 @@ delete_certificate() {
     if [[ -x $CERTBOT_BIN ]]; then
       certbot_cmd delete --cert-name "$cert_name" --non-interactive || { warn "Certbot lineage 删除失败，托管副本未删除。"; return 1; }
     else
-      warn "Certbot 环境缺失，无法安全删除 Let's Encrypt lineage。"; return 1
+      warn "Certbot 环境缺失，无法安全删除 Let's Encrypt lineage。"; return 1;
     fi
   fi
   rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key"
   rm -f "$CERTBOT_HOOK_DIR/sbctl-${identifier}" "$CERTBOT_HOOK_DIR/sbctl-${subject}"
   meta_cert_delete "$identifier"
+  _disable_renewal_job_if_unused
   info "托管证书已删除：${identifier}"
 }
 
+# ---- canonical renewal (includes Cloudflare DNS path) ----
 renew_one_certificate() {
   local identifier=$1 __result_var=${2:-} cert_name validation owner before_serial="" after_serial="" changed=0 was_active=0 renewal_result_internal=failed
   meta_cert_exists "$identifier" || { warn "证书不在托管列表：$identifier"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
   cert_name=$(meta_cert_get_field "$identifier" certName); validation=$(meta_cert_get_field "$identifier" validation)
+
+  # Cloudflare DNS path
+  if [[ $validation == dns-cloudflare ]]; then
+    if ! load_cloudflare_credentials; then
+      warn "${identifier}: Cloudflare 邮箱 / Global API Key 缺失，自动续期阻塞。"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked
+      return 0
+    fi
+    if ! ensure_cloudflare_certbot_plugin; then
+      warn "${identifier}: Cloudflare DNS 插件不可用。"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed
+      return 1
+    fi
+    [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && before_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
+    if ! certbot_cmd renew --cert-name "$cert_name" --quiet; then
+      warn "证书续期失败：${identifier}"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed
+      return 1
+    fi
+    [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
+    sync_managed_certificate "$identifier" "$cert_name" changed || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+    restart_sing_box_if_certificate_changed "$changed" || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+    if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then renewal_result_internal=renewed; else renewal_result_internal=unchanged; fi
+    [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$renewal_result_internal"
+    return 0
+  fi
+
+  # Non-Cloudflare paths
   case $validation in
     dns-manual|legacy|imported)
       warn "${identifier}: 当前类型不能自动续期，请重新签发/导入。"

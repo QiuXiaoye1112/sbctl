@@ -250,3 +250,5 @@ delete_outbound() {
   if apply_candidate "$tmp"; then info "出站 ${tag} 已删除。"; fi
   rm -f "$tmp"
 }
+
+# ---- outbound overview display (from layout.sh) ----
