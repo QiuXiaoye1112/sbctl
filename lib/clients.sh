@@ -70,12 +70,11 @@ list_clients() {
 
 select_client() {
   local __var=$1 tag=$2 type field
-  local names=() name
-  list_clients "$tag"
+  local names=() _n
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
-  while IFS= read -r name; do
-    [[ -n $name ]] && names+=("$name")
+  while IFS= read -r _n; do
+    [[ -n $_n ]] && names+=("$_n")
   done < <(jq -r --arg tag "$tag" --arg field "$field" '.inbounds[]|select(.tag==$tag)|.users[]?|.[$field]' "$CONFIG_FILE")
   ((${#names[@]})) || { warn "该入站还没有用户。"; return 1; }
   if ((${#names[@]} == 1)); then
@@ -94,6 +93,7 @@ delete_client() {
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
   if [[ -z $name ]]; then
+    list_clients "$tag"
     select_client name "$tag" || return 0
   fi
   client_exists "$tag" "$name" || die "找不到用户：${name}"
@@ -109,7 +109,7 @@ rotate_client_credential() {
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
-  [[ -n $name ]] || { select_client name "$tag" || return 0; }
+  [[ -n $name ]] || { list_clients "$tag"; select_client name "$tag" || return 0; }
   client_exists "$tag" "$name" || die "找不到用户：${name}"
   tmp=$(temp_file)
   if [[ $type == vless ]]; then
