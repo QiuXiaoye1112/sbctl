@@ -125,7 +125,7 @@ reality_public_key() {
 }
 
 build_inbound() {
-  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="null" ws_path ws_host
+  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="null" ws_path
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" "Mixed(SOCKS+HTTP)"
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
@@ -150,8 +150,7 @@ build_inbound() {
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
           prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
-          prompt_value ws_host "WebSocket Host" "$client_host"
-          transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
       fi
       ;;
@@ -180,8 +179,7 @@ build_inbound() {
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
           prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
-          prompt_value ws_host "WebSocket Host" "$client_host"
-          transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
       fi
       ;;
