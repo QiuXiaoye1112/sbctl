@@ -40,7 +40,7 @@ select_managed_certificate() {
     [[ -n $id ]] || continue
     [[ -r "$CERT_DIR/${id}.crt" && -r "$CERT_DIR/${id}.key" ]] && ids+=("$id")
   done < <(meta_cert_list)
-  ((${#ids[@]} > 0)) || { warn "没有可用的托管证书，请先运行 sbctl cert import/issue。"; return 1; }
+  ((${#ids[@]} > 0)) || { warn "请在 TLS 证书设置里导入有效证书。"; return 1; }
   if ((${#ids[@]} == 1)) && [[ $always_choose != 1 ]]; then
     printf -v "$__var" '%s' "${ids[0]}"; return 0
   fi
