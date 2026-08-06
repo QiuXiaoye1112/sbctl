@@ -321,6 +321,11 @@ ensure_dependencies() {
   acquire_lock
 }
 
+_lock_is_stale() {
+  local path=$1
+  [[ -e $path ]] && find "$path" -prune -mmin +4 2>/dev/null | grep -q .
+}
+
 acquire_lock() {
   # Re-entrant: if we already hold the lock, return immediately
   [[ ${_SBC_LOCK_HELD:-0} == 1 ]] && return 0
@@ -328,14 +333,8 @@ acquire_lock() {
   if command_exists flock; then
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-      # Check for stale lock: if lock file is older than 300s, force-clear it
-      local lock_age=0 now
-      now=$(date +%s 2>/dev/null || printf 0)
-      if [[ -f $LOCK_FILE && $now -gt 0 ]]; then
-        lock_age=$(($now - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || stat -f %m "$LOCK_FILE" 2>/dev/null || printf 0)))
-      fi
-      if ((lock_age > 300)); then
-        warn "检测到过期锁文件（${lock_age} 秒），自动清除。"
+      if _lock_is_stale "$LOCK_FILE"; then
+        warn "检测到过期锁文件，自动清除。"
         exec 9>&-; rm -f "$LOCK_FILE"
         exec 9>"$LOCK_FILE"
         flock -n 9 || die "另一个 sbctl 操作正在运行。"
@@ -346,13 +345,8 @@ acquire_lock() {
   else
     _SBC_LOCK_DIR="${LOCK_FILE}.d"
     if ! mkdir "$_SBC_LOCK_DIR" 2>/dev/null; then
-      local lock_age=0 now
-      now=$(date +%s 2>/dev/null || printf 0)
-      if [[ -d $_SBC_LOCK_DIR && $now -gt 0 ]]; then
-        lock_age=$(($now - $(stat -c %Y "$_SBC_LOCK_DIR" 2>/dev/null || stat -f %m "$_SBC_LOCK_DIR" 2>/dev/null || printf 0)))
-      fi
-      if ((lock_age > 300)); then
-        warn "检测到过期锁目录（${lock_age} 秒），自动清除。"
+      if _lock_is_stale "$_SBC_LOCK_DIR"; then
+        warn "检测到过期锁目录，自动清除。"
         rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
         mkdir "$_SBC_LOCK_DIR" 2>/dev/null || die "另一个 sbctl 操作正在运行。"
       else
