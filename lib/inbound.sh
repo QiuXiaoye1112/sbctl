@@ -133,22 +133,18 @@ build_inbound() {
         3) tls=""; prompt_public_host client_host ;;
       esac
       prompt_port port 443
-      # Transport: REALITY forces tcp; cert-TLS/none can choose ws
+      # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
       if [[ $choice != 1 ]]; then
         local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws" "httpupgrade" "grpc"
-        case $tp_choice in
-          2) prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"; prompt_value ws_host "WebSocket Host" "$client_host"
-             transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}') ;;
-          3) prompt_value ws_path "HTTPUpgrade 路径" "/$(random_hex 8)"; prompt_value ws_host "HTTPUpgrade Host" "$client_host"
-             transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"httpupgrade",path:$path,host:$host}') ;;
-          4) local grpc_svc
-             prompt_value grpc_svc "gRPC serviceName" "vless"
-             transport_json=$(jq -n --arg svc "$grpc_svc" '{type:"grpc",serviceName:$svc}') ;;
-        esac
+        choose tp_choice "传输方式" "tcp" "ws"
+        if [[ $tp_choice == 2 ]]; then
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          prompt_value ws_host "WebSocket Host" "$client_host"
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+        fi
       fi
       ;;
-    anytls|trojan)
+    anytls)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
@@ -157,6 +153,26 @@ build_inbound() {
         build_certificate_tls tls client_host || return 1
       fi
       prompt_port port 443
+      ;;
+    trojan)
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      if [[ $choice == 1 ]]; then
+        build_reality_tls tls reality_public || return 1
+        prompt_public_host client_host
+      else
+        build_certificate_tls tls client_host || return 1
+      fi
+      prompt_port port 443
+      # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
+      if [[ $choice != 1 ]]; then
+        local tp_choice
+        choose tp_choice "传输方式" "tcp" "ws"
+        if [[ $tp_choice == 2 ]]; then
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          prompt_value ws_host "WebSocket Host" "$client_host"
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+        fi
+      fi
       ;;
     hysteria2)
       build_certificate_tls tls client_host || return 1
@@ -216,7 +232,9 @@ build_inbound() {
     trojan)
       prompt_value name "用户名称" "user-$(random_hex 2)"
       prompt_secret password "Trojan 密码" "$(random_password)"
-      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" '{type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls}')"
+      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" --argjson transport "$transport_json" '
+        {type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} +
+        (if $transport!="" then {transport:$transport} else {} end)')"
       ;;
     socks|http|mixed)
       prompt_optional name "用户名（留空=无认证）"
