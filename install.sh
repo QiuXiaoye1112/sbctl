@@ -13,6 +13,8 @@ fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --conn
 command -v curl >/dev/null 2>&1 || die "缺少 curl。"
 command -v install >/dev/null 2>&1 || die "缺少 install。"
 command -v bash >/dev/null 2>&1 || die "缺少 bash。"
+# Clear any stale lock from previous interrupted runs
+rm -rf /run/lock/sbctl.lock /run/lock/sbctl.lock.d 2>/dev/null || true
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/main"

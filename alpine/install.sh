@@ -6,6 +6,8 @@ LIB_DIR="/usr/local/lib/sbctl"
 MODULES="cache core ui engine compat certmeta inbound certificate reality outbound clients share ops certops cloudflare hy2_hop hy2_create hy2_nft network_guard protocols system_guard management menu uninstall"
 [ "$(id -u)" -eq 0 ] || { echo '[sbctl] 请使用 root 运行。' >&2; exit 1; }
 [ -f /etc/alpine-release ] || { echo '[sbctl] 此入口仅用于 Alpine Linux。' >&2; exit 1; }
+# Clear any stale lock from previous interrupted runs
+rm -rf /run/lock/sbctl.lock /run/lock/sbctl.lock.d 2>/dev/null || true
 apk add --no-cache bash curl jq openssl coreutils >/dev/null
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
