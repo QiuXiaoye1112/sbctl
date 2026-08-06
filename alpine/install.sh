@@ -3,7 +3,7 @@ set -eu
 REPO="QiuXiaoye1112/sbctl"
 TARGET="/usr/local/sbin/sbctl"
 LIB_DIR="/usr/local/lib/sbctl"
-MODULES="core certmeta ui engine compat inbound certificate reality outbound clients share ops certops management uninstall menu protocols layout hy2_hop hy2_create hy2_nft enhancements cloudflare network_guard state_guard system_guard"
+MODULES="cache core ui engine compat certmeta inbound certificate reality outbound clients share ops certops cloudflare hy2_hop hy2_create hy2_nft network_guard protocols system_guard menu uninstall"
 [ "$(id -u)" -eq 0 ] || { echo '[sbctl] 请使用 root 运行。' >&2; exit 1; }
 [ -f /etc/alpine-release ] || { echo '[sbctl] 此入口仅用于 Alpine Linux。' >&2; exit 1; }
 apk add --no-cache bash curl jq openssl coreutils >/dev/null

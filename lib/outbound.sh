@@ -80,8 +80,9 @@ current_outbound_for_inbound() {
   if [[ -n $selected ]]; then printf '%s' "$selected"; else jq -r '.route.final // "direct"' "$CONFIG_FILE"; fi
 }
 
+# Pure display — does NOT call ensure_config. Callers must validate config.
 list_outbound_overview() {
-  ensure_config
+  [[ -f $CONFIG_FILE ]] || { info "还没有配置。"; return 0; }
   local inbound outbound type server port user number=0
   heading "入站与出站规则"
   if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then

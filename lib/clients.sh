@@ -39,7 +39,8 @@ add_client() {
 }
 
 list_clients() {
-  ensure_config
+  # Pure display — does NOT call ensure_config.
+  [[ -f $CONFIG_FILE ]] || { info "配置不存在。"; return 1; }
   local tag=${1-} type i=0 name cred
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")

@@ -11,7 +11,8 @@ print_share_entry() {
 }
 
 print_share() {
-  ensure_config
+  # Does NOT call ensure_config — caller validates config once at entry.
+  [[ -f $CONFIG_FILE ]] || { warn "配置不存在。"; return 1; }
   local tag=${1-} filter=${2-} type host uri_host port name value flow sni public sid security tls_enabled obfs obfs_password link json
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"

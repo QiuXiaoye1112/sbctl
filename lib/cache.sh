@@ -1,41 +1,47 @@
 # shellcheck shell=bash
 # Session-level cache for values that don't change during sbctl's lifetime.
-# No persistent cache files — purely in-memory, process-lifetime only.
-# Uses individual variables (not associative arrays) for bash 3.2+ compatibility.
+# Uses files under /tmp (not global variables) so cache survives $(...) subshells.
+# Cache directory is cleaned up on shell exit — no persistent files.
 
-# Cache variables (namespaced with _SBC_C_)
-_SBC_C_init_system=""
-_SBC_C_pkg_manager=""
-_SBC_C_sing_box_bin=""
-_SBC_C_sing_box_version=""
+_SBC_CACHE_DIR="${TMPDIR:-/tmp}/sbctl-cache-$$"
+mkdir -p "$_SBC_CACHE_DIR" 2>/dev/null || true
+# shellcheck disable=SC2064
+trap "rm -rf $_SBC_CACHE_DIR" EXIT
+
+_sbc_cached() {
+  local key=$1
+  [[ -f $_SBC_CACHE_DIR/$key ]] && cat "$_SBC_CACHE_DIR/$key" 2>/dev/null
+}
+
+_sbc_cache() {
+  local key=$1 value=$2
+  printf '%s' "$value" > "$_SBC_CACHE_DIR/$key" 2>/dev/null || true
+}
 
 sbc_invalidate_install_cache() {
-  _SBC_C_sing_box_bin=""
-  _SBC_C_sing_box_version=""
+  rm -f "$_SBC_CACHE_DIR/_sbc_sing_box_bin" "$_SBC_CACHE_DIR/_sbc_sing_box_version" 2>/dev/null || true
 }
 
 sbc_cache_flush() {
-  _SBC_C_init_system=""
-  _SBC_C_pkg_manager=""
-  _SBC_C_sing_box_bin=""
-  _SBC_C_sing_box_version=""
+  rm -rf "$_SBC_CACHE_DIR" 2>/dev/null || true
+  mkdir -p "$_SBC_CACHE_DIR" 2>/dev/null || true
 }
 
 # Cached init_system — runs once per session
 init_system() {
-  if [[ -n $_SBC_C_init_system ]]; then printf '%s' "$_SBC_C_init_system"; return; fi
   local result
+  result=$(_sbc_cached _sbc_init_system) && { printf '%s' "$result"; return; }
   if command_exists systemctl && [[ -d /run/systemd/system || ${SBCTL_TESTING:-0} == 1 ]]; then result=systemd
   elif command_exists rc-service; then result=openrc
   else result=unknown; fi
-  _SBC_C_init_system=$result
+  _sbc_cache _sbc_init_system "$result"
   printf '%s' "$result"
 }
 
 # Cached pkg_manager — runs once per session
 pkg_manager() {
-  if [[ -n $_SBC_C_pkg_manager ]]; then printf '%s' "$_SBC_C_pkg_manager"; return 0; fi
-  local result=""
+  local result
+  result=$(_sbc_cached _sbc_pkg_manager) && { printf '%s' "$result"; return 0; }
   if command_exists apk; then result=apk
   elif command_exists apt-get; then result=apt
   elif command_exists dnf; then result=dnf
@@ -43,7 +49,7 @@ pkg_manager() {
   elif command_exists pacman; then result=pacman
   elif command_exists zypper; then result=zypper
   else return 1; fi
-  _SBC_C_pkg_manager=$result
+  _sbc_cache _sbc_pkg_manager "$result"
   printf '%s' "$result"
 }
 
@@ -53,20 +59,21 @@ refresh_binary_path() {
     SING_BOX_BIN=$SBCTL_SING_BOX_BIN
     return
   fi
-  if [[ -n $_SBC_C_sing_box_bin ]]; then SING_BOX_BIN=$_SBC_C_sing_box_bin; return; fi
+  local cached
+  cached=$(_sbc_cached _sbc_sing_box_bin) && { SING_BOX_BIN=$cached; return; }
   SING_BOX_BIN=$(command -v sing-box 2>/dev/null || printf '%s' "$SING_BOX_BIN")
-  _SBC_C_sing_box_bin=$SING_BOX_BIN
+  _sbc_cache _sbc_sing_box_bin "$SING_BOX_BIN"
 }
 
-# Cached sing-box version
+# Cached sing-box version — survives $(...) calls
 sing_box_version() {
-  if [[ -n $_SBC_C_sing_box_version ]]; then printf '%s' "$_SBC_C_sing_box_version"; return; fi
-  local version=""
+  local version
+  version=$(_sbc_cached _sbc_sing_box_version) && { printf '%s' "$version"; return; }
   refresh_binary_path
   if [[ -x $SING_BOX_BIN ]]; then
     version=$("$SING_BOX_BIN" version 2>/dev/null | sed -nE '1s/^sing-box version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
   fi
-  _SBC_C_sing_box_version=${version:-}
+  _sbc_cache _sbc_sing_box_version "${version:-}"
   printf '%s' "${version:-}"
 }
 
@@ -113,23 +120,27 @@ service_is_enabled() {
   [[ $unitfile == enabled ]]
 }
 
-# Combined service state summaries — avoids repeated systemctl calls
-service_state_summary() {
-  if [[ ${SBCTL_TESTING:-0} == 1 ]]; then printf '未安装'; return; fi
-  local states load active
+# Combined service state summaries — single systemctl call for all states
+_service_summary_all() {
+  # Output: "running_state startup_state version"
+  if [[ ${SBCTL_TESTING:-0} == 1 ]]; then
+    printf '未安装 未安装 %s' "$(sing_box_version_summary)"
+    return
+  fi
+  local states load active unitfile
   states=$(_service_states)
-  load=$(awk '{print $1}' <<<"$states")
-  active=$(awk '{print $2}' <<<"$states")
-  if [[ $load == not-found ]]; then printf '未安装'
-  elif [[ $active == active ]]; then printf '运行中'
-  else printf '已停止'; fi
+  load=$(echo "$states" | awk '{print $1}')
+  active=$(echo "$states" | awk '{print $2}')
+  unitfile=$(echo "$states" | awk '{print $3}')
+
+  local service_str startup_str
+  if [[ $load == not-found ]]; then service_str=未安装; elif [[ $active == active ]]; then service_str=运行中; else service_str=已停止; fi
+  if [[ $unitfile == enabled ]]; then startup_str=已开启; else startup_str=已关闭; fi
+  printf '%s %s %s' "$service_str" "$startup_str" "$(sing_box_version_summary)"
 }
 
-startup_state_summary() {
-  local unitfile
-  unitfile=$(_service_states | awk '{print $3}')
-  if [[ $unitfile == enabled ]]; then printf '已开启'; else printf '已关闭'; fi
-}
+service_state_summary() { _service_summary_all | awk '{print $1}'; }
+startup_state_summary() { _service_summary_all | awk '{print $2}'; }
 
 sing_box_version_summary() {
   local v
@@ -138,19 +149,19 @@ sing_box_version_summary() {
 }
 
 node_summary() {
-  local service_loader count=0 version_str
+  local service_str count=0 version_str
   if [[ ${SBCTL_TESTING:-0} != 1 ]]; then
     local states load active
     states=$(_service_states)
-    load=$(awk '{print $1}' <<<"$states")
-    active=$(awk '{print $2}' <<<"$states")
-    if [[ $load == not-found ]]; then service_loader=未安装
-    elif [[ $active == active ]]; then service_loader=运行中
-    else service_loader=已停止; fi
+    load=$(echo "$states" | awk '{print $1}')
+    active=$(echo "$states" | awk '{print $2}')
+    if [[ $load == not-found ]]; then service_str=未安装
+    elif [[ $active == active ]]; then service_str=运行中
+    else service_str=已停止; fi
   else
-    service_loader=未安装
+    service_str=未安装
   fi
   [[ -f $CONFIG_FILE ]] && count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf 0)
   version_str=$(sing_box_version_summary)
-  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$service_loader" "$count" "${version_str:-已安装}"
+  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$service_str" "$count" "${version_str:-已安装}"
 }

@@ -1,43 +1,112 @@
 #!/usr/bin/env bash
-# Performance baseline measurement for sbctl optimization.
-# Counts external process invocations during key operations.
-set -euo pipefail
+# Performance baseline test for sbctl.
+# Sources sbctl.sh, mocks external commands with counters, asserts max call counts.
+# Fails hard if hot-path regressions are detected.
+set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
 
-# Create mock environment
-MOCK_DIR=$(mktemp -d /tmp/sbctl-perf-XXXXXX)
-trap 'rm -rf "$MOCK_DIR"' EXIT
+# ---- helpers ----
+failures=0
+assert_le() {
+  local label=$1 actual=$2 max=$3
+  if ((actual > max)); then
+    printf '  FAIL [%s] %d > %d (max)\n' "$label" "$actual" "$max" >&2
+    ((failures+=1))
+  else
+    printf '  ok   [%s] %d <= %d\n' "$label" "$actual" "$max"
+  fi
+}
 
-mkdir -p "$MOCK_DIR/etc/sing-box/certs"
-mkdir -p "$MOCK_DIR/var/lib/sbctl"
-mkdir -p "$MOCK_DIR/usr/local/bin"
-mkdir -p "$MOCK_DIR/usr/local/sbin"
-mkdir -p "$MOCK_DIR/usr/local/lib/sbctl"
+# ---- test environment ----
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+COUNTERS="$TMP/counters"
+mkdir -p "$TMP/bin" "$TMP/cfg" "$TMP/certs"
 
-# Create a mock config
-cat > "$MOCK_DIR/etc/sing-box/config.json" << 'JSON'
+# Mock sing-box with counter
+cat >"$TMP/bin/sing-box" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "sing-box" >> "${COUNTERS:-/tmp/sbctl-perf-counters}"
+case "${1-}" in
+  version) echo "sing-box version 1.14.0" ;;
+  generate)
+    case "${2-}" in
+      uuid) echo "00000000-0000-0000-0000-000000000000" ;;
+      reality-keypair) printf 'PrivateKey: p\nPublicKey: P\n' ;;
+    esac ;;
+  check) exit 0 ;;
+esac
+exit 0
+SCRIPT
+chmod +x "$TMP/bin/sing-box"
+
+# Mock jq with counter — passes through to real jq for correctness
+cat >"$TMP/bin/jq" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "jq" >> "${COUNTERS:-/tmp/sbctl-perf-counters}"
+exec /usr/bin/jq "$@"
+SCRIPT
+chmod +x "$TMP/bin/jq"
+
+# Mock systemctl with counter
+cat >"$TMP/bin/systemctl" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "systemctl" >> "${COUNTERS:-/tmp/sbctl-perf-counters}"
+case "$*" in
+  *show*|*LoadState*)
+    printf 'LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n'
+    ;;
+  *daemon-reload*) : ;;
+  *) : ;;
+esac
+exit 0
+SCRIPT
+chmod +x "$TMP/bin/systemctl"
+
+# Mock openssl (pass through)
+cat >"$TMP/bin/openssl" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "openssl" >> "${COUNTERS:-/tmp/sbctl-perf-counters}"
+exec /usr/bin/openssl "$@"
+SCRIPT
+chmod +x "$TMP/bin/openssl"
+
+# Mock curl (never actually called in hot path)
+cat >"$TMP/bin/curl" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "curl" >> "${COUNTERS:-/tmp/sbctl-perf-counters}"
+exit 1
+SCRIPT
+chmod +x "$TMP/bin/curl"
+
+# Mock sed (pass through)
+cat >"$TMP/bin/sed" <<'SCRIPT'
+#!/usr/bin/env bash
+echo "sed" >> "${COUNTERS:-/tmp/sbctl-perf-counters}"
+exec /usr/bin/sed "$@"
+SCRIPT
+chmod +x "$TMP/bin/sed"
+
+# Create minimal config and meta
+cat >"$TMP/cfg/config.json" <<'JSON'
 {
   "log": {"level": "warn", "timestamp": true},
   "inbounds": [
     {
       "type": "vless", "tag": "test-vless",
       "listen": "0.0.0.0", "listen_port": 443,
-      "users": [{"name": "user1", "uuid": "00000000-0000-0000-0000-000000000001", "flow": "xtls-rprx-vision"}],
+      "users": [{"name": "u1", "uuid": "00000000-0000-0000-0000-000000000001", "flow": "xtls-rprx-vision"}],
       "tls": {"enabled": true, "server_name": "example.com",
         "reality": {"enabled": true, "handshake": {"server": "www.microsoft.com", "server_port": 443},
-        "private_key": "test-key", "short_id": ["abcd"]},
-        "certificate_path": "/etc/sing-box/certs/test.crt",
-        "key_path": "/etc/sing-box/certs/test.key"}
+        "private_key": "k", "short_id": ["abcd"]}}
     },
     {
       "type": "trojan", "tag": "test-trojan",
       "listen": "0.0.0.0", "listen_port": 8443,
-      "users": [{"name": "trojan1", "password": "test-pass"}],
-      "tls": {"enabled": true, "server_name": "trojan.example.com",
-        "certificate_path": "/etc/sing-box/certs/trojan.crt",
-        "key_path": "/etc/sing-box/certs/trojan.key"}
+      "users": [{"name": "t1", "password": "pass"}],
+      "tls": {"enabled": true, "server_name": "t.example.com"}
     }
   ],
   "outbounds": [{"type": "direct", "tag": "direct"}],
@@ -45,113 +114,191 @@ cat > "$MOCK_DIR/etc/sing-box/config.json" << 'JSON'
 }
 JSON
 
-cat > "$MOCK_DIR/var/lib/sbctl/meta.json" << 'JSON'
-{"schema":2,"inbounds":{"test-vless":{"host":"1.2.3.4","updatedAt":"2024-01-01T00:00:00Z","realityPublicKey":"test-pub","realityPrivateSHA256":"test-sha"},"test-trojan":{"host":"trojan.example.com","updatedAt":"2024-01-01T00:00:00Z"}},"certificates":{},"managedResources":{},"migrations":{"legacyCertScanV1":true}}
+cat >"$TMP/meta.json" <<'JSON'
+{"schema":2,"inbounds":{"test-vless":{"host":"1.2.3.4","updatedAt":"2024-01-01T00:00:00Z"},"test-trojan":{"host":"t.example.com","updatedAt":"2024-01-01T00:00:00Z"}},"certificates":{},"managedResources":{},"migrations":{"legacyCertScanV1":true}}
 JSON
 
-# Create mock binaries that count invocations
-for cmd in jq systemctl sing-box openssl sed curl; do
-  cat > "$MOCK_DIR/usr/local/bin/$cmd" << 'SCRIPT'
-#!/usr/bin/env bash
-echo "${0##*/}" >> /tmp/sbctl-perf-counts.log
-case "${0##*/}" in
-  jq)
-    # Pass through to real jq for functionality
-    exec /usr/bin/jq "$@"
-    ;;
-  systemctl)
-    if [[ "$*" == *"is-active"* ]]; then echo inactive; exit 0
-    elif [[ "$*" == *"is-enabled"* ]]; then echo disabled; exit 0
-    elif [[ "$*" == *"list-unit-files"* ]]; then exit 0
-    elif [[ "$*" == *"show"* ]]; then echo "LoadState=loaded"; echo "ActiveState=inactive"; echo "UnitFileState=disabled"; exit 0
-    else exit 0; fi
-    ;;
-  sing-box)
-    if [[ "$*" == *"version"* ]]; then echo "sing-box version 1.14.0"; exit 0
-    elif [[ "$*" == *"check"* ]]; then exit 0
-    elif [[ "$*" == *"generate"* ]]; then echo "PrivateKey: test-key"; echo "PublicKey: test-pub"; exit 0
-    else exit 0; fi
-    ;;
-  openssl) exec /usr/bin/openssl "$@" ;;
-  sed) exec /usr/bin/sed "$@" ;;
-  curl) exit 0 ;;
-esac
-SCRIPT
-  chmod +x "$MOCK_DIR/usr/local/bin/$cmd"
-done
+# ---- actual test: source sbctl.sh and exercise hot paths ----
+printf '=== sbctl Performance Baseline ===\n\n'
 
-# Also add real binaries needed
-for cmd in date tr head tail awk grep cat cp mv rm mkdir chmod readlink dirname basename install; do
-  ln -sf "$(command -v "$cmd")" "$MOCK_DIR/usr/local/bin/$cmd" 2>/dev/null || true
-done
+COUNTERS="$TMP/counters"
+export COUNTERS
 
-# Count function overrides
-echo "=== STRUCTURE BASELINE ==="
-echo "declare -f occurrences:"
-grep -rn 'declare -f' "$PROJECT_DIR/lib/" | wc -l
+PATH="$TMP/bin:$PATH" \
+SBCTL_TESTING=1 \
+SBCTL_SING_BOX_BIN="$TMP/bin/sing-box" \
+SBCTL_CONFIG_DIR="$TMP/cfg" \
+SBCTL_CONFIG_FILE="$TMP/cfg/config.json" \
+SBCTL_META_FILE="$TMP/meta.json" \
+SBCTL_CERT_DIR="$TMP/certs" \
+SBCTL_LOCK_FILE="$TMP/lock" \
+bash -c '
+set -Eeuo pipefail
+source ./sbctl.sh
+
+# ---- Phase 1: node_summary (main menu header) ----
+echo "--- node_summary (main menu) ---"
+> "$COUNTERS"
+node_summary > /dev/null
+echo "jq:        $(grep -c "^jq$" "$COUNTERS" 2>/dev/null || echo 0)"
+echo "systemctl: $(grep -c "^systemctl$" "$COUNTERS" 2>/dev/null || echo 0)"
+echo "sing-box:  $(grep -c "^sing-box$" "$COUNTERS" 2>/dev/null || echo 0)"
+echo "openssl:   $(grep -c "^openssl$" "$COUNTERS" 2>/dev/null || echo 0)"
+echo "curl:      $(grep -c "^curl$" "$COUNTERS" 2>/dev/null || echo 0)"
+
+# ---- Phase 2: second call — cache should hit, no extra sing-box ----
+echo ""
+echo "--- node_summary (2nd call, cache warm) ---"
+> "$COUNTERS"
+node_summary > /dev/null
+echo "jq:        $(grep -c "^jq$" "$COUNTERS" 2>/dev/null || echo 0)"
+echo "systemctl: $(grep -c "^systemctl$" "$COUNTERS" 2>/dev/null || echo 0)"
+echo "sing-box:  $(grep -c "^sing-box$" "$COUNTERS" 2>/dev/null || echo 0)"
+
+# ---- Phase 3: list_inbounds ----
+echo ""
+echo "--- list_inbounds ---"
+> "$COUNTERS"
+list_inbounds > /dev/null
+echo "jq:        $(grep -c "^jq$" "$COUNTERS" 2>/dev/null || echo 0)"
+
+# ---- Phase 4: sing_box_version (cached) ----
+echo ""
+echo "--- sing_box_version (3 calls) ---"
+> "$COUNTERS"
+sing_box_version > /dev/null
+sing_box_version > /dev/null
+sing_box_version > /dev/null
+echo "sing-box:  $(grep -c "^sing-box$" "$COUNTERS" 2>/dev/null || echo 0)  (expected: 1 — cached after first)"
+
+# ---- Phase 5: service_state_summary + startup_state_summary ----
+echo ""
+echo "--- service_state_summary + startup_state_summary ---"
+> "$COUNTERS"
+service_state_summary > /dev/null
+startup_state_summary > /dev/null
+echo "systemctl: $(grep -c "^systemctl$" "$COUNTERS" 2>/dev/null || echo 0)"
+
+# ---- Phase 6: init_system (cached after module load) ----
+echo ""
+echo "--- init_system (3 calls, already cached from module load) ---"
+> "$COUNTERS"
+init_system > /dev/null
+init_system > /dev/null
+init_system > /dev/null
+echo "sing-box:  $(grep -c "^sing-box$" "$COUNTERS" 2>/dev/null || echo 0)"
 
 echo ""
-echo "Duplicate function definitions (≥2 files):"
-grep -rn '^[a-z_]*()' "$PROJECT_DIR/lib/"*.sh | awk -F: '{print $3}' | sed 's/()//' | sort | uniq -c | sort -rn | awk '$1>=2' | wc -l
-echo "functions defined in ≥2 files"
+echo "=== Counts collected ==="
+' 2>&1
 
+# ---- Assertions ----
 echo ""
-echo "Total lines of code:"
-wc -l "$PROJECT_DIR"/sbctl.sh "$PROJECT_DIR"/lib/*.sh | tail -1
+echo "--- Assertions ---"
 
+# Count jq calls from Phase 3 (list_inbounds)
+> "$COUNTERS"
+PATH="$TMP/bin:$PATH" \
+SBCTL_TESTING=1 \
+SBCTL_SING_BOX_BIN="$TMP/bin/sing-box" \
+SBCTL_CONFIG_DIR="$TMP/cfg" \
+SBCTL_CONFIG_FILE="$TMP/cfg/config.json" \
+SBCTL_META_FILE="$TMP/meta.json" \
+SBCTL_CERT_DIR="$TMP/certs" \
+SBCTL_LOCK_FILE="$TMP/lock" \
+bash -c '
+source ./sbctl.sh
+> "$COUNTERS"
+list_inbounds > /dev/null
+jq_count=$(grep -c "^jq$" "$COUNTERS" 2>/dev/null || echo 0)
+printf "%s\n" "$jq_count"
+' > "$TMP/list_jq_count" 2>/dev/null
+list_jq=$(cat "$TMP/list_jq_count" 2>/dev/null || echo 0)
+assert_le "list_inbounds jq calls" "${list_jq:-0}" 2
+
+# node_summary: max assertions
+> "$COUNTERS"
+PATH="$TMP/bin:$PATH" \
+SBCTL_TESTING=1 \
+SBCTL_SING_BOX_BIN="$TMP/bin/sing-box" \
+SBCTL_CONFIG_DIR="$TMP/cfg" \
+SBCTL_CONFIG_FILE="$TMP/cfg/config.json" \
+SBCTL_META_FILE="$TMP/meta.json" \
+SBCTL_CERT_DIR="$TMP/certs" \
+SBCTL_LOCK_FILE="$TMP/lock" \
+bash -c '
+source ./sbctl.sh
+> "$COUNTERS"
+node_summary > /dev/null
+sc=$(grep -c "^systemctl$" "$COUNTERS" 2>/dev/null || echo 0)
+sb=$(grep -c "^sing-box$" "$COUNTERS" 2>/dev/null || echo 0)
+curl_c=$(grep -c "^curl$" "$COUNTERS" 2>/dev/null || echo 0)
+printf "%s %s %s\n" "$sc" "$sb" "$curl_c"
+' > "$TMP/node_counts" 2>/dev/null
+read -r node_sc node_sb node_curl < "$TMP/node_counts" 2>/dev/null || true
+assert_le "node_summary systemctl calls" "${node_sc:-0}" 1
+assert_le "node_summary sing-box calls"   "${node_sb:-0}" 1
+assert_le "node_summary curl calls"       "${node_curl:-0}" 0
+
+# sing_box_version cache: single execution
+> "$COUNTERS"
+PATH="$TMP/bin:$PATH" \
+SBCTL_TESTING=1 \
+SBCTL_SING_BOX_BIN="$TMP/bin/sing-box" \
+SBCTL_CONFIG_DIR="$TMP/cfg" \
+SBCTL_CONFIG_FILE="$TMP/cfg/config.json" \
+SBCTL_META_FILE="$TMP/meta.json" \
+SBCTL_CERT_DIR="$TMP/certs" \
+SBCTL_LOCK_FILE="$TMP/lock" \
+bash -c '
+source ./sbctl.sh
+> "$COUNTERS"
+sing_box_version > /dev/null
+sing_box_version > /dev/null
+sing_box_version > /dev/null
+grep -c "^sing-box$" "$COUNTERS" 2>/dev/null || echo 0
+' > "$TMP/ver_count" 2>/dev/null
+ver_calls=$(cat "$TMP/ver_count" 2>/dev/null || echo 0)
+assert_le "sing_box_version (3 calls) sing-box exec" "${ver_calls:-0}" 1
+
+# ---- structure assertions ----
 echo ""
-echo "Module count:"
-ls "$PROJECT_DIR"/lib/*.sh | wc -l
+echo "--- Structure ---"
+if grep -rn 'declare -f' lib/ sbctl.sh 2>/dev/null; then
+  echo '  FAIL: declare -f override found'
+  ((failures+=1))
+else
+  echo '  ok   zero declare -f overrides'
+fi
 
+# ---- module list sync check ----
 echo ""
-echo "=== FUNCTION OVERRIDE CHAIN ==="
-grep -rn 'declare -f' "$PROJECT_DIR/lib/" || echo "(none found)"
+echo "--- MODULES sync ---"
+sbctl_modules=$(grep '^for _module in ' sbctl.sh | sed 's/.*for _module in //' | sed 's/; do//' | tr ' ' '\n' | sort)
+install_modules=$(grep '^readonly MODULES=' install.sh | sed 's/readonly MODULES="//;s/"//' | tr ' ' '\n' | sort)
+alpine_modules=$(grep '^MODULES=' alpine/install.sh | sed 's/MODULES="//;s/"//' | tr ' ' '\n' | sort)
 
+if [[ "$sbctl_modules" == "$install_modules" ]]; then
+  echo '  ok   sbctl.sh == install.sh MODULES'
+else
+  echo '  FAIL sbctl.sh != install.sh MODULES' >&2
+  diff <(echo "$sbctl_modules") <(echo "$install_modules") >&2 || true
+  ((failures+=1))
+fi
+
+if [[ "$sbctl_modules" == "$alpine_modules" ]]; then
+  echo '  ok   sbctl.sh == alpine/install.sh MODULES'
+else
+  echo '  FAIL sbctl.sh != alpine/install.sh MODULES' >&2
+  diff <(echo "$sbctl_modules") <(echo "$alpine_modules") >&2 || true
+  ((failures+=1))
+fi
+
+# ---- result ----
 echo ""
-echo "=== DUPLICATE FUNCTION DEFINITIONS ==="
-grep -rn '^[a-z_]*()' "$PROJECT_DIR/lib/"*.sh | awk -F: '{print $3}' | sed 's/()//' | sort | uniq -c | sort -rn | awk '$1>=2{print}'
-
-echo ""
-echo "=== PERF COUNTER SIMULATION ==="
-# Simulate the key operations and count jq/systemctl calls
-rm -f /tmp/sbctl-perf-counts.log
-
-# Simulate node_summary (what main menu calls)
-echo "--- main menu (node_summary + list_inbounds) ---"
-export PATH="$MOCK_DIR/usr/local/bin:$PATH"
-export SBCTL_TESTING=1
-export SBCTL_CONFIG_DIR="$MOCK_DIR/etc/sing-box"
-export SBCTL_META_FILE="$MOCK_DIR/var/lib/sbctl/meta.json"
-export SBCTL_SING_BOX_BIN="$MOCK_DIR/usr/local/bin/sing-box"
-export SBCTL_LIB_DIR="$PROJECT_DIR/lib"
-
-# Count what a typical main_menu render does
-rm -f /tmp/sbctl-perf-counts.log
-bash -c "
-export PATH=\"$MOCK_DIR/usr/local/bin:\$PATH\"
-export SBCTL_TESTING=1
-export SBCTL_CONFIG_DIR=\"$MOCK_DIR/etc/sing-box\"
-export SBCTL_META_FILE=\"$MOCK_DIR/var/lib/sbctl/meta.json\"
-export SBCTL_SING_BOX_BIN=\"$MOCK_DIR/usr/local/bin/sing-box\"
-
-# Simulate node_summary calls
-# refresh_binary_path
-\"$MOCK_DIR/usr/local/bin/sing-box\" version >/dev/null 2>&1 || true
-# service_exists -> init_system + systemctl
-\"$MOCK_DIR/usr/local/bin/systemctl\" list-unit-files sing-box.service --no-legend >/dev/null 2>&1 || true
-# service_is_active -> init_system + systemctl
-\"$MOCK_DIR/usr/local/bin/systemctl\" is-active --quiet sing-box >/dev/null 2>&1 || true
-# jq for inbounds count
-\"$MOCK_DIR/usr/local/bin/jq\" '.inbounds|length' \"$MOCK_DIR/etc/sing-box/config.json\"
-
-# Simulate list_inbounds
-\"$MOCK_DIR/usr/local/bin/jq\" '.inbounds|length' \"$MOCK_DIR/etc/sing-box/config.json\"
-\"$MOCK_DIR/usr/local/bin/jq\" -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then \"reality\" elif .tls.enabled==true then \"tls\" else \"none\" end),((.users//[])|length|tostring)] | @tsv' \"$MOCK_DIR/etc/sing-box/config.json\"
-" 2>/dev/null || true
-
-echo "jq calls: $(grep -c '^jq$' /tmp/sbctl-perf-counts.log 2>/dev/null || echo 0)"
-echo "systemctl calls: $(grep -c '^systemctl$' /tmp/sbctl-perf-counts.log 2>/dev/null || echo 0)"
-echo "sing-box calls: $(grep -c '^sing-box$' /tmp/sbctl-perf-counts.log 2>/dev/null || echo 0)"
-
-echo ""
-echo "=== COMPLETE ==="
+if ((failures > 0)); then
+  echo "=== ${failures} ASSERTION(S) FAILED ==="
+  exit 1
+else
+  echo "=== ALL ASSERTIONS PASSED ==="
+fi

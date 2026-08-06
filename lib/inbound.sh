@@ -203,9 +203,10 @@ add_inbound() {
   return "$rc"
 }
 
-# Single-jq list_inbounds — one jq call for the entire table
+# Single-jq list_inbounds — one jq call for the entire table.
+# Does NOT call ensure_config/init_meta — callers must ensure config is valid.
 list_inbounds() {
-  ensure_config
+  [[ -f $CONFIG_FILE ]] || { info "还没有入站。"; return 0; }
   local count tag_width=24 type_width=14 port_width=8 security_width=12 users_width=6
   count=$(jq '.inbounds|length' "$CONFIG_FILE")
   ((count)) || { info "还没有入站。"; return 0; }

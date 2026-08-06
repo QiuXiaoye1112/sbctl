@@ -77,6 +77,7 @@ modify_inbound_menu() {
 }
 
 inbound_menu() {
+  ensure_config  # once at entry, not on every redraw
   local choice tag
   while true; do
     clear_screen
@@ -96,6 +97,7 @@ inbound_menu() {
 }
 
 client_menu() {
+  ensure_config  # once at entry
   local tag=$1 choice
   while inbound_exists "$tag"; do
     clear_screen; heading "用户管理 · ${tag}"; list_clients "$tag"
@@ -112,6 +114,7 @@ client_menu() {
 }
 
 outbound_menu() {
+  ensure_config  # once at entry
   local choice
   while true; do
     clear_screen
@@ -158,10 +161,12 @@ toggle_service_startup() {
 }
 
 service_menu() {
-  local choice
+  local choice svc_summary boot_summary ver_summary
   while true; do
     clear_screen; heading "服务管理"
-    printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$(service_state_summary)" "$(startup_state_summary)" "$(sing_box_version_summary)"
+    # Single _service_summary_all call, parse with read — no repeated awk/systemctl
+    read -r svc_summary boot_summary ver_summary <<< "$(_service_summary_all)"
+    printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$svc_summary" "$boot_summary" "$ver_summary"
     printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装/更新/修复 sing-box\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
