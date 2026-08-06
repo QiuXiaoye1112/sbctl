@@ -15,21 +15,8 @@ command -v install >/dev/null 2>&1 || die "缺少 install。"
 command -v bash >/dev/null 2>&1 || die "缺少 bash。"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-commit=""
-if meta=$(curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 8 --max-time 20 \
-  -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${REPO}/commits/main" 2>/dev/null); then
-  commit=$(printf '%s' "$meta" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | sed -n '1p')
-fi
-if [[ $commit =~ ^[0-9a-f]{40}$ ]]; then
-  BASE_URL="https://raw.githubusercontent.com/${REPO}/${commit}"
-  info "锁定源码提交：${commit:0:12}"
-else
-  BASE_URL="https://github.com/${REPO}/raw/refs/heads/main"
-  info "无法解析 main 提交，使用 GitHub 实时分支下载。"
-fi
-info "正在下载并校验 sbctl..."
+BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/main"
 fetch "$BASE_URL/sbctl.sh" "$tmp/sbctl.sh" || die "主脚本下载失败。"
-grep -q '^# sbctl - sing-box Linux terminal manager' "$tmp/sbctl.sh" || die "主脚本内容校验失败。"
 mkdir -p "$tmp/lib"
 for module in $MODULES; do
   fetch "$BASE_URL/lib/${module}.sh" "$tmp/lib/${module}.sh" || die "模块下载失败：${module}"

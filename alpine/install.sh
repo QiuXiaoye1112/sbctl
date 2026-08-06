@@ -9,18 +9,9 @@ MODULES="cache core ui engine compat certmeta inbound certificate reality outbou
 apk add --no-cache bash curl jq openssl coreutils >/dev/null
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
-commit=""
-meta=$(curl -fsSL --retry 2 --connect-timeout 8 --max-time 20 \
-  -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${REPO}/commits/main" 2>/dev/null || true)
-commit=$(printf '%s' "$meta" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | sed -n '1p')
-case "$commit" in
-  ????????????????????????????????????????) BASE_URL="https://raw.githubusercontent.com/${REPO}/${commit}"; echo "[sbctl] 锁定源码提交：$(printf '%.12s' "$commit")" ;;
-  *) BASE_URL="https://github.com/${REPO}/raw/refs/heads/main"; echo '[sbctl] 无法解析 main 提交，使用 GitHub 实时分支下载。' ;;
-esac
+BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/main"
 fetch() { curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$1" -o "$2"; }
-echo '[sbctl] 正在下载并校验 sbctl...'
 fetch "$BASE_URL/sbctl.sh" "$tmp/sbctl.sh" || { echo '[sbctl] 主脚本下载失败。' >&2; exit 1; }
-grep -q '^# sbctl - sing-box Linux terminal manager' "$tmp/sbctl.sh" || { echo '[sbctl] 主脚本内容校验失败。' >&2; exit 1; }
 mkdir -p "$tmp/lib"
 for module in $MODULES; do
   fetch "$BASE_URL/lib/${module}.sh" "$tmp/lib/${module}.sh" || { echo "[sbctl] 模块下载失败: $module" >&2; exit 1; }
