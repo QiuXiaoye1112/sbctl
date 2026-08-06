@@ -60,10 +60,11 @@ validate_certificate_pair() {
 }
 
 build_certificate_tls() {
-  local __json=$1 identifier sni
+  local __json=$1 __host=${2-} identifier sni
   select_managed_certificate identifier || return 1
   prompt_certificate_server_name sni "$CERT_DIR/${identifier}.crt" || return 1
   printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$CERT_DIR/${identifier}.crt" --arg key "$CERT_DIR/${identifier}.key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
+  [[ -z $__host ]] || printf -v "$__host" '%s' "$sni"
 }
 
 generate_reality_keys() {
@@ -118,20 +119,36 @@ build_inbound() {
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
   prompt_value listen "监听地址" "0.0.0.0"
-  prompt_public_host client_host
+
+  # VLESS: decide TLS before asking for client host
+  #   REALITY → prompt_public_host (client_host may differ from SNI)
+  #   cert TLS → client_host comes from certificate server_name
+  if [[ $type == vless ]]; then
+    choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+    if [[ $choice == 1 ]]; then
+      build_reality_tls tls reality_public || return 1
+      prompt_public_host client_host
+    else
+      build_certificate_tls tls client_host || return 1
+    fi
+    prompt_port port 443
+  else
+    prompt_public_host client_host
+  fi
 
   case $type in
-    anytls|vless|trojan)
+    anytls|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
       if [[ $choice == 1 ]]; then build_reality_tls tls reality_public || return 1; else build_certificate_tls tls || return 1; fi
       prompt_port port 443
       ;;
+    vless)
+      ;; # TLS and port already handled above
     hysteria2)
       build_certificate_tls tls || return 1
       local hop_choice
       choose hop_choice "端口模式" "普通端口" "端口跳跃"
       if [[ $hop_choice == 2 ]]; then
-        # ---- port hopping enabled ----
         while true; do
           prompt_value selected_hop_range "端口跳跃范围（如 20000-30000）"
           validate_hy2_hop_range "$selected_hop_range" && break
