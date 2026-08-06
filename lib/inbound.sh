@@ -136,12 +136,16 @@ build_inbound() {
       # Transport: REALITY forces tcp; cert-TLS/none can choose ws
       if [[ $choice != 1 ]]; then
         local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws"
-        if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
-          prompt_value ws_host "WebSocket Host" "$client_host"
-          transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
-        fi
+        choose tp_choice "传输方式" "tcp" "ws" "httpupgrade" "grpc"
+        case $tp_choice in
+          2) prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"; prompt_value ws_host "WebSocket Host" "$client_host"
+             transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}') ;;
+          3) prompt_value ws_path "HTTPUpgrade 路径" "/$(random_hex 8)"; prompt_value ws_host "HTTPUpgrade Host" "$client_host"
+             transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"httpupgrade",path:$path,host:$host}') ;;
+          4) local grpc_svc
+             prompt_value grpc_svc "gRPC serviceName" "vless"
+             transport_json=$(jq -n --arg svc "$grpc_svc" '{type:"grpc",serviceName:$svc}') ;;
+        esac
       fi
       ;;
     anytls|trojan)
