@@ -114,7 +114,7 @@ reality_public_key() {
 }
 
 build_inbound() {
-  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range=""
+  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="" ws_path ws_host
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" "Mixed(SOCKS+HTTP)"
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
@@ -133,6 +133,16 @@ build_inbound() {
         3) tls=""; prompt_public_host client_host ;;
       esac
       prompt_port port 443
+      # Transport: REALITY forces tcp; cert-TLS/none can choose ws
+      if [[ $choice != 1 ]]; then
+        local tp_choice
+        choose tp_choice "传输方式" "tcp" "ws"
+        if [[ $tp_choice == 2 ]]; then
+          prompt_value ws_path "WebSocket 路径" "/"
+          prompt_value ws_host "WebSocket Host" "$client_host"
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+        fi
+      fi
       ;;
     anytls|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
@@ -179,11 +189,12 @@ build_inbound() {
       prompt_value name "用户名称" "user-$(random_hex 2)"
       uuid=$(generate_uuid)
       if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
-      if [[ -z $tls ]]; then
-        printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]}')"
-      else
-        printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls" '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}],tls:$tls}')"
-      fi
+      local tls_arg=""
+      if [[ -z $tls ]]; then tls_arg="{}"; else tls_arg=$tls; fi
+      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls_arg" --argjson transport "$transport_json" '
+        {type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]} +
+        (if $tls!={} then {tls:$tls} else {} end) +
+        (if $transport!="" then {transport:$transport} else {} end)')"
       ;;
     hysteria2)
       prompt_value name "用户名称" "user-$(random_hex 2)"
