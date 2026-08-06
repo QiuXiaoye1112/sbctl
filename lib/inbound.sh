@@ -26,6 +26,8 @@ _random_port_avoiding_hops() {
     hex=$(random_hex 2)
     candidate=$((10000 + (16#$hex % 55536)))
     hy2_port_in_any_hop_range "$candidate" && continue
+    port_in_config "$candidate" && continue
+    port_in_use_os "$candidate" && continue
     printf '%s' "$candidate"; return 0
   done
   printf '443'
