@@ -138,7 +138,7 @@ build_inbound() {
         local tp_choice
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/"
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
           prompt_value ws_host "WebSocket Host" "$client_host"
           transport_json=$(jq -n --arg path "$ws_path" --arg host "$ws_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
