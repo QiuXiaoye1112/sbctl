@@ -33,15 +33,17 @@ print_share() {
       elif [[ $tls_enabled == true ]]; then
         security=tls
       else
-        warn "VLESS 入站未启用 TLS/REALITY，无法生成分享链接。"; return 0
+        security=none
       fi
       while IFS=$'\t' read -r name value flow; do
         [[ -z $filter || $name == "$filter" ]] || continue
         if [[ $security == reality ]]; then
           link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
           [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
-        else
+        elif [[ $security == tls ]]; then
           link="vless://${value}@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+        else
+          link="vless://${value}@${uri_host}:${port}?type=tcp"
         fi
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"

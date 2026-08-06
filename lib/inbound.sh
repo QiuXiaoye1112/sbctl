@@ -128,8 +128,8 @@ reality_public_key() {
 
 build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="null" ws_path
-  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" "Mixed(SOCKS+HTTP)"
-  case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
+  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
+  case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
   prompt_value listen "监听地址" "0.0.0.0"
 
@@ -204,7 +204,7 @@ build_inbound() {
         prompt_port port
       fi
       ;;
-    socks|http|mixed)
+    socks|http)
       prompt_public_host client_host
       prompt_port port
       ;;
@@ -247,7 +247,7 @@ build_inbound() {
         {type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} +
         (if $transport!=null then {transport:$transport} else {} end)')"
       ;;
-    socks|http|mixed)
+    socks|http)
       prompt_optional name "用户名（留空=无认证）"
       if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)"; fi
       if [[ -n $name ]]; then
