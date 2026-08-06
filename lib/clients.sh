@@ -93,7 +93,6 @@ delete_client() {
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
   if [[ -z $name ]]; then
-    list_clients "$tag"
     select_client name "$tag" || return 0
   fi
   client_exists "$tag" "$name" || die "找不到用户：${name}"
@@ -109,7 +108,7 @@ rotate_client_credential() {
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
-  [[ -n $name ]] || { list_clients "$tag"; select_client name "$tag" || return 0; }
+  [[ -n $name ]] || { select_client name "$tag" || return 0; }
   client_exists "$tag" "$name" || die "找不到用户：${name}"
   tmp=$(temp_file)
   if [[ $type == vless ]]; then
