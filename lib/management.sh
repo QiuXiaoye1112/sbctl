@@ -1,7 +1,7 @@
 rename_inbound() {
   ensure_dependencies inbound-rename; ensure_config
   local old=${1-} new=${2-} tmp meta_tmp
-  [[ -n $old ]] || select_inbound old || return
+  [[ -n $old ]] || select_inbound old || return 0
   inbound_exists "$old" || die "找不到入站：$old"
   if [[ -z $new ]]; then
     while true; do
@@ -33,7 +33,7 @@ rename_inbound() {
 modify_inbound_security() {
   ensure_dependencies inbound-security; require_supported_core; ensure_config
   local tag=${1-} type choice tls="" public="" tmp host
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   case $type in
@@ -65,7 +65,7 @@ modify_inbound_security() {
 delete_inbound() {
   ensure_dependencies inbound-delete; ensure_config
   local tag=${1-} yes=${2:-0} tmp
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return
   tmp=$(temp_file)
@@ -81,7 +81,7 @@ delete_inbound() {
 rename_client() {
   ensure_dependencies client-rename; ensure_config
   local tag=${1-} old=${2-} new=${3-} type field tmp
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")

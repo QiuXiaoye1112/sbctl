@@ -223,9 +223,9 @@ select_inbound() {
 delete_inbound() {
   ensure_dependencies inbound-delete; ensure_config
   local tag=${1-} yes=${2:-0} tmp
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
-  [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return
+  [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return 0
   tmp=$(temp_file)
   jq --arg tag "$tag" '.inbounds |= map(select(.tag!=$tag))' "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then meta_delete_inbound "$tag"; info "已删除入站 ${tag}。"; fi
@@ -235,7 +235,7 @@ delete_inbound() {
 modify_inbound_basic() {
   ensure_dependencies inbound-modify; ensure_config
   local tag=${1-} listen port host tmp
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")"
   prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag"

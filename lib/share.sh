@@ -13,7 +13,7 @@ print_share_entry() {
 print_share() {
   ensure_config
   local tag=${1-} filter=${2-} type host uri_host port name value flow sni public sid security tls_enabled obfs obfs_password link json
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"

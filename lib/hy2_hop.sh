@@ -300,7 +300,7 @@ modify_inbound_menu() {
 print_share() {
   ensure_config
   local tag=${1-} filter=${2-} type host share_host port share_port name password sni obfs obfs_password link
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   [[ $type == hysteria2 ]] || { original_print_share "$tag" "$filter"; return; }

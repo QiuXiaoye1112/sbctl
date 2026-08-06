@@ -105,6 +105,7 @@ run_menu_action() {
   set +e
   (
     set -Eeuo pipefail
+    trap - ERR
     trap cleanup_on_exit EXIT
     "$@"
   )
