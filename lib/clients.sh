@@ -12,7 +12,7 @@ client_exists() {
 add_client() {
   ensure_dependencies client-add; ensure_config
   local tag=${1-} type name password uuid flow user tmp
-  [[ -n $tag ]] || select_inbound tag '^(anytls|vless|hysteria2|trojan|socks|http|mixed)$' || return
+  [[ -n $tag ]] || select_inbound tag '^(anytls|vless|hysteria2|trojan|socks|http|mixed)$' || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   while true; do
     prompt_value name "用户名称" "user-$(random_hex 2)"
@@ -41,7 +41,7 @@ add_client() {
 list_clients() {
   ensure_config
   local tag=${1-} type
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   heading "${tag} 用户"
   case $type in
@@ -54,7 +54,7 @@ list_clients() {
 delete_client() {
   ensure_dependencies client-delete; ensure_config
   local tag=${1-} name=${2-} type field tmp
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
   if [[ -z $name ]]; then
@@ -71,7 +71,7 @@ delete_client() {
 rotate_client_credential() {
   ensure_dependencies client-rotate; ensure_config
   local tag=${1-} name=${2-} type field value tmp
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
   [[ -n $name ]] || { list_clients "$tag"; prompt_value name "用户名称"; }
@@ -106,7 +106,7 @@ client_json_for_anytls() {
 print_share() {
   ensure_config
   local tag=${1-} filter=${2-} type host h port name value sni public sid security tls_enabled obfs obfs_password
-  [[ -n $tag ]] || select_inbound tag || return
+  [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"; h=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")

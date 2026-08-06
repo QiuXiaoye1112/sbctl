@@ -211,7 +211,7 @@ select_outbound() {
 assign_outbound() {
   ensure_dependencies outbound-assign; require_supported_core; ensure_config
   local inbound=${1-} outbound=${2-} tmp
-  [[ -n $inbound ]] || select_inbound inbound || return
+  [[ -n $inbound ]] || select_inbound inbound || return 0
   inbound_exists "$inbound" || die "找不到入站：$inbound"
   [[ -n $outbound ]] || select_outbound outbound 1 || return
   [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
