@@ -40,15 +40,49 @@ add_client() {
 
 list_clients() {
   ensure_config
-  local tag=${1-} type
+  local tag=${1-} type i=0 name cred
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   heading "${tag} 用户"
   case $type in
-    vless) jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.uuid,(.flow//"")]|@tsv' "$CONFIG_FILE" ;;
-    anytls|hysteria2|trojan) jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.password]|@tsv' "$CONFIG_FILE" ;;
-    socks|http|mixed) jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.username,.password]|@tsv' "$CONFIG_FILE" ;;
+    vless)
+      while IFS=$'\t' read -r name cred; do
+        ((i+=1))
+        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.uuid]|@tsv' "$CONFIG_FILE")
+      ;;
+    anytls|hysteria2|trojan)
+      while IFS=$'\t' read -r name cred; do
+        ((i+=1))
+        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.password]|@tsv' "$CONFIG_FILE")
+      ;;
+    socks|http|mixed)
+      while IFS=$'\t' read -r name cred; do
+        ((i+=1))
+        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.username,.password]|@tsv' "$CONFIG_FILE")
+      ;;
   esac
+  (($i)) || info "还没有用户。"
+}
+
+select_client() {
+  local __var=$1 tag=$2 type field
+  local names=() name
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  while IFS= read -r name; do
+    [[ -n $name ]] && names+=("$name")
+  done < <(jq -r --arg tag "$tag" --arg field "$field" '.inbounds[]|select(.tag==$tag)|.users[]?|.[$field]' "$CONFIG_FILE")
+  ((${#names[@]})) || { warn "该入站还没有用户。"; return 1; }
+  if ((${#names[@]} == 1)); then
+    printf -v "$__var" '%s' "${names[0]}"
+    return 0
+  fi
+  local choice
+  choose choice "选择用户" "${names[@]}"
+  printf -v "$__var" '%s' "${names[$((choice-1))]}"
 }
 
 delete_client() {
@@ -59,7 +93,7 @@ delete_client() {
   field=$(client_label_field "$type")
   if [[ -z $name ]]; then
     list_clients "$tag"
-    prompt_value name "要删除的用户名称"
+    select_client name "$tag" || return 0
   fi
   client_exists "$tag" "$name" || die "找不到用户：${name}"
   confirm "删除用户 ${name}？" N || return
@@ -74,7 +108,7 @@ rotate_client_credential() {
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
-  [[ -n $name ]] || { list_clients "$tag"; prompt_value name "用户名称"; }
+  [[ -n $name ]] || { list_clients "$tag"; select_client name "$tag" || return 0; }
   client_exists "$tag" "$name" || die "找不到用户：${name}"
   tmp=$(temp_file)
   if [[ $type == vless ]]; then
