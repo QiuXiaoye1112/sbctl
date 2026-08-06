@@ -234,12 +234,20 @@ prompt_public_host() {
   local __var=$1 default=${2:-} v4="" v6="" choice value=""
   if [[ -z $default ]]; then
     v4=$(detect_public_ipv4 || true); v6=$(detect_public_ipv6 || true)
-    if [[ -n $v4 && -n $v6 ]]; then
-      choose choice "选择客户端连接地址" "IPv4  $v4" "IPv6  $v6" "域名/其他地址" || return 1
-      case $choice in 1) value=$v4;; 2) value=$v6;; 3) prompt_value value "客户端连接域名/IP" || return 1;; esac
-    elif [[ -n $v4 ]]; then value=$v4
-    elif [[ -n $v6 ]]; then value=$v6
-    else prompt_value value "客户端连接域名/IP" || return 1
+    local labels=() values=() cert_id
+    [[ -n $v4 ]] && { labels+=("IPv4  $v4"); values+=("$v4"); }
+    [[ -n $v6 ]] && { labels+=("IPv6  $v6"); values+=("$v6"); }
+    while IFS= read -r cert_id; do
+      [[ -n $cert_id ]] || continue
+      labels+=("${cert_id} (已托管)"); values+=("$cert_id")
+    done < <(meta_cert_list 2>/dev/null || true)
+    labels+=("域名/其他地址"); values+=("__manual__")
+    if ((${#labels[@]} == 1)); then
+      prompt_value value "客户端连接域名/IP" || return 1
+    else
+      choose choice "选择客户端连接地址" "${labels[@]}" || return 1
+      local selected="${values[$((choice-1))]}"
+      if [[ $selected == __manual__ ]]; then prompt_value value "客户端连接域名/IP" || return 1; else value=$selected; fi
     fi
   else value=$default; fi
   [[ -n $value && $value != *' '* ]] || { error "客户端连接地址无效。"; return 1; }
