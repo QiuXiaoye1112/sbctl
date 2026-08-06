@@ -335,24 +335,23 @@ acquire_lock() {
         warn "检测到过期锁（PID ${pid} 已不存在），自动清除。"
         exec 9>&-; rm -f "$LOCK_FILE" "$LOCK_FILE.pid"
         exec 9>"$LOCK_FILE"
-        flock -n 9 || die "另一个 sbctl 操作正在运行。"
+        flock -n 9 || { warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0; }
       else
-        die "另一个 sbctl 操作正在运行。"
+        warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0
       fi
     fi
     printf '%s' "$$" > "$LOCK_FILE.pid"
   else
     _SBC_LOCK_DIR="${LOCK_FILE}.d"
     if ! mkdir "$_SBC_LOCK_DIR" 2>/dev/null; then
-      # Check if the lock holder is still alive
       local pid
       pid=$(cat "$_SBC_LOCK_DIR/pid" 2>/dev/null || true)
       if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
         warn "检测到过期锁（PID ${pid} 已不存在），自动清除。"
         rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
-        mkdir "$_SBC_LOCK_DIR" 2>/dev/null || die "另一个 sbctl 操作正在运行。"
+        mkdir "$_SBC_LOCK_DIR" 2>/dev/null || { warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0; }
       else
-        die "另一个 sbctl 操作正在运行。"
+        warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0
       fi
     fi
     printf '%s' "$$" > "$_SBC_LOCK_DIR/pid"
