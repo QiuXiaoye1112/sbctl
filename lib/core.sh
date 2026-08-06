@@ -64,6 +64,7 @@ confirm() {
 
 prompt_value() {
   local __var=$1 prompt=$2 default=${3-} __input=""
+  printf -v "$__var" '%s' ''
   while true; do
     if [[ -n $default ]]; then
       read -r -p "${prompt} [${default}]: " __input || return 1
@@ -79,6 +80,7 @@ prompt_value() {
 
 prompt_optional() {
   local __var=$1 prompt=$2 __input=""
+  printf -v "$__var" '%s' ''
   read -r -p "${prompt}: " __input || return 1
   printf -v "$__var" '%s' "$__input"
 }
@@ -95,6 +97,7 @@ prompt_optional_positive_int() {
 
 prompt_secret() {
   local __var=$1 prompt=$2 generated=${3-} __input=""
+  printf -v "$__var" '%s' ''
   if [[ -n $generated ]]; then
     read -r -p "${prompt}（留空自动生成）: " __input || return 1
     __input=${__input:-$generated}
@@ -107,6 +110,7 @@ prompt_secret() {
 choose() {
   local __var=$1 prompt=$2; shift 2
   local options=("$@") __choice="" i
+  printf -v "$__var" '%s' ''
   printf '%s\n' "$prompt"
   for ((i=0;i<${#options[@]};i++)); do printf '  %d) %s\n' "$((i+1))" "${options[$i]}"; done
   while true; do

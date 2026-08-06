@@ -82,7 +82,7 @@ select_client() {
     return 0
   fi
   local choice
-  choose choice "选择用户" "${names[@]}"
+  choose choice "选择用户" "${names[@]}" || return 1
   printf -v "$__var" '%s' "${names[$((choice-1))]}"
 }
 

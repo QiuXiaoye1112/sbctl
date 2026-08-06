@@ -277,7 +277,7 @@ select_inbound() {
     if [[ -n $filter ]]; then jq -r --arg re "$filter" '.inbounds[]|select(.type|test($re))|.tag' "$CONFIG_FILE"; else jq -r '.inbounds[].tag' "$CONFIG_FILE"; fi
   )
   ((${#tags[@]})) || { warn "没有可选入站。"; return 1; }
-  if ((${#tags[@]} == 1)); then __selected=${tags[0]}; else choose __answer "选择入站" "${tags[@]}"; __selected=${tags[$((__answer-1))]}; fi
+  if ((${#tags[@]} == 1)); then __selected=${tags[0]}; else choose __answer "选择入站" "${tags[@]}" || return 1; __selected=${tags[$((__answer-1))]}; fi
   printf -v "$__var" '%s' "$__selected"
 }
 

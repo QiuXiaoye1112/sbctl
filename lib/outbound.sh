@@ -237,7 +237,7 @@ delete_outbound() {
     local tags=()
     while IFS= read -r item; do [[ -n $item ]] && tags+=("$item"); done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|.tag' "$CONFIG_FILE")
     ((${#tags[@]})) || { warn "没有可删除的代理出站。"; return 0; }
-    if ((${#tags[@]} == 1)); then tag=${tags[0]}; else choose answer "选择出站" "${tags[@]}"; tag=${tags[$((answer-1))]}; fi
+    if ((${#tags[@]} == 1)); then tag=${tags[0]}; else choose answer "选择出站" "${tags[@]}" || return 0; tag=${tags[$((answer-1))]}; fi
   fi
   [[ $tag != direct ]] || { warn "direct 出站不能删除。"; return 0; }
   outbound_exists "$tag" || die "找不到出站：$tag"
