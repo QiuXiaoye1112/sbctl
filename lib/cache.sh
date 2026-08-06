@@ -97,17 +97,15 @@ sing_box_installed() {
 _service_states() {
   case $(init_system) in
     systemd)
-      local output load active unitfile
-      output=$(systemctl show "$SERVICE_NAME" -p LoadState -p ActiveState -p UnitFileState --no-pager 2>/dev/null) || {
-        printf 'not-found inactive disabled'
-        return
-      }
-      # Pure-bash extraction from systemctl show output lines.
-      # Format: LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n
-      load=${output#*LoadState=}; load=${load%%$'\n'*}
-      active=${output#*ActiveState=}; active=${active%%$'\n'*}
-      unitfile=${output#*UnitFileState=}; unitfile=${unitfile%%$'\n'*}
-      printf '%s %s %s' "${load:-not-found}" "${active:-inactive}" "${unitfile:-disabled}"
+      local load=not-found active=inactive unitfile=disabled line
+      while IFS= read -r line; do
+        case $line in
+          LoadState=*)   load=${line#LoadState=} ;;
+          ActiveState=*) active=${line#ActiveState=} ;;
+          UnitFileState=*) unitfile=${line#UnitFileState=} ;;
+        esac
+      done < <(systemctl show "$SERVICE_NAME" -p LoadState -p ActiveState -p UnitFileState --no-pager 2>/dev/null || true)
+      printf '%s %s %s' "$load" "$active" "$unitfile"
       ;;
     openrc)
       local active=inactive enabled=disabled

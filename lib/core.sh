@@ -26,23 +26,27 @@ on_error() {
 }
 trap on_error ERR
 
-# Single unified EXIT cleanup — covers cache dir, lock dir, cert service restore.
-cleanup_on_exit() {
-  # Cache directory cleanup (from lib/cache.sh)
-  if [[ -n ${_SBC_CACHE_DIR:-} && -d ${_SBC_CACHE_DIR:-} ]]; then
-    rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
-  fi
-  # Lock directory cleanup (from acquire_lock, mkdir-based fallback)
-  if [[ -n ${_SBC_LOCK_DIR:-} && -d ${_SBC_LOCK_DIR:-} ]]; then
-    rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
-  fi
-  # Certbot stopped-service restore
+# Action-level cleanup: cert service restore ONLY.
+# Safe to run in subshells (run_menu_action) — does NOT delete session cache or lock.
+cleanup_action_on_exit() {
   if [[ ${CERT_STOPPED_SERVICE:-0} == 1 ]]; then
     service_start >/dev/null 2>&1 || true
     CERT_STOPPED_SERVICE=0
   fi
 }
-trap cleanup_on_exit EXIT
+
+# Session-level cleanup: cache + lock + action cleanup.
+# Only runs on outermost sbctl process exit.
+cleanup_session_on_exit() {
+  if [[ -n ${_SBC_CACHE_DIR:-} && -d ${_SBC_CACHE_DIR:-} ]]; then
+    rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
+  fi
+  if [[ -n ${_SBC_LOCK_DIR:-} && -d ${_SBC_LOCK_DIR:-} ]]; then
+    rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
+  fi
+  cleanup_action_on_exit
+}
+trap cleanup_session_on_exit EXIT
 
 pause() {
   [[ -t 0 ]] || return 0
@@ -120,7 +124,7 @@ run_menu_action() {
   (
     set -Eeuo pipefail
     trap - ERR
-    trap cleanup_on_exit EXIT
+    trap cleanup_action_on_exit EXIT
     "$@"
   )
   status=$?
