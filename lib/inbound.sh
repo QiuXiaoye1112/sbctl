@@ -143,7 +143,7 @@ build_inbound() {
         2) build_certificate_tls tls client_host || return 1 ;;
         3) tls=""; prompt_public_host client_host ;;
       esac
-      prompt_port port 443
+      prompt_port port
       # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
       if [[ $choice != 1 ]]; then
         local tp_choice
@@ -163,7 +163,7 @@ build_inbound() {
       else
         build_certificate_tls tls client_host || return 1
       fi
-      prompt_port port 443
+      prompt_port port
       ;;
     trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
@@ -173,7 +173,7 @@ build_inbound() {
       else
         build_certificate_tls tls client_host || return 1
       fi
-      prompt_port port 443
+      prompt_port port
       # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
       if [[ $choice != 1 ]]; then
         local tp_choice
@@ -201,12 +201,12 @@ build_inbound() {
         fi
         prompt_hy2_internal_port port "$selected_hop_range" || return 1
       else
-        prompt_port port 443
+        prompt_port port
       fi
       ;;
     socks|http|mixed)
       prompt_public_host client_host
-      prompt_port port 443
+      prompt_port port
       ;;
   esac
 
