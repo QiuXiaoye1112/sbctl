@@ -4,7 +4,7 @@ set -Eeuo pipefail
 readonly REPO="QiuXiaoye1112/sbctl"
 readonly TARGET="/usr/local/sbin/sbctl"
 readonly LIB_DIR="/usr/local/lib/sbctl"
-readonly MODULES="cache core ui engine compat certmeta inbound certificate reality outbound clients share ops certops cloudflare hy2_hop hy2_create hy2_nft network_guard protocols system_guard menu uninstall"
+readonly MODULES="cache core ui engine compat certmeta inbound certificate reality outbound clients share ops certops cloudflare hy2_hop hy2_create hy2_nft network_guard protocols system_guard management menu uninstall"
 info() { printf '[sbctl] %s\n' "$*"; }
 die() { printf '[sbctl] 错误: %s\n' "$*" >&2; exit 1; }
 fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$1" -o "$2"; }
