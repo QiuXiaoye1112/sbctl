@@ -105,16 +105,16 @@ _service_states() {
           UnitFileState=*) unitfile=${line#UnitFileState=} ;;
         esac
       done < <(systemctl show "$SERVICE_NAME" -p LoadState -p ActiveState -p UnitFileState --no-pager 2>/dev/null || true)
-      printf '%s %s %s' "$load" "$active" "$unitfile"
+      printf '%s\t%s\t%s' "$load" "$active" "$unitfile"
       ;;
     openrc)
       local active=inactive enabled=disabled
-      [[ -x $OPENRC_INIT_DIR/$SERVICE_NAME ]] || { printf 'not-found inactive disabled'; return; }
+      [[ -x $OPENRC_INIT_DIR/$SERVICE_NAME ]] || { printf 'not-found\tinactive\tdisabled'; return; }
       rc-service "$SERVICE_NAME" status >/dev/null 2>&1 && active=active || true
       rc-update show default 2>/dev/null | grep -Eq "(^|[[:space:]])${SERVICE_NAME}([[:space:]]|$)" && enabled=enabled || true
-      printf 'loaded %s %s' "$active" "$enabled"
+      printf 'loaded\t%s\t%s' "$active" "$enabled"
       ;;
-    *) printf 'not-found inactive disabled';;
+    *) printf 'not-found\tinactive\tdisabled';;
   esac
 }
 
@@ -138,11 +138,11 @@ service_is_enabled() {
   [[ $unitfile == enabled ]]
 }
 
-# Single call returns all three summaries as space-separated tokens.
+# Single call returns all three summaries as tab-separated tokens (IFS=$'\n\t').
 # Callers use `read -r svc boot ver <<< "$(_service_summary_all)"`.
 _service_summary_all() {
   if [[ ${SBCTL_TESTING:-0} == 1 ]]; then
-    printf '未安装 未安装 %s' "$(sing_box_version_summary)"
+    printf '未安装\t未安装\t%s' "$(sing_box_version_summary)"
     return
   fi
   local load active unitfile svc boot ver
@@ -150,7 +150,7 @@ _service_summary_all() {
   if [[ $load == not-found ]]; then svc=未安装; elif [[ $active == active ]]; then svc=运行中; else svc=已停止; fi
   if [[ $unitfile == enabled ]]; then boot=已开启; else boot=已关闭; fi
   ver=$(sing_box_version_summary)
-  printf '%s %s %s' "$svc" "$boot" "$ver"
+  printf '%s\t%s\t%s' "$svc" "$boot" "$ver"
 }
 
 service_state_summary() { local s; read -r s _ <<< "$(_service_summary_all)"; printf '%s' "$s"; }
