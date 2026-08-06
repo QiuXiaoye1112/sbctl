@@ -8,7 +8,7 @@ MODULES="cache core ui engine compat certmeta inbound certificate reality outbou
 [ -f /etc/alpine-release ] || { echo '[sbctl] 此入口仅用于 Alpine Linux。' >&2; exit 1; }
 # Clear any stale lock from previous interrupted runs
 rm -rf /run/lock/sbctl.lock /run/lock/sbctl.lock.d 2>/dev/null || true
-apk add --no-cache bash curl jq openssl coreutils util-linux >/dev/null
+apk add --no-cache bash curl jq openssl coreutils >/dev/null
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/main"

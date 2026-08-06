@@ -41,10 +41,6 @@ cleanup_session_on_exit() {
   if [[ -n ${_SBC_CACHE_DIR:-} && -d ${_SBC_CACHE_DIR:-} ]]; then
     rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
   fi
-  if [[ -n ${_SBC_LOCK_DIR:-} && -d ${_SBC_LOCK_DIR:-} ]]; then
-    rm -rf "$_SBC_LOCK_DIR" 2>/dev/null || true
-  fi
-  rm -f "$LOCK_FILE.pid" 2>/dev/null || true
   cleanup_action_on_exit
 }
 trap cleanup_session_on_exit EXIT
@@ -319,44 +315,6 @@ ensure_dependencies() {
   local missing=() c
   for c in curl jq openssl; do command_exists "$c" || missing+=("$c"); done
   ((${#missing[@]} == 0)) || install_packages "${missing[@]}"
-  acquire_lock
-}
-
-acquire_lock() {
-  # Re-entrant: if we already hold the lock, return immediately
-  [[ ${_SBC_LOCK_HELD:-0} == 1 ]] && return 0
-  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
-  if command_exists flock; then
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-      local pid
-      pid=$(cat "$LOCK_FILE.pid" 2>/dev/null || true)
-      if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
-        warn "检测到过期锁（PID ${pid} 已不存在），自动清除。"
-        exec 9>&-; rm -f "$LOCK_FILE" "$LOCK_FILE.pid"
-        exec 9>"$LOCK_FILE"
-        flock -n 9 || { warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0; }
-      else
-        warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0
-      fi
-    fi
-    printf '%s' "$$" > "$LOCK_FILE.pid"
-  else
-    _SBC_LOCK_DIR="${LOCK_FILE}.d"
-    if ! mkdir "$_SBC_LOCK_DIR" 2>/dev/null; then
-      local pid
-      pid=$(cat "$_SBC_LOCK_DIR/pid" 2>/dev/null || true)
-      if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
-        warn "检测到过期锁（PID ${pid} 已不存在），自动清除。"
-        rmdir "$_SBC_LOCK_DIR" 2>/dev/null || true
-        mkdir "$_SBC_LOCK_DIR" 2>/dev/null || { warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0; }
-      else
-        warn "另一个 sbctl 操作正在运行，继续执行（可能冲突）。"; _SBC_LOCK_HELD=1; return 0
-      fi
-    fi
-    printf '%s' "$$" > "$_SBC_LOCK_DIR/pid"
-  fi
-  _SBC_LOCK_HELD=1
 }
 
 temp_file() { mktemp "${TMPDIR:-/tmp}/sbctl.XXXXXX"; }
