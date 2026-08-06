@@ -174,7 +174,7 @@ hy2_hop_configure() {
   fi
 
   while true; do
-    prompt_value range "端口跳跃范围（如 20000-21000）" "${current:-}"
+    prompt_value range "端口跳跃范围" "${current:-30000-50000}"
     validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
     hy2_hop_check_conflicts "$range" "$tag" || continue
     break

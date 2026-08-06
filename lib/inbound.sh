@@ -20,8 +20,19 @@ prompt_tag() {
     printf -v "$__var" '%s' "$value"; return
   done
 }
+_random_port_avoiding_hops() {
+  local candidate hex i
+  for ((i=0; i<64; i++)); do
+    hex=$(random_hex 2)
+    candidate=$((10000 + (16#$hex % 55536)))
+    hy2_port_in_any_hop_range "$candidate" && continue
+    printf '%s' "$candidate"; return 0
+  done
+  printf '443'
+}
+
 prompt_port() {
-  local __var=$1 default=${2:-443} except=${3-} value
+  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value
   while true; do
     prompt_value value "监听端口" "$default"
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
@@ -114,7 +125,7 @@ reality_public_key() {
 }
 
 build_inbound() {
-  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="" ws_path ws_host
+  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="null" ws_path ws_host
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" "Mixed(SOCKS+HTTP)"
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
@@ -180,7 +191,7 @@ build_inbound() {
       choose hop_choice "端口模式" "普通端口" "端口跳跃"
       if [[ $hop_choice == 2 ]]; then
         while true; do
-          prompt_value selected_hop_range "端口跳跃范围（如 20000-30000）"
+          prompt_value selected_hop_range "端口跳跃范围" "30000-50000"
           validate_hy2_hop_range "$selected_hop_range" && break
           warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
         done
@@ -214,7 +225,7 @@ build_inbound() {
       printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls_arg" --argjson transport "$transport_json" '
         {type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]} +
         (if $tls!={} then {tls:$tls} else {} end) +
-        (if $transport!="" then {transport:$transport} else {} end)')"
+        (if $transport!=null then {transport:$transport} else {} end)')"
       ;;
     hysteria2)
       prompt_value name "用户名称" "user-$(random_hex 2)"
@@ -234,7 +245,7 @@ build_inbound() {
       prompt_secret password "Trojan 密码" "$(random_password)"
       printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" --argjson transport "$transport_json" '
         {type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} +
-        (if $transport!="" then {transport:$transport} else {} end)')"
+        (if $transport!=null then {transport:$transport} else {} end)')"
       ;;
     socks|http|mixed)
       prompt_optional name "用户名（留空=无认证）"

@@ -123,7 +123,7 @@ bash -c '
     local __var=$1 prompt=$2
     case $prompt in
       "监听地址") printf -v "$__var" "%s" 0.0.0.0 ;;
-      "端口跳跃范围（如 20000-30000）") printf -v "$__var" "%s" 20000-30000 ;;
+      "端口跳跃范围") printf -v "$__var" "%s" 20000-30000 ;;
       "用户名称") printf -v "$__var" "%s" user-hop ;;
     esac
   }
@@ -170,7 +170,7 @@ bash -c '
     local __var=$1 prompt=$2
     case $prompt in
       "监听地址") printf -v "$__var" "%s" 0.0.0.0 ;;
-      "端口跳跃范围（如 20000-30000）") printf -v "$__var" "%s" 25000-35000 ;;
+      "端口跳跃范围") printf -v "$__var" "%s" 25000-35000 ;;
     esac
   }
   prompt_public_host() { printf -v "$1" "%s" 203.0.113.10; }

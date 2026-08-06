@@ -8,6 +8,16 @@ hy2_port_in_range() {
   ((10#$port >= 10#$start && 10#$port <= 10#$end))
 }
 
+hy2_port_in_any_hop_range() {
+  local port=$1 range
+  init_meta 2>/dev/null || true
+  while IFS= read -r range; do
+    [[ -n $range ]] || continue
+    hy2_port_in_range "$port" "$range" && return 0
+  done < <(jq -r '.inbounds[]?.hysteria2PortHopping.range // empty' "$META_FILE" 2>/dev/null || true)
+  return 1
+}
+
 hy2_internal_port_available() {
   local port=$1 range=$2
   validate_port "$port" || return 1
