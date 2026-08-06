@@ -124,10 +124,10 @@ build_inbound() {
   case $type in
     anytls|vless|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-      if [[ $choice == 1 ]]; then build_reality_tls tls reality_public; else build_certificate_tls tls; fi
+      if [[ $choice == 1 ]]; then build_reality_tls tls reality_public || return 1; else build_certificate_tls tls || return 1; fi
       ;;
     hysteria2)
-      build_certificate_tls tls
+      build_certificate_tls tls || return 1
       ;;
   esac
 
@@ -182,7 +182,7 @@ build_inbound() {
 add_inbound() {
   ensure_dependencies inbound-add; require_supported_core; ensure_config
   local inbound host public tag tmp meta_tmp rc=0 type
-  build_inbound inbound host public
+  build_inbound inbound host public || return 0
   tag=$(jq -r '.tag' <<<"$inbound")
   type=$(jq -r '.type' <<<"$inbound")
   tmp=$(temp_file); meta_tmp=$(temp_file)
