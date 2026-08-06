@@ -239,6 +239,8 @@ prompt_public_host() {
     [[ -n $v6 ]] && { labels+=("IPv6  $v6"); values+=("$v6"); }
     while IFS= read -r cert_id; do
       [[ -n $cert_id ]] || continue
+      # Skip internal IP-cert labels (ip4-*, ip6-*), only show real domains
+      [[ $cert_id == ip4-* || $cert_id == ip6-* ]] && continue
       labels+=("${cert_id} (已托管)"); values+=("$cert_id")
     done < <(meta_cert_list 2>/dev/null || true)
     labels+=("域名/其他地址"); values+=("__manual__")
