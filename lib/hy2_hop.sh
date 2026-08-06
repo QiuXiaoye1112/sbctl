@@ -10,6 +10,29 @@ validate_hy2_hop_range() {
   validate_port "$start" && validate_port "$end" && ((10#$start < 10#$end))
 }
 
+hy2_hop_check_conflicts() {
+  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
+  new_start=${range%-*}; new_end=${range#*-}
+  init_meta
+  while IFS=$'\t' read -r tag existing; do
+    [[ -n $tag && -n $existing ]] || continue
+    [[ $tag != "$except_tag" ]] || continue
+    existing_start=${existing%-*}; existing_end=${existing#*-}
+    # Overlap: new_start <= existing_end AND new_end >= existing_start
+    if ((10#$new_start <= 10#$existing_end && 10#$new_end >= 10#$existing_start)); then
+      warn "端口跳跃范围与入站 ${tag} 的 ${existing} 重叠，请重新选择。"
+      return 1
+    fi
+  done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  return 0
+}
+
+# Apply NAT rules only (meta must already be set). Called from add_inbound after apply.
+hy2_hop_apply_nat() {
+  hy2_hop_sync
+  return 0
+}
+
 hy2_hop_range_for_tag() {
   local tag=$1
   init_meta
@@ -152,8 +175,9 @@ hy2_hop_configure() {
 
   while true; do
     prompt_value range "端口跳跃范围（如 20000-21000）" "${current:-}"
-    validate_hy2_hop_range "$range" && break
-    warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
+    validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
+    hy2_hop_check_conflicts "$range" "$tag" || continue
+    break
   done
 
   local listen_port internal_port

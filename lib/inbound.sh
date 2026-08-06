@@ -118,16 +118,36 @@ build_inbound() {
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; 7) type=mixed;; esac
   prompt_tag tag "${type}-$(random_hex 2)"
   prompt_value listen "监听地址" "0.0.0.0"
-  prompt_port port 443
   prompt_public_host client_host
 
   case $type in
     anytls|vless|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
       if [[ $choice == 1 ]]; then build_reality_tls tls reality_public || return 1; else build_certificate_tls tls || return 1; fi
+      prompt_port port 443
       ;;
     hysteria2)
       build_certificate_tls tls || return 1
+      local hop_choice
+      choose hop_choice "端口模式" "普通端口" "端口跳跃"
+      if [[ $hop_choice == 2 ]]; then
+        # ---- port hopping enabled ----
+        while true; do
+          prompt_value selected_hop_range "端口跳跃范围（如 20000-30000）"
+          validate_hy2_hop_range "$selected_hop_range" && break
+          warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
+        done
+        if ! hy2_hop_check_conflicts "$selected_hop_range" "$tag"; then
+          warn "端口跳跃范围冲突，请重新设置。"
+          return 1
+        fi
+        prompt_hy2_internal_port port "$selected_hop_range" || return 1
+      else
+        prompt_port port 443
+      fi
+      ;;
+    *)
+      prompt_port port 443
       ;;
   esac
 
@@ -181,17 +201,32 @@ build_inbound() {
 
 add_inbound() {
   ensure_dependencies inbound-add; require_supported_core; ensure_config
-  local inbound host public tag tmp meta_tmp rc=0 type
-  build_inbound inbound host public || return 0
+  local inbound host public tag tmp meta_tmp rc=0 type hop_range
+  build_inbound inbound host public hop_range || return 0
   tag=$(jq -r '.tag' <<<"$inbound")
   type=$(jq -r '.type' <<<"$inbound")
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$CONFIG_FILE" >"$tmp"
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
+  # If port hopping was selected during build, stamp metadata before apply
+  if [[ $type == hysteria2 && -n $hop_range ]]; then
+    local meta_tmp2
+    meta_tmp2=$(temp_file)
+    jq --arg tag "$tag" --arg range "$hop_range" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+      .inbounds[$tag]=((.inbounds[$tag]//{})+{updatedAt:$now}) |
+      .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$meta_tmp" >"$meta_tmp2"
+    rm -f "$meta_tmp"
+    meta_tmp=$meta_tmp2
+  fi
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    # Hysteria2 port hopping integration (from hy2_hop.sh)
-    if [[ $type == hysteria2 && -t 0 ]]; then
-      if ! hy2_hop_configure "$tag" 1; then warn "端口跳跃配置未完成；Hysteria2 入站本身已创建。"; fi
+    # Configure NAT rules post-apply for port hopping
+    if [[ $type == hysteria2 && -n $hop_range ]]; then
+      if hy2_hop_apply_nat; then
+        info "Hysteria2 端口跳跃已启用：${hop_range} -> UDP $(jq -r '.listen_port' <<<"$inbound")"
+      else
+        warn "端口跳跃 NAT 配置失败，当前使用内部监听端口连接。"
+        hy2_hop_meta_disable "$tag"
+      fi
     fi
     heading "入站已创建"
     show_inbound "$tag"
