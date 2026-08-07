@@ -121,6 +121,10 @@ choose() {
 
 run_menu_action() {
   local status
+  # ERR traps still fire when `errexit` is disabled. Temporarily remove the
+  # outer session trap so a failed action can be captured instead of exiting
+  # the whole interactive program. The action itself keeps strict -e behavior.
+  trap - ERR
   set +e
   (
     set -Eeuo pipefail
@@ -130,6 +134,7 @@ run_menu_action() {
   )
   status=$?
   set -e
+  trap on_error ERR
   ((status == 0)) || warn "操作未完成，脚本仍在运行。"
   return 0
 }
