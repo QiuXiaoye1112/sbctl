@@ -6,6 +6,11 @@ cd "$ROOT"
 
 bash -n lib/cloudflare.sh
 
+grep -Fq "'cloudflare<3'" lib/cloudflare.sh
+grep -Fq -- '--no-deps "$plugin_spec"' lib/cloudflare.sh
+grep -Fq 'SBCTL_PIP_TIMEOUT:-300' lib/cloudflare.sh
+grep -Fq 'status == 137' lib/cloudflare.sh || grep -Fq '137)' lib/cloudflare.sh
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 CASE="$TMP/case"
