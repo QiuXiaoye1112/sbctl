@@ -13,12 +13,18 @@ certbot_distribution_version() {
 
 certbot_core_version() { certbot_distribution_version certbot; }
 
-certbot_version_supported() {
-  local version major minor
-  version=$(certbot_core_version) || return 1
+certbot_version_in_supported_range() {
+  local version=${1:-} major minor
+  [[ -n $version ]] || version=$(certbot_core_version) || return 1
   IFS=. read -r major minor _ <<<"$version"
   [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] || return 1
-  ((major == 5 && minor >= 4)) || return 1
+  ((major == 5 && minor >= 4))
+}
+
+certbot_version_supported() {
+  local version
+  version=$(certbot_core_version) || return 1
+  certbot_version_in_supported_range "$version" || return 1
   certbot_supports_ip
 }
 
@@ -149,8 +155,13 @@ ensure_certbot_environment() {
   _certbot_prepare_venv || die "无法创建/修复 Certbot venv。"
 
   if ! certbot_version_supported; then
+    version=$(certbot_core_version 2>/dev/null || true)
     info "正在安装/修复 Certbot 5.x 核心。"
-    certbot_pip_install "Certbot 核心" 'certbot>=5.4,<6' || die "Certbot 安装失败。"
+    if certbot_version_in_supported_range "$version"; then
+      certbot_pip_install "Certbot 核心" --force-reinstall "certbot==${version}" || die "Certbot 安装失败。"
+    else
+      certbot_pip_install "Certbot 核心" 'certbot>=5.4,<6' || die "Certbot 安装失败。"
+    fi
   fi
 
   certbot_version_supported || die "当前 Certbot 不受支持（需要 5.4 <= 版本 < 6）。"
