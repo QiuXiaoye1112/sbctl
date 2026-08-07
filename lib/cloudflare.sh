@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # Cloudflare DNS credential management.
-# No function overrides — certificate lifecycle lives in certops.sh.
+# No certificate-lifecycle overrides — certops.sh owns issuance/renewal while
+# cert_guard.sh owns the shared Certbot environment/bootstrap policy.
 
 CLOUDFLARE_INI="${SBCTL_CLOUDFLARE_INI:-${CERTBOT_CONFIG_DIR}/cloudflare.ini}"
 
@@ -8,71 +9,35 @@ cloudflare_plugin_available() {
   [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_dns_cloudflare' >/dev/null 2>&1
 }
 
-_cloudflare_pip_install() {
-  local log_file=$1
-  local pip_timeout=${SBCTL_PIP_TIMEOUT:-300}
-  local certbot_version="" plugin_spec="certbot-dns-cloudflare" status
-
-  certbot_version=$($CERTBOT_BIN --version 2>/dev/null | awk 'NR==1 {print $2}' || true)
-  if [[ $certbot_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    plugin_spec="certbot-dns-cloudflare==${certbot_version}"
-  fi
-
-  # certbot-dns-cloudflare only needs acme/certbot (already in this venv) plus
-  # the legacy CloudFlare client. Install that small dependency set first so
-  # pip does not re-resolve/upgrade the entire Certbot environment on tiny VPSes.
-  if ! "$CERTBOT_VENV/bin/python" -c 'import CloudFlare' >/dev/null 2>&1; then
-    if _cert_run_bounded "$pip_timeout" env \
-      PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
-      "$CERTBOT_VENV/bin/pip" install \
-        --disable-pip-version-check --no-cache-dir --no-compile --prefer-binary \
-        --timeout 20 --retries 2 'cloudflare<3' >>"$log_file" 2>&1; then
-      :
-    else
-      status=$?
-      return "$status"
-    fi
-  fi
-
-  _cert_run_bounded "$pip_timeout" env \
-    PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    "$CERTBOT_VENV/bin/pip" install \
-      --disable-pip-version-check --no-cache-dir --no-compile --prefer-binary \
-      --timeout 20 --retries 2 --no-deps "$plugin_spec" >>"$log_file" 2>&1
-}
-
 ensure_cloudflare_certbot_plugin() {
-  cloudflare_plugin_available && return 0
-  [[ -x $CERTBOT_VENV/bin/pip ]] || { warn "Certbot venv 缺少 pip，无法安装 Cloudflare DNS 插件。"; return 1; }
-  info "正在安装 Certbot Cloudflare DNS 插件。"
+  local certbot_version installed_version="" force=0
+  ensure_certbot_environment
+  certbot_version=$(certbot_core_version) || { warn "无法读取 Certbot 版本，不能安装 Cloudflare DNS 插件。"; return 1; }
+  installed_version=$(certbot_distribution_version certbot-dns-cloudflare 2>/dev/null || true)
 
-  local log_file status mem_total_kb mem_available_kb swap_total_kb
-  log_file=$(temp_file)
-  : >"$log_file"
-
-  if _cloudflare_pip_install "$log_file"; then
-    rm -f "$log_file"
-  else
-    status=$?
-    case $status in
-      137)
-        warn "Cloudflare 插件安装进程被 SIGKILL；通常表示 VPS 内存不足并触发 OOM。"
-        if [[ -r /proc/meminfo ]]; then
-          mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-          mem_available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-          swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
-          warn "内存约 $((mem_total_kb / 1024)) MiB，可用约 $((mem_available_kb / 1024)) MiB，Swap 约 $((swap_total_kb / 1024)) MiB。"
-        fi
-        ;;
-      124) warn "Cloudflare 插件安装超过 ${SBCTL_PIP_TIMEOUT:-300} 秒，已终止。" ;;
-      *) warn "certbot-dns-cloudflare 安装失败（退出码 ${status}）。" ;;
-    esac
-    [[ ! -s $log_file ]] || { warn "pip 最后输出："; tail -n 20 "$log_file" >&2; }
-    rm -f "$log_file"
-    return 1
+  if [[ $installed_version == "$certbot_version" ]] && cloudflare_plugin_available && certbot_pip_check; then
+    return 0
   fi
 
+  # If the distribution metadata says the right version is installed but the
+  # import is broken, reinstall the plugin. Otherwise let pip resolve only the
+  # exact plugin version and its declared dependencies. Never hand-pin the
+  # Cloudflare SDK and never use --no-deps: those requirements change between
+  # Certbot releases and belong to the plugin's own package metadata.
+  [[ $installed_version == "$certbot_version" ]] && force=1
+  info "正在安装/修复 Certbot Cloudflare DNS 插件。"
+  if ((force)); then
+    certbot_pip_install "Certbot Cloudflare DNS 插件" --force-reinstall \
+      "certbot-dns-cloudflare==${certbot_version}" || return 1
+  else
+    certbot_pip_install "Certbot Cloudflare DNS 插件" \
+      "certbot-dns-cloudflare==${certbot_version}" || return 1
+  fi
+
+  certbot_distribution_matches_core certbot-dns-cloudflare \
+    || { warn "Cloudflare DNS 插件版本与 Certbot 核心不一致。"; return 1; }
   cloudflare_plugin_available || { warn "Cloudflare DNS 插件安装后仍不可用。"; return 1; }
+  certbot_pip_check || { warn "Certbot Python 依赖不一致，Cloudflare DNS 插件不可安全使用。"; return 1; }
 }
 
 load_cloudflare_credentials() {
