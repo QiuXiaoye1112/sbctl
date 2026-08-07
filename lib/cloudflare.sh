@@ -8,12 +8,70 @@ cloudflare_plugin_available() {
   [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_dns_cloudflare' >/dev/null 2>&1
 }
 
+_cloudflare_pip_install() {
+  local log_file=$1
+  local pip_timeout=${SBCTL_PIP_TIMEOUT:-300}
+  local certbot_version="" plugin_spec="certbot-dns-cloudflare" status
+
+  certbot_version=$($CERTBOT_BIN --version 2>/dev/null | awk 'NR==1 {print $2}' || true)
+  if [[ $certbot_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    plugin_spec="certbot-dns-cloudflare==${certbot_version}"
+  fi
+
+  # certbot-dns-cloudflare only needs acme/certbot (already in this venv) plus
+  # the legacy CloudFlare client. Install that small dependency set first so
+  # pip does not re-resolve/upgrade the entire Certbot environment on tiny VPSes.
+  if ! "$CERTBOT_VENV/bin/python" -c 'import CloudFlare' >/dev/null 2>&1; then
+    if _cert_run_bounded "$pip_timeout" env \
+      PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+      "$CERTBOT_VENV/bin/pip" install \
+        --disable-pip-version-check --no-cache-dir --no-compile --prefer-binary \
+        --timeout 20 --retries 2 'cloudflare<3' >>"$log_file" 2>&1; then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
+  fi
+
+  _cert_run_bounded "$pip_timeout" env \
+    PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    "$CERTBOT_VENV/bin/pip" install \
+      --disable-pip-version-check --no-cache-dir --no-compile --prefer-binary \
+      --timeout 20 --retries 2 --no-deps "$plugin_spec" >>"$log_file" 2>&1
+}
+
 ensure_cloudflare_certbot_plugin() {
   cloudflare_plugin_available && return 0
   [[ -x $CERTBOT_VENV/bin/pip ]] || { warn "Certbot venv 缺少 pip，无法安装 Cloudflare DNS 插件。"; return 1; }
   info "正在安装 Certbot Cloudflare DNS 插件。"
-  _cert_run_bounded 180 "$CERTBOT_VENV/bin/pip" install --disable-pip-version-check --timeout 20 --retries 2 \
-    --upgrade certbot-dns-cloudflare >/dev/null || { warn "certbot-dns-cloudflare 安装失败。"; return 1; }
+
+  local log_file status mem_total_kb mem_available_kb swap_total_kb
+  log_file=$(temp_file)
+  : >"$log_file"
+
+  if _cloudflare_pip_install "$log_file"; then
+    rm -f "$log_file"
+  else
+    status=$?
+    case $status in
+      137)
+        warn "Cloudflare 插件安装进程被 SIGKILL；通常表示 VPS 内存不足并触发 OOM。"
+        if [[ -r /proc/meminfo ]]; then
+          mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          mem_available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+          swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+          warn "内存约 $((mem_total_kb / 1024)) MiB，可用约 $((mem_available_kb / 1024)) MiB，Swap 约 $((swap_total_kb / 1024)) MiB。"
+        fi
+        ;;
+      124) warn "Cloudflare 插件安装超过 ${SBCTL_PIP_TIMEOUT:-300} 秒，已终止。" ;;
+      *) warn "certbot-dns-cloudflare 安装失败（退出码 ${status}）。" ;;
+    esac
+    [[ ! -s $log_file ]] || { warn "pip 最后输出："; tail -n 20 "$log_file" >&2; }
+    rm -f "$log_file"
+    return 1
+  fi
+
   cloudflare_plugin_available || { warn "Cloudflare DNS 插件安装后仍不可用。"; return 1; }
 }
 
