@@ -16,6 +16,10 @@ hy2_port_in_range() {
   ((10#$port >= 10#$start && 10#$port <= 10#$end))
 }
 
+hy2_port_in_default_hop_range() {
+  hy2_port_in_range "$1" "30000-50000"
+}
+
 hy2_port_in_any_hop_range() {
   local port=$1 range
   init_meta 2>/dev/null || true
@@ -29,9 +33,11 @@ hy2_port_in_any_hop_range() {
 hy2_internal_port_available() {
   local port=$1 range=$2
   validate_port "$port" || return 1
+  hy2_port_in_default_hop_range "$port" && return 1
   hy2_port_in_range "$port" "$range" && return 1
   port_in_config "$port" && return 1
   port_in_use_os "$port" && return 1
+  return 0
 }
 
 hy2_pick_internal_port() {

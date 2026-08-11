@@ -24,6 +24,27 @@ ensure_dependencies() { :; }
 port_in_use_os() { [[ $1 == 25001 ]]; }
 ! declare -F port_in_xrayctl_config >/dev/null
 
+hy2_port_in_default_hop_range 30000
+hy2_port_in_default_hop_range 50000
+! hy2_port_in_default_hop_range 29999
+! hy2_port_in_default_hop_range 50001
+
+random_file="$TMP/random-values"
+printf '%s\n' 4e20 4e1f >"$random_file"
+random_hex() {
+  local value
+  IFS= read -r value <"$random_file"
+  tail -n +2 "$random_file" >"$random_file.next"
+  mv "$random_file.next" "$random_file"
+  printf '%s' "$value"
+}
+[[ $(_random_port_avoiding_hops) == 29999 ]]
+
+printf '%s\n' 4e20 4e1f >"$random_file"
+internal_port=""
+hy2_pick_internal_port internal_port 51000-52000
+[[ $internal_port == 29999 ]]
+
 prompt_values=(25001 25002)
 prompt_index=0
 prompt_value() {
