@@ -50,6 +50,7 @@ set -Eeuo pipefail
 source ./sbctl.sh
 ensure_dependencies() { :; }
 sing_box_installed() { return 1; }
+hy2_hop_sync() { :; }
 
 write_default_config
 [[ $SBCTL_VERSION == 0.4.3 ]]
