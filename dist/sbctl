@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.0"
+readonly SBCTL_VERSION="0.4.1"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
@@ -22,6 +22,9 @@ QUICK_SYMLINK="${SBCTL_SYMLINK_PATH:-/usr/local/bin/sbctl}"
 SERVICE_NAME="${SBCTL_SERVICE_NAME:-sing-box}"
 LOCK_FILE="${SBCTL_LOCK_FILE:-/run/lock/sbctl.lock}"
 DATA_DIR="${SBCTL_DATA_DIR:-/var/lib/sing-box}"
+XRAYCTL_CONFIG_FILE="${SBCTL_XRAYCTL_CONFIG_FILE:-/usr/local/etc/xray/config.json}"
+SBCTL_BBR_CONFIG="${SBCTL_BBR_CONFIG:-/etc/sysctl.d/99-sbctl-bbr.conf}"
+XRAYCTL_BBR_CONFIG="${SBCTL_XRAYCTL_BBR_CONFIG:-/etc/sysctl.d/99-xrayctl-bbr.conf}"
 SYSTEMD_UNIT_DIR="${SBCTL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 OPENRC_INIT_DIR="${SBCTL_OPENRC_INIT_DIR:-/etc/init.d}"
 CERTBOT_HOOK_DIR="${SBCTL_CERTBOT_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
@@ -30,6 +33,11 @@ CERTBOT_BIN="${SBCTL_CERTBOT_BIN:-${CERTBOT_VENV}/bin/certbot}"
 CERTBOT_CONFIG_DIR="${SBCTL_CERTBOT_CONFIG_DIR:-/var/lib/sbctl/letsencrypt}"
 CERTBOT_WORK_DIR="${SBCTL_CERTBOT_WORK_DIR:-/var/lib/sbctl/certbot-work}"
 CERTBOT_LOGS_DIR="${SBCTL_CERTBOT_LOGS_DIR:-/var/log/sbctl/certbot}"
+_default_certbot_shared_lock=/run/lock/xrayctl-sbctl-certbot.lock
+if [[ ${SBCTL_TESTING:-0} == 1 ]]; then _default_certbot_shared_lock="${LOCK_FILE%/*}/xrayctl-sbctl-certbot.lock"; fi
+CERTBOT_SHARED_LOCK="${SBCTL_CERTBOT_SHARED_LOCK:-$_default_certbot_shared_lock}"
+unset _default_certbot_shared_lock
+CERTBOT_SHARED_LOCK_WAIT="${SBCTL_CERTBOT_SHARED_LOCK_WAIT:-300}"
 CERT_STOPPED_SERVICE=0
 APT_IPV4_AVAILABLE_CACHE=""
 
@@ -1157,6 +1165,7 @@ hy2_internal_port_available() {
   validate_port "$port" || return 1
   hy2_port_in_range "$port" "$range" && return 1
   port_in_config "$port" && return 1
+  port_in_xrayctl_config "$port" && return 1
   port_in_use_os "$port" && return 1
 }
 
@@ -1183,6 +1192,7 @@ prompt_hy2_internal_port() {
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
     port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
+    port_in_xrayctl_config "$value" && { warn "该端口已被 xrayctl/Xray 入站使用。"; continue; }
     port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
     printf -v "$__var" '%s' "$value"; return 0
   done
@@ -1198,7 +1208,7 @@ hy2_build() {
 }
 
 hy2_hop_check_conflicts() {
-  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
+  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end peer_port
   new_start=${range%-*}; new_end=${range#*-}
   init_meta
   while IFS=$'\t' read -r tag existing; do
@@ -1211,6 +1221,15 @@ hy2_hop_check_conflicts() {
       return 1
     fi
   done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
+    while IFS= read -r peer_port; do
+      validate_port "$peer_port" || continue
+      if ((10#$peer_port >= 10#$new_start && 10#$peer_port <= 10#$new_end)); then
+        warn "端口跳跃范围包含 xrayctl/Xray 入站端口 ${peer_port}，请重新选择。"
+        return 1
+      fi
+    done < <(jq -r '.inbounds[]?.port // empty' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || true)
+  fi
   return 0
 }
 
@@ -1453,6 +1472,12 @@ port_in_use_os() {
   elif command_exists netstat; then netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"
   else return 1; fi
 }
+port_in_xrayctl_config() {
+  local port=$1
+  validate_port "$port" || return 1
+  [[ -r $XRAYCTL_CONFIG_FILE ]] || return 1
+  jq -e --argjson port "$port" '.inbounds[]? | select(.port==$port)' "$XRAYCTL_CONFIG_FILE" >/dev/null 2>&1
+}
 
 prompt_tag() {
   local __var=$1 default=$2 value
@@ -1470,6 +1495,7 @@ _random_port_avoiding_hops() {
     candidate=$((10000 + (16#$hex % 55536)))
     hy2_port_in_any_hop_range "$candidate" && continue
     port_in_config "$candidate" && continue
+    port_in_xrayctl_config "$candidate" && continue
     port_in_use_os "$candidate" && continue
     printf '%s' "$candidate"; return 0
   done
@@ -1482,6 +1508,7 @@ prompt_port() {
     prompt_value value "监听端口" "$default"
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
+    port_in_xrayctl_config "$value" && { warn "该端口已被 xrayctl/Xray 入站使用。"; continue; }
     if port_in_use_os "$value" && [[ -z $except ]]; then confirm "系统检测到端口 ${value} 已占用，仍继续？" N || continue; fi
     printf -v "$__var" '%s' "$value"; return
   done
@@ -3208,6 +3235,40 @@ _certbot_exec() {
   "$CERTBOT_BIN" --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" --logs-dir "$CERTBOT_LOGS_DIR" "$@"
 }
 
+_certbot_shared_lock_acquire() {
+  local waited=0 owner="" lock=$CERTBOT_SHARED_LOCK parent
+  [[ ${lock##*/} == xrayctl-sbctl-certbot.lock ]] || { error "Certbot 共享锁路径不安全：${lock}"; return 1; }
+  [[ $CERTBOT_SHARED_LOCK_WAIT =~ ^[0-9]+$ ]] || { error "Certbot 共享锁等待时间无效。"; return 1; }
+  parent=${lock%/*}; [[ $parent == "$lock" ]] && parent=.
+  mkdir -p "$parent" || { warn "无法创建 Certbot 共享锁目录：${parent}"; return 1; }
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner=""
+    [[ -r $lock/pid ]] && IFS= read -r owner <"$lock/pid" || true
+    if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$lock/pid" "$lock/tool"
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
+    if ((waited >= CERTBOT_SHARED_LOCK_WAIT)); then
+      warn "另一个 xrayctl/sbctl Certbot 操作仍在运行，当前操作已取消。"
+      return 1
+    fi
+    sleep 1
+    ((waited+=1)) || true
+  done
+  chmod 700 "$lock" 2>/dev/null || true
+  printf '%s\n' "$$" >"$lock/pid"
+  printf 'sbctl\n' >"$lock/tool"
+}
+
+_certbot_shared_lock_release() {
+  local owner="" lock=$CERTBOT_SHARED_LOCK
+  [[ -r $lock/pid ]] && IFS= read -r owner <"$lock/pid" || true
+  [[ $owner == "$$" ]] || return 0
+  rm -f "$lock/pid" "$lock/tool"
+  rmdir "$lock" 2>/dev/null || true
+}
+
 _certbot_arg_value() {
   local wanted=$1; shift
   while (($#)); do
@@ -3226,7 +3287,7 @@ _certbot_renewal_authenticator() {
 # Keep certops.sh's public command surface, but self-heal the nginx plugin before
 # an unattended renewal whose lineage explicitly records the nginx authenticator.
 certbot_cmd() {
-  local cert_name="" authenticator=""
+  local cert_name="" authenticator="" rc=0
   if [[ ${1:-} == renew ]]; then
     cert_name=$(_certbot_arg_value --cert-name "$@" 2>/dev/null || true)
     if [[ -n $cert_name ]]; then
@@ -3236,17 +3297,49 @@ certbot_cmd() {
       fi
     fi
   fi
-  _certbot_exec "$@"
+  _certbot_shared_lock_acquire || return 1
+  _certbot_exec "$@" || rc=$?
+  _certbot_shared_lock_release
+  return "$rc"
 }
 
 # ---- module: service ----
 # BBR safety, diagnostics and residual scanning.
 # Service definition lives in engine.sh (canonical, hardened version).
 
+bbr_manager() {
+  local own=0 peer=0 unknown=0 current=""
+  if [[ -f $SBCTL_BBR_CONFIG ]]; then
+    if grep -q '^# managed by sbctl$' "$SBCTL_BBR_CONFIG" 2>/dev/null; then own=1; else unknown=1; fi
+  fi
+  [[ -f $XRAYCTL_BBR_CONFIG ]] && peer=1
+  if ((peer && (own || unknown))); then printf 'both'; return; fi
+  if ((own)); then printf 'sbctl'; return; fi
+  if ((peer)); then printf 'xrayctl'; return; fi
+  if ((unknown)); then printf 'external'; return; fi
+  [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && current=$(< /proc/sys/net/ipv4/tcp_congestion_control)
+  if [[ $current == bbr ]]; then printf 'external'; else printf 'none'; fi
+}
+
 enable_bbr() {
   ensure_dependencies bbr
   command_exists sysctl || die "缺少 sysctl。"
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf qdisc_ok=0 available
+  local config=$SBCTL_BBR_CONFIG qdisc_ok=0 available manager
+  manager=$(bbr_manager)
+  case $manager in
+    xrayctl)
+      info "BBR 已由 xrayctl 管理；sbctl 不会创建重复配置。"
+      return 0
+      ;;
+    both)
+      warn "同时检测到 sbctl 与 xrayctl 的 BBR 配置，请先保留一个管理方。"
+      return 1
+      ;;
+    external)
+      warn "BBR 已由其他系统配置启用；sbctl 不会接管。"
+      return 1
+      ;;
+  esac
   if [[ -e $config ]] && ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
     warn "检测到非 sbctl 管理的 BBR 配置，拒绝覆盖：$config"
     return 1
@@ -3273,7 +3366,24 @@ enable_bbr() {
 disable_bbr() {
   ensure_dependencies bbr-disable
   command_exists sysctl || die "缺少 sysctl。"
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback="" current=""
+  local config=$SBCTL_BBR_CONFIG available fallback="" current="" manager
+  manager=$(bbr_manager)
+  case $manager in
+    xrayctl)
+      warn "BBR 由 xrayctl 管理，sbctl 拒绝关闭全局拥塞控制。"
+      return 1
+      ;;
+    both)
+      if grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
+      meta_resource_remove bbrConfig
+      info "已移除重复的 sbctl BBR 配置；BBR 继续由 xrayctl 管理。"
+      return 0
+      ;;
+    external)
+      warn "BBR 不是由 sbctl 管理，拒绝关闭全局拥塞控制。"
+      return 1
+      ;;
+  esac
   current=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
   if [[ $current != bbr ]]; then
     if [[ -f $config ]] && grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
@@ -3327,6 +3437,12 @@ system_diagnostics() {
   printf '公网 IPv4: %s\n' "${v4:-未检测到}"
   printf '公网 IPv6: %s\n' "${v6:-未检测到}"
   printf 'BBR: %s\n' "$(bbr_state_summary)"
+  printf 'BBR 管理方: %s\n' "$(bbr_manager)"
+  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
+    printf 'xrayctl 共存: 已检测到（Xray 入站 %s）\n' "$(jq '.inbounds|length' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || printf '?')"
+  else
+    printf 'xrayctl 共存: 未检测到配置\n'
+  fi
   printf '配置: %s\n' "$CONFIG_FILE"
   printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
   printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"
@@ -3339,7 +3455,7 @@ system_diagnostics() {
 
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'
+    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用（%s 管理）' "$(bbr_manager)" || printf '未启用'
   else
     printf '不可用'
   fi
@@ -3670,7 +3786,16 @@ _remove_config_and_metadata() {
 }
 
 _remove_bbr_settings() {
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback=""
+  local config=$SBCTL_BBR_CONFIG available fallback=""
+  if [[ -f $XRAYCTL_BBR_CONFIG ]]; then
+    if grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
+    info "检测到 xrayctl 管理 BBR；仅移除 sbctl 自有配置，保留全局 BBR。"
+    return 0
+  fi
+  if ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
+    info "BBR 不由 sbctl 管理；保留全局拥塞控制设置。"
+    return 0
+  fi
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control && $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then
     available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
     if grep -qw cubic <<<"$available"; then fallback=cubic; elif grep -qw reno <<<"$available"; then fallback=reno; fi
