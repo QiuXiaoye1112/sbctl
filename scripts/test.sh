@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
+
+bash tests/architecture.sh
+bash tests/unit/core.sh
+bash tests/integration/state-transaction.sh
+bash tests/smoke/cli.sh
+
+printf 'portable test suite passed.\n'
