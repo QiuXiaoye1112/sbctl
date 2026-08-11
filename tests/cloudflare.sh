@@ -132,8 +132,11 @@ certbot_distribution_matches_core() {
 certbot_nginx_available() { [[ -e $NGINX_READY ]]; }
 certbot_pip_check() { return 0; }
 certbot_pip_install() {
-  printf '%s\n' "$*" >>"$CALLS"
-  case "$*" in
+  local invocation
+  printf -v invocation '%s ' "$@"
+  invocation=${invocation% }
+  printf '%s\n' "$invocation" >>"$CALLS"
+  case "$invocation" in
     *'certbot>=5.4,<6'*) touch "$CORE_READY" ;;
     *'certbot-nginx==5.7.0'*) touch "$NGINX_READY" ;;
   esac
@@ -185,7 +188,9 @@ certbot_distribution_matches_core() { [[ $1 == certbot-dns-cloudflare && -e $CF_
 cloudflare_plugin_available() { [[ -e $CF_READY ]]; }
 certbot_pip_check() { return 0; }
 certbot_pip_install() {
-  printf '%s\n' "$*" >"$CF_PIP_ARGS"
+  local invocation
+  printf -v invocation '%s ' "$@"
+  printf '%s\n' "${invocation% }" >"$CF_PIP_ARGS"
   touch "$CF_READY"
 }
 ensure_cloudflare_certbot_plugin

@@ -79,7 +79,8 @@ sing_box_version() {
 
 sing_box_installed() {
   refresh_binary_path
-  [[ -x $SING_BOX_BIN ]] || command_exists sing-box
+  [[ -x $SING_BOX_BIN ]] && return 0
+  [[ -z ${SBCTL_SING_BOX_BIN:-} ]] && command_exists sing-box
 }
 
 # ---- service state: single systemctl show, pure-bash parsing ----
