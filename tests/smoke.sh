@@ -13,7 +13,7 @@ grep -q '^restore_backup()' src/state.sh
 grep -q '^build_reality_tls()' src/security.sh
 grep -q '"AnyTLS" "VLESS" "Hysteria2" "Trojan"' src/inbound.sh
 grep -q 'META_FILE="${SBCTL_META_FILE:-/var/lib/sbctl/meta.json}"' sbctl.sh
-grep -q -- '-c ${CONFIG_FILE}' src/state.sh
+grep -q -- '-c ${CONFIG_FILE}' src/service.sh
 
 MOCK=$(mktemp -d)
 trap 'rm -rf "$MOCK"' EXIT
@@ -205,31 +205,26 @@ run_generated_case() {
   '
 }
 
-run_generated_case anytls $'1\n\n\n24443\n1.2.3.4\n1\n\n\n\n\n\n' \
+run_generated_case anytls $'1\n\n\n1\n\n\n1.2.3.4\n24443\n\n\n' \
   '.inbounds[0].type=="anytls" and .inbounds[0].tls.reality.enabled==true' \
   '"type": "anytls"'
 
-run_generated_case vless $'2\n\n\n24444\n1.2.3.4\n1\n\n\n\n\n' \
+run_generated_case vless $'2\n\n\n1\n\n\n1.2.3.4\n24444\n\n' \
   '.inbounds[0].type=="vless" and .inbounds[0].users[0].flow=="xtls-rprx-vision" and .inbounds[0].tls.reality.enabled==true' \
   'security=reality'
 
-run_generated_case trojan $'4\n\n\n24448\n1.2.3.4\n1\n\n\n\n\n' \
+run_generated_case trojan $'4\n\n\n1\n\n\n1.2.3.4\n24448\n\n\n' \
   '.inbounds[0].type=="trojan" and .inbounds[0].tls.reality.enabled==true' \
   'security=reality'
 
-run_generated_case socks $'5\n\n127.0.0.1\n24449\n127.0.0.1\nalice\n\n' \
+run_generated_case socks $'5\n\n127.0.0.1\n127.0.0.1\n24449\nalice\n\n' \
   '.inbounds[0].type=="socks" and .inbounds[0].users[0].username=="alice"' \
-  'socks://127.0.0.1:24449' \
+  '@127.0.0.1:24449' \
   '127.0.0.1'
 
-run_generated_case http $'6\n\n127.0.0.1\n24450\n127.0.0.1\n\n' \
+run_generated_case http $'6\n\n127.0.0.1\n127.0.0.1\n24450\n\n' \
   '.inbounds[0].type=="http" and (.inbounds[0].users|length)==0' \
   'http://127.0.0.1:24450  无认证' \
-  '127.0.0.1'
-
-run_generated_case mixed $'7\n\n127.0.0.1\n24451\n127.0.0.1\nbob\n\n' \
-  '.inbounds[0].type=="mixed" and .inbounds[0].users[0].username=="bob"' \
-  'mixed://127.0.0.1:24451' \
   '127.0.0.1'
 
 HY="$MOCK/hy2"
@@ -252,8 +247,8 @@ bash -c '
 3
 
 
+1
 24445
-1.2.3.4
 
 
 

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # sbctl inbound — canonical inbound CRUD with transactional meta updates.
-# Optimized: single jq call per display page, no function overrides.
+# Uses a single jq call per display page.
 
 inbound_exists() { jq -e --arg tag "$1" '.inbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; }
 port_in_config() { jq -e --argjson port "$1" --arg except "${2-}" '.inbounds[]?|select(.listen_port==$port and .tag!=$except)' "$CONFIG_FILE" >/dev/null; }
@@ -166,7 +166,7 @@ build_inbound() {
   [[ -z $__hop ]] || printf -v "$__hop" '%s' "$selected_hop_range"
 }
 
-# ---- canonical CRUD (merged from state_guard.sh and management.sh) ----
+# ---- inbound CRUD ----
 
 add_inbound() {
   ensure_dependencies inbound-add; require_supported_core; ensure_config

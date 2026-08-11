@@ -1,7 +1,6 @@
 # shellcheck shell=bash
 # Hysteria2 UDP port hopping support — NAT redirect table/chain for HY2.
-# No function overrides. Hooks into canonical CRUD via hy2_hop_sync and
-# hy2_hop_configure which are called directly from inbound.sh and uninstall.sh.
+# Inbound and uninstall call this domain's synchronization API directly.
 
 validate_hy2_hop_range() {
   local value=${1:-} start end

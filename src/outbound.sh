@@ -63,13 +63,6 @@ _ensure_local_outbound() {
   rm -f "$tmp"
 }
 
-is_managed_inbound_route_rule() {
-  local inbound=$1
-  jq -e --arg inbound "$inbound" '
-    type=="object" and .action=="route" and (.inbound // [])==[$inbound] and
-    ((keys_unsorted | sort) == (["action","inbound","outbound"] | sort))' >/dev/null
-}
-
 current_outbound_for_inbound() {
   local inbound=$1 selected
   selected=$(jq -r --arg inbound "$inbound" '

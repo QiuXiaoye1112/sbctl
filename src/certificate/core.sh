@@ -62,39 +62,6 @@ prompt_certificate_server_name() {
   printf -v "$__var" '%s' "$selected"
 }
 
-prompt_certificate_files() {
-  local __cert=$1 __key=$2 default_cert=${3:-} default_key=${4:-} entered_cert entered_key
-  while true; do
-    prompt_value entered_cert "证书文件路径" "$default_cert" || return 1
-    prompt_value entered_key "私钥文件路径" "$default_key" || return 1
-    if validate_certificate_pair "$entered_cert" "$entered_key"; then
-      printf -v "$__cert" '%s' "$entered_cert"
-      printf -v "$__key" '%s' "$entered_key"
-      return 0
-    fi
-    warn "证书或私钥无效，或证书与私钥不匹配，请重新输入。"
-  done
-}
-
-prompt_tls_certificate() {
-  local __cert=$1 __key=$2 __sni=$3 identifier cert_value key_value sni_value
-  if (( $(managed_certificate_count) > 0 )) && confirm "使用托管证书？" Y; then
-    select_managed_certificate identifier || return 1
-    cert_value="${CERT_DIR}/${identifier}.crt"
-    key_value="${CERT_DIR}/${identifier}.key"
-    validate_certificate_pair "$cert_value" "$key_value" || { warn "托管证书与私钥校验失败。"; return 1; }
-    info "使用托管证书：${identifier}"
-  else
-    prompt_certificate_files cert_value key_value || return 1
-    info "使用证书文件：${cert_value}"
-  fi
-  prompt_certificate_server_name sni_value "$cert_value" || return 1
-  info "TLS serverName/SNI：${sni_value}"
-  printf -v "$__cert" '%s' "$cert_value"
-  printf -v "$__key" '%s' "$key_value"
-  printf -v "$__sni" '%s' "$sni_value"
-}
-
 # ---- certificate and managed-resource metadata ----
 meta_cert_exists() {
   init_meta

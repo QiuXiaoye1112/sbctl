@@ -151,7 +151,7 @@ restart_service_checked() {
   service_is_active
 }
 
-# Canonical service definition (from system_guard.sh — hardened version)
+# Hardened service definition.
 create_service_definition() {
   refresh_binary_path
   mkdir -p "$DATA_DIR" "$CONFIG_DIR"

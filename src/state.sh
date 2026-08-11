@@ -1,6 +1,5 @@
 # shellcheck shell=bash
-# sbctl engine — config lifecycle, service definition, install/update, and state transactions.
-# This is the canonical implementation; no module overrides these functions.
+# sbctl state — config/meta lifecycle, migrations, transactions, backup and restore.
 
 # ---- config bootstrap ----
 ensure_config() {
@@ -51,7 +50,7 @@ validate_candidate() {
   fi
 }
 
-# Transactional config+meta apply (from state_guard.sh)
+# Transactional config+meta apply.
 apply_candidate_with_meta() {
   local candidate=$1 meta_candidate=${2:-} cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0
   ensure_config
@@ -80,10 +79,10 @@ apply_candidate_with_meta() {
   info "配置已应用。"
 }
 
-# Simple apply (backward compat)
+# Config-only convenience API.
 apply_candidate() { apply_candidate_with_meta "$1"; }
 
-# Meta candidate builder (from state_guard.sh)
+# Metadata candidate builder.
 build_inbound_meta_candidate() {
   local tag=$1 host=$2 public_key=${3-} config_candidate=$4 output=$5 private="" private_sha=""
   init_meta
@@ -297,11 +296,6 @@ meta_set_host() {
   init_meta; tmp=$(temp_file)
   jq --arg tag "$tag" --arg host "$host" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
     .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now})' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
-}
-meta_delete_inbound() {
-  local tag=$1 tmp; init_meta; tmp=$(temp_file)
-  jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$tmp"
   install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
 }
 public_host_for_tag() {

@@ -27,13 +27,6 @@ sbc_invalidate_install_cache() {
   rm -f "$_SBC_CACHE_DIR/_sbc_sing_box_bin" "$_SBC_CACHE_DIR/_sbc_sing_box_version" 2>/dev/null || true
 }
 
-sbc_cache_flush() {
-  [[ -n $_SBC_CACHE_DIR ]] || return
-  rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
-  _SBC_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cache.XXXXXX") || _SBC_CACHE_DIR=""
-  [[ -z $_SBC_CACHE_DIR ]] || chmod 700 "$_SBC_CACHE_DIR" 2>/dev/null || true
-}
-
 # Cached init_system — runs once per session
 init_system() {
   local result
@@ -193,7 +186,7 @@ _apt_run_bounded() {
   fi
 }
 
-apt_get_guarded() {
+platform_apt_get() {
   local total_timeout=${SBCTL_APT_TIMEOUT:-180}
   local apt_options=(
     -o Acquire::Retries=2
@@ -295,10 +288,10 @@ install_packages() {
   case $manager in
     apk) run_bounded 180 apk add --no-cache "$@" ;;
     apt)
-      if ! DEBIAN_FRONTEND=noninteractive apt_get_guarded update -y; then
+      if ! DEBIAN_FRONTEND=noninteractive platform_apt_get update -y; then
         warn "APT 软件索引更新失败或超时，尝试使用现有索引继续安装。"
       fi
-      DEBIAN_FRONTEND=noninteractive apt_get_guarded install -y --no-install-recommends "$@" \
+      DEBIAN_FRONTEND=noninteractive platform_apt_get install -y --no-install-recommends "$@" \
         || die "APT 依赖安装失败，请检查软件源、DNS 和服务器网络。"
       ;;
     dnf) run_bounded 180 dnf install -y "$@" ;;

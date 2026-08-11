@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Cloudflare DNS credential management.
-# No certificate-lifecycle overrides — certops.sh owns issuance/renewal while
-# cert_guard.sh owns the shared Certbot environment/bootstrap policy.
+# Certificate lifecycle owns issuance/renewal; certbot.sh owns the shared
+# Certbot environment/bootstrap policy.
 
 CLOUDFLARE_INI="${SBCTL_CLOUDFLARE_INI:-${CERTBOT_CONFIG_DIR}/cloudflare.ini}"
 

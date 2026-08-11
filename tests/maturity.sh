@@ -152,8 +152,8 @@ if [[ ! -e /etc/sysctl.d/99-sbctl-bbr.conf ]]; then
   [[ ! -e $CASE/sysctl-called ]]
 fi
 
-declare -f apt_get_guarded | grep -Fq 'Acquire::Retries=2'
-declare -f apt_get_guarded | grep -Fq 'Acquire::ForceIPv4=true'
+declare -f platform_apt_get | grep -Fq 'Acquire::Retries=2'
+declare -f platform_apt_get | grep -Fq 'Acquire::ForceIPv4=true'
 BASH
 
 # Production systemd service summary — single systemctl show call via _service_states

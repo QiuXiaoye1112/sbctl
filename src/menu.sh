@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # sbctl menus — canonical interactive UI, dispatch, and help.
-# All menus are defined exactly once. No overrides.
+# All menus are defined exactly once.
 
 # ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
 manage_inbound_menu() {
@@ -196,7 +196,7 @@ system_menu() {
   done
 }
 
-# ---- uninstall menu (from enhancements.sh — three-level model) ----
+# ---- three-level uninstall menu ----
 uninstall_menu() {
   local choice
   while true; do

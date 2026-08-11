@@ -187,7 +187,6 @@ validate_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
 validate_tag() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
 validate_domain() { [[ ${1:-} =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 validate_uuid() { [[ ${1:-} =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
-validate_short_id() { [[ ${1:-} =~ ^[0-9A-Fa-f]{0,8}$ ]]; }
 validate_ipv4() {
   local IFS=. a b c d extra
   read -r a b c d extra <<<"${1:-}"
@@ -310,13 +309,6 @@ _sbc_cache() {
 sbc_invalidate_install_cache() {
   [[ -n $_SBC_CACHE_DIR ]] || return
   rm -f "$_SBC_CACHE_DIR/_sbc_sing_box_bin" "$_SBC_CACHE_DIR/_sbc_sing_box_version" 2>/dev/null || true
-}
-
-sbc_cache_flush() {
-  [[ -n $_SBC_CACHE_DIR ]] || return
-  rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
-  _SBC_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cache.XXXXXX") || _SBC_CACHE_DIR=""
-  [[ -z $_SBC_CACHE_DIR ]] || chmod 700 "$_SBC_CACHE_DIR" 2>/dev/null || true
 }
 
 # Cached init_system — runs once per session
@@ -478,7 +470,7 @@ _apt_run_bounded() {
   fi
 }
 
-apt_get_guarded() {
+platform_apt_get() {
   local total_timeout=${SBCTL_APT_TIMEOUT:-180}
   local apt_options=(
     -o Acquire::Retries=2
@@ -580,10 +572,10 @@ install_packages() {
   case $manager in
     apk) run_bounded 180 apk add --no-cache "$@" ;;
     apt)
-      if ! DEBIAN_FRONTEND=noninteractive apt_get_guarded update -y; then
+      if ! DEBIAN_FRONTEND=noninteractive platform_apt_get update -y; then
         warn "APT 软件索引更新失败或超时，尝试使用现有索引继续安装。"
       fi
-      DEBIAN_FRONTEND=noninteractive apt_get_guarded install -y --no-install-recommends "$@" \
+      DEBIAN_FRONTEND=noninteractive platform_apt_get install -y --no-install-recommends "$@" \
         || die "APT 依赖安装失败，请检查软件源、DNS 和服务器网络。"
       ;;
     dnf) run_bounded 180 dnf install -y "$@" ;;
@@ -601,8 +593,7 @@ ensure_dependencies() {
 }
 
 # ---- module: state ----
-# sbctl engine — config lifecycle, service definition, install/update, and state transactions.
-# This is the canonical implementation; no module overrides these functions.
+# sbctl state — config/meta lifecycle, migrations, transactions, backup and restore.
 
 # ---- config bootstrap ----
 ensure_config() {
@@ -653,7 +644,7 @@ validate_candidate() {
   fi
 }
 
-# Transactional config+meta apply (from state_guard.sh)
+# Transactional config+meta apply.
 apply_candidate_with_meta() {
   local candidate=$1 meta_candidate=${2:-} cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0
   ensure_config
@@ -682,10 +673,10 @@ apply_candidate_with_meta() {
   info "配置已应用。"
 }
 
-# Simple apply (backward compat)
+# Config-only convenience API.
 apply_candidate() { apply_candidate_with_meta "$1"; }
 
-# Meta candidate builder (from state_guard.sh)
+# Metadata candidate builder.
 build_inbound_meta_candidate() {
   local tag=$1 host=$2 public_key=${3-} config_candidate=$4 output=$5 private="" private_sha=""
   init_meta
@@ -901,11 +892,6 @@ meta_set_host() {
     .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now})' "$META_FILE" >"$tmp"
   install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
 }
-meta_delete_inbound() {
-  local tag=$1 tmp; init_meta; tmp=$(temp_file)
-  jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
-}
 public_host_for_tag() {
   local tag=$1 host=""
   init_meta
@@ -979,39 +965,6 @@ prompt_certificate_server_name() {
     selected=${names[$((answer-1))]}
   fi
   printf -v "$__var" '%s' "$selected"
-}
-
-prompt_certificate_files() {
-  local __cert=$1 __key=$2 default_cert=${3:-} default_key=${4:-} entered_cert entered_key
-  while true; do
-    prompt_value entered_cert "证书文件路径" "$default_cert" || return 1
-    prompt_value entered_key "私钥文件路径" "$default_key" || return 1
-    if validate_certificate_pair "$entered_cert" "$entered_key"; then
-      printf -v "$__cert" '%s' "$entered_cert"
-      printf -v "$__key" '%s' "$entered_key"
-      return 0
-    fi
-    warn "证书或私钥无效，或证书与私钥不匹配，请重新输入。"
-  done
-}
-
-prompt_tls_certificate() {
-  local __cert=$1 __key=$2 __sni=$3 identifier cert_value key_value sni_value
-  if (( $(managed_certificate_count) > 0 )) && confirm "使用托管证书？" Y; then
-    select_managed_certificate identifier || return 1
-    cert_value="${CERT_DIR}/${identifier}.crt"
-    key_value="${CERT_DIR}/${identifier}.key"
-    validate_certificate_pair "$cert_value" "$key_value" || { warn "托管证书与私钥校验失败。"; return 1; }
-    info "使用托管证书：${identifier}"
-  else
-    prompt_certificate_files cert_value key_value || return 1
-    info "使用证书文件：${cert_value}"
-  fi
-  prompt_certificate_server_name sni_value "$cert_value" || return 1
-  info "TLS serverName/SNI：${sni_value}"
-  printf -v "$__cert" '%s' "$cert_value"
-  printf -v "$__key" '%s' "$key_value"
-  printf -v "$__sni" '%s' "$sni_value"
 }
 
 # ---- certificate and managed-resource metadata ----
@@ -1171,8 +1124,7 @@ protocol_build_proxy() {
 
 # ---- module: hysteria2 ----
 # Hysteria2 UDP port hopping support — NAT redirect table/chain for HY2.
-# No function overrides. Hooks into canonical CRUD via hy2_hop_sync and
-# hy2_hop_configure which are called directly from inbound.sh and uninstall.sh.
+# Inbound and uninstall call this domain's synchronization API directly.
 
 validate_hy2_hop_range() {
   local value=${1:-} start end
@@ -1489,7 +1441,7 @@ internal_hy2_hop_clear() {
 
 # ---- module: inbound ----
 # sbctl inbound — canonical inbound CRUD with transactional meta updates.
-# Optimized: single jq call per display page, no function overrides.
+# Uses a single jq call per display page.
 
 inbound_exists() { jq -e --arg tag "$1" '.inbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; }
 port_in_config() { jq -e --argjson port "$1" --arg except "${2-}" '.inbounds[]?|select(.listen_port==$port and .tag!=$except)' "$CONFIG_FILE" >/dev/null; }
@@ -1655,7 +1607,7 @@ build_inbound() {
   [[ -z $__hop ]] || printf -v "$__hop" '%s' "$selected_hop_range"
 }
 
-# ---- canonical CRUD (merged from state_guard.sh and management.sh) ----
+# ---- inbound CRUD ----
 
 add_inbound() {
   ensure_dependencies inbound-add; require_supported_core; ensure_config
@@ -2080,13 +2032,6 @@ _ensure_local_outbound() {
   rm -f "$tmp"
 }
 
-is_managed_inbound_route_rule() {
-  local inbound=$1
-  jq -e --arg inbound "$inbound" '
-    type=="object" and .action=="route" and (.inbound // [])==[$inbound] and
-    ((keys_unsorted | sort) == (["action","inbound","outbound"] | sort))' >/dev/null
-}
-
 current_outbound_for_inbound() {
   local inbound=$1 selected
   selected=$(jq -r --arg inbound "$inbound" '
@@ -2422,8 +2367,6 @@ certbot_supports_ip() { [[ -x $CERTBOT_BIN ]] && "$CERTBOT_BIN" --help all 2>/de
 certbot_nginx_available() {
   [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_nginx' >/dev/null 2>&1
 }
-
-install_certbot() { ensure_certbot_environment; }
 
 certbot_account_ids() {
   local file id
@@ -2940,8 +2883,8 @@ renew_certificate_command() {
 
 # ---- module: certificate/cloudflare ----
 # Cloudflare DNS credential management.
-# No certificate-lifecycle overrides — certops.sh owns issuance/renewal while
-# cert_guard.sh owns the shared Certbot environment/bootstrap policy.
+# Certificate lifecycle owns issuance/renewal; certbot.sh owns the shared
+# Certbot environment/bootstrap policy.
 
 CLOUDFLARE_INI="${SBCTL_CLOUDFLARE_INI:-${CERTBOT_CONFIG_DIR}/cloudflare.ini}"
 
@@ -3447,7 +3390,7 @@ restart_service_checked() {
   service_is_active
 }
 
-# Canonical service definition (from system_guard.sh — hardened version)
+# Hardened service definition.
 create_service_definition() {
   refresh_binary_path
   mkdir -p "$DATA_DIR" "$CONFIG_DIR"
@@ -3838,7 +3781,7 @@ uninstall_sing_box() {
 
 # ---- module: menu ----
 # sbctl menus — canonical interactive UI, dispatch, and help.
-# All menus are defined exactly once. No overrides.
+# All menus are defined exactly once.
 
 # ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
 manage_inbound_menu() {
@@ -4034,7 +3977,7 @@ system_menu() {
   done
 }
 
-# ---- uninstall menu (from enhancements.sh — three-level model) ----
+# ---- three-level uninstall menu ----
 uninstall_menu() {
   local choice
   while true; do

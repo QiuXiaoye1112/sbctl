@@ -11,8 +11,6 @@ certbot_nginx_available() {
   [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_nginx' >/dev/null 2>&1
 }
 
-install_certbot() { ensure_certbot_environment; }
-
 certbot_account_ids() {
   local file id
   for file in "$CERTBOT_CONFIG_DIR"/accounts/*/*/*/regr.json; do

@@ -41,7 +41,8 @@ write_default_config
 
 save_cloudflare_credentials 'cf@example.com' 'global-api-key-test'
 load_cloudflare_credentials
-[[ $(stat -c '%a' "$CLOUDFLARE_INI") == 600 ]]
+mode=$(stat -c '%a' "$CLOUDFLARE_INI" 2>/dev/null || stat -f '%Lp' "$CLOUDFLARE_INI")
+[[ $mode == 600 ]]
 grep -Fq 'dns_cloudflare_email = cf@example.com' "$CLOUDFLARE_INI"
 grep -Fq 'dns_cloudflare_api_key = global-api-key-test' "$CLOUDFLARE_INI"
 ! grep -Fq 'dns_cloudflare_api_token' "$CLOUDFLARE_INI"
@@ -104,10 +105,7 @@ source ./sbctl.sh
 printf '#!/bin/sh\nexit 0\n' >"$CERTBOT_VENV/bin/pip"
 chmod +x "$CERTBOT_VENV/bin/pip"
 _cert_run_bounded() { return 137; }
-set +e
-certbot_pip_install 'test component' 'dummy-package'
-rc=$?
-set -e
+if certbot_pip_install 'test component' 'dummy-package'; then rc=0; else rc=$?; fi
 [[ $rc == 137 ]]
 
 # Core bootstrap installs the supported 5.x range and matching nginx plugin once.

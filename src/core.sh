@@ -144,7 +144,6 @@ validate_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
 validate_tag() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
 validate_domain() { [[ ${1:-} =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 validate_uuid() { [[ ${1:-} =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
-validate_short_id() { [[ ${1:-} =~ ^[0-9A-Fa-f]{0,8}$ ]]; }
 validate_ipv4() {
   local IFS=. a b c d extra
   read -r a b c d extra <<<"${1:-}"

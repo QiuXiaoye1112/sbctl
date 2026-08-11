@@ -13,7 +13,6 @@ bash -n src/inbound.sh
 grep -Fq 'choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"' src/inbound.sh
 ! grep -Fq 'mixed)' src/inbound.sh
 grep -Fq 'anytls://' src/share.sh
-grep -Fq 'confirm "使用托管证书？" Y' src/certificate/core.sh
 grep -Fq 'choose answer "选择 TLS serverName/SNI"' src/certificate/core.sh
 grep -Fq 'protocol_build_anytls()' src/protocols.sh
 grep -Fq 'protocol_build_vless()' src/protocols.sh

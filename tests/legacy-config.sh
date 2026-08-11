@@ -58,9 +58,10 @@ bash -c '
   ls "$BACKUP_DIR"/pre-tag-migration-*.json >/dev/null
 
   output=$(list_inbounds)
-  grep -Fq "legacy-shadowsocks-1" <<<"$output"
-  grep -Fq "shadowsocks" <<<"$output"
+  grep -Fq "legacy-shado..." <<<"$output"
+  grep -Fq "shadow..." <<<"$output"
   grep -Fq "8080" <<<"$output"
+  [[ $(show_inbound legacy-shadowsocks-1 | jq -r .tag) == legacy-shadowsocks-1 ]]
 
   ensure_dependencies(){ :; }
   delete_inbound legacy-shadowsocks-1 1
