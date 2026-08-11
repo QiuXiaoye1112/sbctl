@@ -57,4 +57,18 @@ inbound=''; host=''; public=''; hop=''
 build_inbound inbound host public hop
 jq -e '.type=="hysteria2" and (has("obfs")|not)' <<<"$inbound" >/dev/null
 
+# An unauthenticated SOCKS inbound leaves the optional username and password
+# empty; both still need initialized values under Bash 5.2 `set -u` semantics.
+choose() {
+  local __var=$1 prompt=$2
+  case $prompt in
+    "选择入站协议") printf -v "$__var" '%s' 5 ;;
+  esac
+}
+prompt_public_host() { printf -v "$1" '%s' 203.0.113.10; }
+prompt_optional() { printf -v "$1" '%s' ''; }
+inbound=''; host=''; public=''; hop=''
+build_inbound inbound host public hop
+jq -e '.type=="socks" and .users==[]' <<<"$inbound" >/dev/null
+
 printf 'protocol builder unit checks passed.\n'
