@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 
 version=$(SBCTL_TESTING=1 bash ./sbctl.sh version)
-[[ $version == 'sbctl 0.4.3' ]]
+[[ $version == 'sbctl 0.4.4' ]]
 
 help=$(SBCTL_TESTING=1 bash ./sbctl.sh help)
 grep -Fq 'sbctl inbound add' <<<"$help"
@@ -15,6 +15,6 @@ grep -Fq '支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP' <<<
 printf 'CLI smoke checks passed.\n'
 
 if [[ -x dist/sbctl ]]; then
-  [[ $(SBCTL_TESTING=1 bash ./dist/sbctl version) == 'sbctl 0.4.3' ]]
+  [[ $(SBCTL_TESTING=1 bash ./dist/sbctl version) == 'sbctl 0.4.4' ]]
   SBCTL_TESTING=1 bash ./dist/sbctl help | grep -Fq 'sbctl inbound add'
 fi

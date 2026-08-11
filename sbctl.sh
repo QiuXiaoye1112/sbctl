@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.3"
+readonly SBCTL_VERSION="0.4.4"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
@@ -33,8 +33,8 @@ CERTBOT_BIN="${SBCTL_CERTBOT_BIN:-${CERTBOT_VENV}/bin/certbot}"
 CERTBOT_CONFIG_DIR="${SBCTL_CERTBOT_CONFIG_DIR:-/var/lib/sbctl/letsencrypt}"
 CERTBOT_WORK_DIR="${SBCTL_CERTBOT_WORK_DIR:-/var/lib/sbctl/certbot-work}"
 CERTBOT_LOGS_DIR="${SBCTL_CERTBOT_LOGS_DIR:-/var/log/sbctl/certbot}"
-_default_certbot_shared_lock=/run/lock/xrayctl-sbctl-certbot.lock
-if [[ ${SBCTL_TESTING:-0} == 1 ]]; then _default_certbot_shared_lock="${LOCK_FILE%/*}/xrayctl-sbctl-certbot.lock"; fi
+_default_certbot_shared_lock=/run/lock/certbot.lock
+if [[ ${SBCTL_TESTING:-0} == 1 ]]; then _default_certbot_shared_lock="${LOCK_FILE%/*}/certbot.lock"; fi
 CERTBOT_SHARED_LOCK="${SBCTL_CERTBOT_SHARED_LOCK:-$_default_certbot_shared_lock}"
 unset _default_certbot_shared_lock
 CERTBOT_SHARED_LOCK_WAIT="${SBCTL_CERTBOT_SHARED_LOCK_WAIT:-300}"

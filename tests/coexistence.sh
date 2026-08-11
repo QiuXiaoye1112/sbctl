@@ -16,7 +16,7 @@ export SBCTL_XRAYCTL_CONFIG_FILE="$TMP/xray/config.json"
 export SBCTL_BBR_CONFIG="$TMP/99-sbctl-bbr.conf"
 export SBCTL_XRAYCTL_BBR_CONFIG="$TMP/99-xrayctl-bbr.conf"
 export SBCTL_CERTBOT_VENV="$TMP/certbot-venv"
-export SBCTL_CERTBOT_SHARED_LOCK="$TMP/xrayctl-sbctl-certbot.lock"
+export SBCTL_CERTBOT_SHARED_LOCK="$TMP/certbot.lock"
 export SBCTL_CERTBOT_SHARED_LOCK_WAIT=0
 
 mkdir -p "$(dirname "$SBCTL_XRAYCTL_CONFIG_FILE")"
