@@ -31,7 +31,6 @@ hy2_internal_port_available() {
   validate_port "$port" || return 1
   hy2_port_in_range "$port" "$range" && return 1
   port_in_config "$port" && return 1
-  port_in_xrayctl_config "$port" && return 1
   port_in_use_os "$port" && return 1
 }
 
@@ -58,7 +57,6 @@ prompt_hy2_internal_port() {
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
     port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
-    port_in_xrayctl_config "$value" && { warn "该端口已被 xrayctl/Xray 入站使用。"; continue; }
     port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
     printf -v "$__var" '%s' "$value"; return 0
   done
@@ -74,7 +72,7 @@ hy2_build() {
 }
 
 hy2_hop_check_conflicts() {
-  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end peer_port
+  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
   new_start=${range%-*}; new_end=${range#*-}
   init_meta
   while IFS=$'\t' read -r tag existing; do
@@ -87,15 +85,6 @@ hy2_hop_check_conflicts() {
       return 1
     fi
   done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
-  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
-    while IFS= read -r peer_port; do
-      validate_port "$peer_port" || continue
-      if ((10#$peer_port >= 10#$new_start && 10#$peer_port <= 10#$new_end)); then
-        warn "端口跳跃范围包含 xrayctl/Xray 入站端口 ${peer_port}，请重新选择。"
-        return 1
-      fi
-    done < <(jq -r '.inbounds[]?.port // empty' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || true)
-  fi
   return 0
 }
 
