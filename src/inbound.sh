@@ -24,12 +24,20 @@ _random_port_avoiding_hops() {
   for ((i=0; i<64; i++)); do
     hex=$(random_hex 2)
     candidate=$((10000 + (16#$hex % 55536)))
+    hy2_port_in_default_hop_range "$candidate" && continue
     hy2_port_in_any_hop_range "$candidate" && continue
     port_in_config "$candidate" && continue
     port_in_use_os "$candidate" && continue
     printf '%s' "$candidate"; return 0
   done
-  printf '443'
+  for ((candidate=10000; candidate<=65535; candidate++)); do
+    hy2_port_in_default_hop_range "$candidate" && continue
+    hy2_port_in_any_hop_range "$candidate" && continue
+    port_in_config "$candidate" && continue
+    port_in_use_os "$candidate" && continue
+    printf '%s' "$candidate"; return 0
+  done
+  return 1
 }
 
 prompt_port() {
