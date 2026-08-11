@@ -177,3 +177,140 @@ node_summary() {
   ver=$(sing_box_version_summary)
   printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$svc" "$count" "${ver:-已安装}"
 }
+
+# APT uses a foreground timeout when available so package hooks cannot suspend
+# sbctl through SIGTTIN/SIGTTOU on a controlling terminal.
+_apt_run_bounded() {
+  local seconds=$1; shift
+  if command_exists timeout; then
+    if timeout --help 2>&1 | grep -F -- '--foreground' >/dev/null; then
+      timeout --foreground "$seconds" "$@"
+    else
+      timeout "$seconds" "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
+apt_get_guarded() {
+  local total_timeout=${SBCTL_APT_TIMEOUT:-180}
+  local apt_options=(
+    -o Acquire::Retries=2
+    -o Acquire::http::Timeout=15
+    -o Acquire::https::Timeout=15
+    -o Dpkg::Use-Pty=0
+  )
+  apt_ipv4_available && apt_options+=(-o Acquire::ForceIPv4=true)
+  _apt_run_bounded "$total_timeout" env \
+    DEBIAN_FRONTEND=noninteractive \
+    APT_LISTCHANGES_FRONTEND=none \
+    apt-get "${apt_options[@]}" "$@"
+}
+
+
+# ---- platform operations ----
+# ---- service actions (uncached — these have side effects) ----
+service_start() {
+  case $(init_system) in systemd) systemctl start "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" start;; *) return 1;; esac
+}
+service_stop() {
+  case $(init_system) in systemd) systemctl stop "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" stop;; *) return 1;; esac
+}
+service_restart() {
+  case $(init_system) in systemd) systemctl restart "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" restart;; *) return 1;; esac
+}
+service_enable() {
+  case $(init_system) in
+    systemd) systemctl enable "$SERVICE_NAME" >/dev/null ;;
+    openrc) rc-update add "$SERVICE_NAME" default >/dev/null ;;
+    *) return 1;;
+  esac
+}
+service_disable() {
+  case $(init_system) in
+    systemd) systemctl disable "$SERVICE_NAME" >/dev/null ;;
+    openrc) rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true ;;
+    *) return 1;;
+  esac
+}
+service_logs() {
+  local lines=${1:-100}
+  case $(init_system) in
+    systemd) journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager ;;
+    openrc) tail -n "$lines" /var/log/sing-box.log 2>/dev/null || warn "未找到 /var/log/sing-box.log。" ;;
+  esac
+}
+
+# ---- network helpers (lightweight, no-cache — used in creation flows) ----
+detect_public_ipv4() {
+  command_exists curl || return 1
+  local response
+  response=$({ curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true; } | tr -d '[:space:]')
+  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  response=$({ curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://checkip.amazonaws.com 2>/dev/null || true; } | tr -d '[:space:]')
+  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  local raw
+  raw=$(curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  response=$(awk -F= '$1=="ip" {print $2; exit}' <<<"$raw" | tr -d '[:space:]')
+  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  return 1
+}
+detect_public_ipv6() {
+  command_exists curl || return 1
+  local response
+  response=$({ curl -6 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://api6.ipify.org 2>/dev/null || true; } | tr -d '[:space:]')
+  if validate_ip_literal "$response" && ! validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  local raw
+  raw=$(curl -6 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  response=$(awk -F= '$1=="ip" {print $2; exit}' <<<"$raw" | tr -d '[:space:]')
+  if validate_ip_literal "$response" && ! validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  return 1
+}
+
+apt_ipv4_available() {
+  if [[ -n ${APT_IPV4_AVAILABLE_CACHE:-} ]]; then
+    [[ $APT_IPV4_AVAILABLE_CACHE == 1 ]]
+    return
+  fi
+  local available=0
+  if command_exists ip && ip -4 route get 1.1.1.1 >/dev/null 2>&1; then
+    available=1
+  elif [[ -r /proc/net/route ]] && awk '$2=="00000000" && $4 ~ /0003/ {found=1} END{exit !found}' /proc/net/route 2>/dev/null; then
+    available=1
+  fi
+  APT_IPV4_AVAILABLE_CACHE=$available
+  ((available == 1))
+}
+
+# ---- package manager (no cache — pkg_manager is cached in cache.sh) ----
+install_packages() {
+  local manager
+  manager=$(pkg_manager) || die "无法识别包管理器。"
+  case $manager in
+    apk) run_bounded 180 apk add --no-cache "$@" ;;
+    apt)
+      if ! DEBIAN_FRONTEND=noninteractive apt_get_guarded update -y; then
+        warn "APT 软件索引更新失败或超时，尝试使用现有索引继续安装。"
+      fi
+      DEBIAN_FRONTEND=noninteractive apt_get_guarded install -y --no-install-recommends "$@" \
+        || die "APT 依赖安装失败，请检查软件源、DNS 和服务器网络。"
+      ;;
+    dnf) run_bounded 180 dnf install -y "$@" ;;
+    yum) run_bounded 180 yum install -y "$@" ;;
+    pacman) run_bounded 180 pacman -Sy --noconfirm --needed "$@" ;;
+    zypper) run_bounded 180 zypper --non-interactive install "$@" ;;
+  esac
+}
+
+ensure_dependencies() {
+  require_root "$@"
+  local missing=() c
+  for c in curl jq openssl; do command_exists "$c" || missing+=("$c"); done
+  ((${#missing[@]} == 0)) || install_packages "${missing[@]}"
+}

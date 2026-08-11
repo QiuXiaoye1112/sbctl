@@ -137,4 +137,22 @@ client_json_for_anytls() {
   fi
 }
 
+rename_client() {
+  ensure_dependencies client-rename; ensure_config
+  local tag=${1-} old=${2-} new=${3-} type field tmp
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  if [[ -z $old ]]; then list_clients "$tag"; select_client old "$tag" || return 0; fi
+  client_exists "$tag" "$old" || die "找不到用户：$old"
+  if [[ -z $new ]]; then prompt_value new "新用户名称" "$old"; fi
+  [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
+  client_exists "$tag" "$new" && die "用户名称已存在：$new"
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg old "$old" --arg new "$new" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$old)|.[$field])=$new' "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then info "用户已重命名：${old} -> ${new}"; fi
+  rm -f "$tmp"
+}
+
 # Canonical print_share lives in share.sh

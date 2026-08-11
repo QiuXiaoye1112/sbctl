@@ -6,6 +6,7 @@ cd "$ROOT"
 
 bash tests/architecture.sh
 bash tests/unit/core.sh
+bash tests/unit/protocols.sh
 bash tests/integration/state-transaction.sh
 bash tests/smoke/cli.sh
 

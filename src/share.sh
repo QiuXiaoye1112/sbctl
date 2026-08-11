@@ -126,3 +126,12 @@ print_share() {
   esac
   share_separator
 }
+
+print_all_share() {
+  ensure_config
+  local tag
+  if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then info "还没有入站。"; return 0; fi
+  while IFS= read -r tag; do
+    print_share "$tag" "" || warn "${tag} 分享信息生成失败。"
+  done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+}

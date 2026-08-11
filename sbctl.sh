@@ -42,12 +42,11 @@ unset _repo_src
 
 # Centralized dependency order. Source modules never source one another.
 for _module in \
-  platform core ui platform_network \
-  state_migrations state \
-  certificate/metadata certificate/core security \
-  outbound inbound/core inbound/clients share state_backup \
-  certificate/lifecycle certificate/cloudflare certificate/environment \
-  hysteria2 hysteria2_network protocols service management menu uninstall
+  platform core state \
+  certificate/core security \
+  outbound inbound inbound/clients share \
+  certificate/lifecycle certificate/cloudflare certificate/certbot \
+  hysteria2 protocols service menu uninstall
 do
   [[ -r "$SRC_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$SRC_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090

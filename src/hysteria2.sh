@@ -10,6 +10,68 @@ validate_hy2_hop_range() {
   validate_port "$start" && validate_port "$end" && ((10#$start < 10#$end))
 }
 
+hy2_port_in_range() {
+  local port=$1 range=$2 start end
+  start=${range%-*}; end=${range#*-}
+  validate_port "$port" && validate_hy2_hop_range "$range" || return 1
+  ((10#$port >= 10#$start && 10#$port <= 10#$end))
+}
+
+hy2_port_in_any_hop_range() {
+  local port=$1 range
+  init_meta 2>/dev/null || true
+  while IFS= read -r range; do
+    [[ -n $range ]] || continue
+    hy2_port_in_range "$port" "$range" && return 0
+  done < <(jq -r '.inbounds[]?.hysteria2PortHopping.range // empty' "$META_FILE" 2>/dev/null || true)
+  return 1
+}
+
+hy2_internal_port_available() {
+  local port=$1 range=$2
+  validate_port "$port" || return 1
+  hy2_port_in_range "$port" "$range" && return 1
+  port_in_config "$port" && return 1
+  port_in_use_os "$port" && return 1
+}
+
+hy2_pick_internal_port() {
+  local __var=$1 range=$2 candidate hex i
+  for ((i=0; i<256; i++)); do
+    hex=$(random_hex 2); candidate=$((10000 + (16#$hex % 55536)))
+    if hy2_internal_port_available "$candidate" "$range"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
+  done
+  for ((candidate=10000; candidate<=65535; candidate++)); do
+    if hy2_internal_port_available "$candidate" "$range"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+prompt_hy2_internal_port() {
+  local __var=$1 range=$2 value=""
+  while true; do
+    prompt_optional value "内部监听端口（留空自动选择）" || return 1
+    if [[ -z $value ]]; then
+      hy2_pick_internal_port value "$range" || { error "找不到可用的内部监听端口。"; return 1; }
+      info "内部监听端口：${value}"; printf -v "$__var" '%s' "$value"; return 0
+    fi
+    validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
+    hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
+    port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
+    port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
+    printf -v "$__var" '%s' "$value"; return 0
+  done
+}
+
+hy2_build() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 password=$6 up=$7 down=$8 obfs=${9-} tls=${10}
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --arg up "$up" --arg down "$down" --arg obfs "$obfs" --argjson tls "$tls" '
+    {type:"hysteria2",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} |
+    if $up!="" then .up_mbps=($up|tonumber) else . end |
+    if $down!="" then .down_mbps=($down|tonumber) else . end |
+    if $obfs!="" then .obfs={type:"salamander",password:$obfs} else . end')"
+}
+
 hy2_hop_check_conflicts() {
   local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
   new_start=${range%-*}; new_end=${range#*-}
@@ -137,6 +199,44 @@ EOF_RC
 }
 
 # Canonical hy2_hop_restore_all lives in hy2_nft.sh (nftables-aware version)
+
+hy2_hop_restore_all() {
+  [[ $(uname -s) == Linux ]] || return 0
+  init_meta
+  [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
+  local count tag range target start end cmd
+  count=$(hy2_hop_enabled_count)
+  if ((count == 0)); then hy2_hop_clear_rules; return 0; fi
+  hy2_hop_ensure_backend
+  if command_exists nft; then
+    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
+    nft add table inet sbctl_hy2_hop
+    nft 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }'
+    while IFS=$'\t' read -r tag range; do
+      [[ -n $tag && -n $range ]] || continue
+      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+      validate_port "$target" || continue
+      nft add rule inet sbctl_hy2_hop prerouting udp dport "$range" redirect to ":${target}"
+    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  else
+    for cmd in iptables ip6tables; do
+      command_exists "$cmd" || continue
+      "$cmd" -t nat -N SBCTL_HY2_HOP >/dev/null 2>&1 || true
+      "$cmd" -t nat -F SBCTL_HY2_HOP
+      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP
+    done
+    while IFS=$'\t' read -r tag range; do
+      [[ -n $tag && -n $range ]] || continue
+      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+      validate_port "$target" || continue
+      start=${range%-*}; end=${range#*-}
+      for cmd in iptables ip6tables; do
+        command_exists "$cmd" || continue
+        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target"
+      done
+    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  fi
+}
 
 # Sync all hop rules after CRUD operations (called from inbound.sh)
 hy2_hop_sync() {

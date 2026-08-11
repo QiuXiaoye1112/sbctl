@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# sbctl core — colors, logging, validators, I/O helpers, and metadata primitives.
-# Session-cached state functions live in lib/cache.sh (loaded before this file).
+# sbctl core — logging, interaction, validators, temp files, and table helpers.
+# Domain and platform operations live in their dedicated modules.
 
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
   C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
@@ -169,69 +169,6 @@ generate_uuid() {
 url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 uri_host() { [[ $1 == *:* && $1 != \[*\] ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
 
-# ---- service actions (uncached — these have side effects) ----
-service_start() {
-  case $(init_system) in systemd) systemctl start "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" start;; *) return 1;; esac
-}
-service_stop() {
-  case $(init_system) in systemd) systemctl stop "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" stop;; *) return 1;; esac
-}
-service_restart() {
-  case $(init_system) in systemd) systemctl restart "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" restart;; *) return 1;; esac
-}
-service_enable() {
-  case $(init_system) in
-    systemd) systemctl enable "$SERVICE_NAME" >/dev/null ;;
-    openrc) rc-update add "$SERVICE_NAME" default >/dev/null ;;
-    *) return 1;;
-  esac
-}
-service_disable() {
-  case $(init_system) in
-    systemd) systemctl disable "$SERVICE_NAME" >/dev/null ;;
-    openrc) rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true ;;
-    *) return 1;;
-  esac
-}
-service_logs() {
-  local lines=${1:-100}
-  case $(init_system) in
-    systemd) journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager ;;
-    openrc) tail -n "$lines" /var/log/sing-box.log 2>/dev/null || warn "未找到 /var/log/sing-box.log。" ;;
-  esac
-}
-
-# ---- network helpers (lightweight, no-cache — used in creation flows) ----
-detect_public_ipv4() {
-  command_exists curl || return 1
-  local response
-  response=$({ curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true; } | tr -d '[:space:]')
-  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
-  response=$({ curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --connect-timeout 3 --max-time 5 https://checkip.amazonaws.com 2>/dev/null || true; } | tr -d '[:space:]')
-  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
-  local raw
-  raw=$(curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --connect-timeout 3 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-  response=$(awk -F= '$1=="ip" {print $2; exit}' <<<"$raw" | tr -d '[:space:]')
-  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
-  return 1
-}
-detect_public_ipv6() {
-  command_exists curl || return 1
-  local response
-  response=$({ curl -6 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --connect-timeout 3 --max-time 5 https://api6.ipify.org 2>/dev/null || true; } | tr -d '[:space:]')
-  if validate_ip_literal "$response" && ! validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
-  local raw
-  raw=$(curl -6 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --connect-timeout 3 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-  response=$(awk -F= '$1=="ip" {print $2; exit}' <<<"$raw" | tr -d '[:space:]')
-  if validate_ip_literal "$response" && ! validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
-  return 1
-}
-
 prompt_public_host() {
   local __var=$1 default=${2:-} v4="" v6="" choice value=""
   if [[ -z $default ]]; then
@@ -268,148 +205,37 @@ run_bounded() {
 }
 _cert_run_bounded() { run_bounded "$@"; }
 
-apt_ipv4_available() {
-  if [[ -n ${APT_IPV4_AVAILABLE_CACHE:-} ]]; then
-    [[ $APT_IPV4_AVAILABLE_CACHE == 1 ]]
-    return
-  fi
-  local available=0
-  if command_exists ip && ip -4 route get 1.1.1.1 >/dev/null 2>&1; then
-    available=1
-  elif [[ -r /proc/net/route ]] && awk '$2=="00000000" && $4 ~ /0003/ {found=1} END{exit !found}' /proc/net/route 2>/dev/null; then
-    available=1
-  fi
-  APT_IPV4_AVAILABLE_CACHE=$available
-  ((available == 1))
-}
-
-# ---- package manager (no cache — pkg_manager is cached in cache.sh) ----
-install_packages() {
-  local manager
-  manager=$(pkg_manager) || die "无法识别包管理器。"
-  case $manager in
-    apk) run_bounded 180 apk add --no-cache "$@" ;;
-    apt)
-      if ! DEBIAN_FRONTEND=noninteractive apt_get_guarded update -y; then
-        warn "APT 软件索引更新失败或超时，尝试使用现有索引继续安装。"
-      fi
-      DEBIAN_FRONTEND=noninteractive apt_get_guarded install -y --no-install-recommends "$@" \
-        || die "APT 依赖安装失败，请检查软件源、DNS 和服务器网络。"
-      ;;
-    dnf) run_bounded 180 dnf install -y "$@" ;;
-    yum) run_bounded 180 yum install -y "$@" ;;
-    pacman) run_bounded 180 pacman -Sy --noconfirm --needed "$@" ;;
-    zypper) run_bounded 180 zypper --non-interactive install "$@" ;;
-  esac
-}
-
-ensure_dependencies() {
-  require_root "$@"
-  local missing=() c
-  for c in curl jq openssl; do command_exists "$c" || missing+=("$c"); done
-  ((${#missing[@]} == 0)) || install_packages "${missing[@]}"
-}
-
 temp_file() { mktemp "${TMPDIR:-/tmp}/sbctl.XXXXXX"; }
 timestamp() { date '+%Y%m%d-%H%M%S'; }
 
-# ---- metadata primitives ----
-init_meta() {
-  mkdir -p "$(dirname "$META_FILE")"
-  if [[ ! -s $META_FILE ]] || ! jq -e 'type=="object" and ((.inbounds // {})|type=="object")' "$META_FILE" >/dev/null 2>&1; then
-    [[ ! -f $META_FILE ]] || cp -a "$META_FILE" "${META_FILE}.broken-$(timestamp)"
-    _sbctl_meta_default_json >"$META_FILE"
-    chmod 600 "$META_FILE"
-  else
-    _sbctl_meta_upgrade_file || die "无法升级 sbctl metadata。"
-  fi
-  _sbctl_meta_legacy_cert_scan
-}
-
-_sbctl_meta_default_json() {
-  printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{}}'
-}
-
-_sbctl_meta_upgrade_file() {
-  local tmp
-  tmp=$(temp_file)
-  jq '
-    .schema=2 |
-    .inbounds=(if (.inbounds|type)=="object" then .inbounds else {} end) |
-    .certificates=(if (.certificates|type)=="object" then .certificates else {} end) |
-    .managedResources=(if (.managedResources|type)=="object" then .managedResources else {} end) |
-    .migrations=(if (.migrations|type)=="object" then .migrations else {} end)
-  ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 600 "$tmp" "$META_FILE"
-  rm -f "$tmp"
-}
-
-_sbctl_meta_legacy_cert_scan() {
-  jq -e '.migrations.legacyCertScanV1 == true' "$META_FILE" >/dev/null 2>&1 && return 0
-  local cert key id subject tmp migrated=0
-  mkdir -p "$CERT_DIR"
-  for cert in "$CERT_DIR"/*.crt; do
-    [[ -r $cert ]] || continue
-    key=${cert%.crt}.key
-    [[ -r $key ]] || continue
-    id=$(basename "$cert" .crt)
-    jq -e --arg id "$id" '.certificates[$id] != null' "$META_FILE" >/dev/null 2>&1 && continue
-    subject=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null \
-      | sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -1 || true)
-    if [[ -z $subject ]]; then
-      subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null \
-        | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -1 || true)
-    fi
-    [[ -n $subject ]] || subject=$id
-    tmp=$(temp_file)
-    jq --arg id "$id" --arg subject "$subject" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
-      .certificates[$id]={subject:$subject,certName:$id,source:"legacy",validation:"legacy",autoRenew:false,updatedAt:$now}
-    ' "$META_FILE" >"$tmp"
-    install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
-    ((migrated+=1))
+# ---- terminal table helpers ----
+display_width() {
+  local __var=$1 value=$2 char code computed_width=0 i
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}
+    printf -v code '%d' "'$char"
+    if ((code < 0 || code > 127)); then ((computed_width+=2)); else ((computed_width+=1)); fi
   done
-  tmp=$(temp_file)
-  jq '.migrations.legacyCertScanV1=true' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
-  ((migrated == 0)) || info "已将 ${migrated} 张旧版证书登记到 sbctl metadata。"
+  printf -v "$__var" '%s' "$computed_width"
 }
 
-meta_set_inbound() {
-  local tag=$1 host=$2 public_key=${3-} tmp private private_sha=""
-  init_meta
-  if [[ -n $public_key && -f $CONFIG_FILE ]]; then
-    private=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag)|.tls.reality.private_key // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    [[ -z $private ]] || private_sha=$(printf '%s' "$private" | openssl dgst -sha256 -r | awk '{print $1}')
-  fi
-  tmp=$(temp_file)
-  jq --arg tag "$tag" --arg host "$host" --arg public "$public_key" --arg privateSHA "$private_sha" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
-    .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now}) |
-    if $public!="" and $privateSHA!="" then
-      .inbounds[$tag].realityPublicKey=$public | .inbounds[$tag].realityPrivateSHA256=$privateSHA
-    else
-      del(.inbounds[$tag].realityPublicKey,.inbounds[$tag].realityPrivateSHA256)
-    end' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+print_table_cell() {
+  local value=$1 target_width=$2 cell_width=0 padding
+  display_width cell_width "$value"
+  padding=$((target_width-cell_width))
+  ((padding > 0)) || padding=1
+  printf '%s%*s' "$value" "$padding" ''
 }
-meta_set_host() {
-  local tag=$1 host=$2 tmp
-  init_meta; tmp=$(temp_file)
-  jq --arg tag "$tag" --arg host "$host" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
-    .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now})' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
-}
-meta_delete_inbound() {
-  local tag=$1 tmp; init_meta; tmp=$(temp_file)
-  jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
-}
-public_host_for_tag() {
-  local tag=$1 host=""
-  init_meta
-  host=$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE")
-  if [[ -z $host ]]; then
-    prompt_public_host host || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
-    meta_set_host "$tag" "$host"
-  fi
-  printf '%s' "$host"
+
+print_table_cell_clipped() {
+  local value=$1 target_width=$2 cell_width=0 limit clipped="" used=0 char char_width=0 i
+  display_width cell_width "$value"
+  if ((cell_width < target_width)); then print_table_cell "$value" "$target_width"; return; fi
+  limit=$((target_width-4)); ((limit > 0)) || limit=1
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}; display_width char_width "$char"
+    ((used+char_width <= limit)) || break
+    clipped+=$char; ((used+=char_width))
+  done
+  print_table_cell "${clipped}..." "$target_width"
 }

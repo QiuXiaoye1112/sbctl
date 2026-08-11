@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 bash -n sbctl.sh
-bash -n src/certificate/metadata.sh
+bash -n src/certificate/core.sh
 bash -n src/certificate/lifecycle.sh
 bash -n src/uninstall.sh
 bash -n src/menu.sh

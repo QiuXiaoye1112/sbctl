@@ -8,10 +8,10 @@ bash -n sbctl.sh
 bash -n install.sh
 sh -n alpine/install.sh
 
-grep -q '^build_inbound()' src/inbound/core.sh
-grep -q '^restore_backup()' src/state_backup.sh
-grep -q '^build_reality_tls()' src/inbound/core.sh
-grep -q '"AnyTLS" "VLESS" "Hysteria2" "Trojan"' src/inbound/core.sh
+grep -q '^build_inbound()' src/inbound.sh
+grep -q '^restore_backup()' src/state.sh
+grep -q '^build_reality_tls()' src/security.sh
+grep -q '"AnyTLS" "VLESS" "Hysteria2" "Trojan"' src/inbound.sh
 grep -q 'META_FILE="${SBCTL_META_FILE:-/var/lib/sbctl/meta.json}"' sbctl.sh
 grep -q -- '-c ${CONFIG_FILE}' src/state.sh
 

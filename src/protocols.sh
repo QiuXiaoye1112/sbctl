@@ -1,72 +1,44 @@
-# Supported inbound set and creation flow.
-# Mixed(SOCKS+HTTP) is intentionally not offered or created by sbctl.
+# shellcheck shell=bash
+# Builders for ordinary inbound protocols. Interaction and persistence belong
+# to inbound.sh; these functions only construct sing-box JSON objects.
 
-hy2_port_in_range() {
-  local port=$1 range=$2 start end
-  start=${range%-*}; end=${range#*-}
-  validate_port "$port" && validate_hy2_hop_range "$range" || return 1
-  ((10#$port >= 10#$start && 10#$port <= 10#$end))
+protocol_capability() {
+  local type=$1 capability=$2
+  case "$type:$capability" in
+    vless:tls|vless:reality|vless:users|anytls:tls|anytls:reality|anytls:users|trojan:tls|trojan:reality|trojan:users|socks:users|http:users) return 0;;
+    *) return 1;;
+  esac
 }
 
-hy2_port_in_any_hop_range() {
-  local port=$1 range
-  init_meta 2>/dev/null || true
-  while IFS= read -r range; do
-    [[ -n $range ]] || continue
-    hy2_port_in_range "$port" "$range" && return 0
-  done < <(jq -r '.inbounds[]?.hysteria2PortHopping.range // empty' "$META_FILE" 2>/dev/null || true)
-  return 1
+protocol_build_anytls() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 password=$6 tls=$7
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" \
+    '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls}')"
 }
 
-hy2_internal_port_available() {
-  local port=$1 range=$2
-  validate_port "$port" || return 1
-  hy2_port_in_range "$port" "$range" && return 1
-  port_in_config "$port" && return 1
-  port_in_use_os "$port" && return 1
-  return 0
+protocol_build_vless() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 uuid=$6 flow=$7 tls=${8-} transport=${9:-null} tls_json
+  [[ -n $tls ]] && tls_json=$tls || tls_json='{}'
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls_json" --argjson transport "$transport" '
+    {type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]} +
+    (if $tls!={} then {tls:$tls} else {} end) +
+    (if $transport!=null then {transport:$transport} else {} end)')"
 }
 
-hy2_pick_internal_port() {
-  local __var=$1 range=$2 candidate hex i
-  for ((i=0; i<256; i++)); do
-    hex=$(random_hex 2)
-    candidate=$((10000 + (16#$hex % 55536)))
-    if hy2_internal_port_available "$candidate" "$range"; then
-      printf -v "$__var" '%s' "$candidate"
-      return 0
-    fi
-  done
-  for ((candidate=10000; candidate<=65535; candidate++)); do
-    if hy2_internal_port_available "$candidate" "$range"; then
-      printf -v "$__var" '%s' "$candidate"
-      return 0
-    fi
-  done
-  return 1
+protocol_build_trojan() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 password=$6 tls=$7 transport=${8:-null}
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" --argjson transport "$transport" '
+    {type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} +
+    (if $transport!=null then {transport:$transport} else {} end)')"
 }
 
-prompt_hy2_internal_port() {
-  local __var=$1 range=$2 value=""
-  while true; do
-    prompt_optional value "内部监听端口（留空自动选择）" || return 1
-    if [[ -z $value ]]; then
-      hy2_pick_internal_port value "$range" || { error "找不到可用的内部监听端口。"; return 1; }
-      info "内部监听端口：${value}"
-      printf -v "$__var" '%s' "$value"
-      return 0
-    fi
-    validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
-    hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
-    port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
-    port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
-    printf -v "$__var" '%s' "$value"
-    return 0
-  done
+protocol_build_proxy() {
+  local __out=$1 type=$2 tag=$3 listen=$4 port=$5 username=${6-} password=${7-}
+  if [[ -n $username ]]; then
+    printf -v "$__out" '%s' "$(jq -n --arg type "$type" --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg user "$username" --arg pass "$password" \
+      '{type:$type,tag:$tag,listen:$listen,listen_port:$port,users:[{username:$user,password:$pass}]}')"
+  else
+    printf -v "$__out" '%s' "$(jq -n --arg type "$type" --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+      '{type:$type,tag:$tag,listen:$listen,listen_port:$port,users:[]}')"
+  fi
 }
-
-_legacy_build_inbound_removed() { :; }  # Canonical build_inbound lives in inbound.sh
-
-# Canonical build_inbound lives in inbound.sh
-
-# Canonical show_help lives in menu.sh

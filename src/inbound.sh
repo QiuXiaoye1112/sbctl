@@ -44,88 +44,6 @@ prompt_port() {
   done
 }
 
-managed_certificate_count() { init_meta; jq -r '.certificates | length' "$META_FILE" 2>/dev/null || printf '0'; }
-
-select_managed_certificate() {
-  local __var=$1 always_choose=${2:-0} id answer
-  local ids=()
-  while IFS= read -r id; do
-    [[ -n $id ]] || continue
-    [[ -r "$CERT_DIR/${id}.crt" && -r "$CERT_DIR/${id}.key" ]] && ids+=("$id")
-  done < <(meta_cert_list)
-  ((${#ids[@]} > 0)) || { warn "请在 TLS 证书设置里导入有效证书。"; return 1; }
-  if ((${#ids[@]} == 1)) && [[ $always_choose != 1 ]]; then
-    printf -v "$__var" '%s' "${ids[0]}"; return 0
-  fi
-  choose answer "选择证书" "${ids[@]}" || return 1
-  printf -v "$__var" '%s' "${ids[$((answer-1))]}"
-}
-
-validate_certificate_pair() {
-  local cert=$1 key=$2 cert_pub key_pub
-  [[ -r $cert && -r $key ]] || return 1
-  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
-  openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1 || return 1
-  openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
-  cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl sha256)
-  key_pub=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | openssl sha256)
-  [[ -n $cert_pub && $cert_pub == "$key_pub" ]]
-}
-
-build_certificate_tls() {
-  local __json=$1 __host=${2-} identifier sni
-  select_managed_certificate identifier || return 1
-  prompt_certificate_server_name sni "$CERT_DIR/${identifier}.crt" || return 1
-  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$CERT_DIR/${identifier}.crt" --arg key "$CERT_DIR/${identifier}.key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
-  [[ -z $__host ]] || printf -v "$__host" '%s' "$sni"
-}
-
-generate_reality_keys() {
-  local __private=$1 __public=$2 output __key_private __key_public
-  require_sing_box
-  output=$("$SING_BOX_BIN" generate reality-keypair)
-  __key_private=$(awk '/PrivateKey/ {print $NF; exit}' <<<"$output" | tr -d '"')
-  __key_public=$(awk '/PublicKey/ {print $NF; exit}' <<<"$output" | tr -d '"')
-  [[ -n $__key_private && -n $__key_public ]] || { error "$output"; die "无法解析 REALITY 密钥。"; }
-  printf -v "$__private" '%s' "$__key_private"
-  printf -v "$__public" '%s' "$__key_public"
-}
-
-build_reality_tls() {
-  local __json=$1 __public=$2 target sni port __generated_private __generated_public short_id
-
-  while true; do
-    prompt_value target "REALITY 目标" "www.microsoft.com:443" || return 1
-    validate_reality_target "$target" && break
-    warn "目标格式应为 域名:端口，请重新输入。"
-  done
-
-  sni=${target%:*}
-  port=${target##*:}
-  while true; do
-    prompt_value sni "REALITY serverName/SNI" "$sni" || return 1
-    validate_domain "$sni" && break
-    warn "SNI 必须是有效域名，请重新输入。"
-  done
-
-  generate_reality_keys __generated_private __generated_public
-  short_id=$(random_hex 4)
-  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg server "${target%:*}" --argjson port "$port" --arg private "$__generated_private" --arg sid "$short_id" '{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$server,server_port:$port},private_key:$private,short_id:[$sid]}}')"
-  printf -v "$__public" '%s' "$__generated_public"
-}
-
-reality_public_key() {
-  local tag=$1 private cached expected_sha current_sha
-  private=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.private_key // empty' "$CONFIG_FILE")
-  [[ -n $private ]] || return 1
-  cached=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPublicKey // empty' "$META_FILE" 2>/dev/null || true)
-  expected_sha=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPrivateSHA256 // empty' "$META_FILE" 2>/dev/null || true)
-  [[ -n $cached && -n $expected_sha ]] || return 1
-  current_sha=$(printf '%s' "$private" | openssl dgst -sha256 -r | awk '{print $1}')
-  [[ $current_sha == "$expected_sha" ]] || return 1
-  printf '%s' "$cached"
-}
-
 build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="null" ws_path
   choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
@@ -214,18 +132,13 @@ build_inbound() {
     anytls)
       prompt_value name "用户名称" "user-$(random_hex 2)"
       prompt_secret password "AnyTLS 密码" "$(random_password)"
-      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls}')"
+      protocol_build_anytls "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls"
       ;;
     vless)
       prompt_value name "用户名称" "user-$(random_hex 2)"
       uuid=$(generate_uuid)
       if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
-      local tls_arg=""
-      if [[ -z $tls ]]; then tls_arg="{}"; else tls_arg=$tls; fi
-      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls_arg" --argjson transport "$transport_json" '
-        {type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]} +
-        (if $tls!={} then {tls:$tls} else {} end) +
-        (if $transport!=null then {transport:$transport} else {} end)')"
+      protocol_build_vless "$__json" "$tag" "$listen" "$port" "$name" "$uuid" "$flow" "$tls" "$transport_json"
       ;;
     hysteria2)
       prompt_value name "用户名称" "user-$(random_hex 2)"
@@ -234,28 +147,18 @@ build_inbound() {
       prompt_optional_positive_int down "下行限制 Mbps（留空=不限）"
       choose obfs_choice "QUIC 混淆" "关闭" "Salamander"
       if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)"; fi
-      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --arg up "$up" --arg down "$down" --arg obfs "$obfs_password" --argjson tls "$tls" '
-        {type:"hysteria2",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} |
-        if $up!="" then .up_mbps=($up|tonumber) else . end |
-        if $down!="" then .down_mbps=($down|tonumber) else . end |
-        if $obfs!="" then .obfs={type:"salamander",password:$obfs} else . end')"
+      hy2_build "$__json" "$tag" "$listen" "$port" "$name" "$password" "$up" "$down" "$obfs_password" "$tls"
       ;;
     trojan)
       prompt_value name "用户名称" "user-$(random_hex 2)"
       prompt_secret password "Trojan 密码" "$(random_password)"
-      printf -v "$__json" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" --argjson transport "$transport_json" '
-        {type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} +
-        (if $transport!=null then {transport:$transport} else {} end)')"
+      protocol_build_trojan "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls" "$transport_json"
       ;;
     socks|http)
       prompt_optional name "用户名（留空=无认证）"
       if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)"; fi
-      if [[ -n $name ]]; then
-        printf -v "$__json" '%s' "$(jq -n --arg type "$type" --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg user "$name" --arg pass "$password" '{type:$type,tag:$tag,listen:$listen,listen_port:$port,users:[{username:$user,password:$pass}]}')"
-      else
-        [[ $listen == 127.0.0.1 || $listen == ::1 ]] || warn "公网无认证代理风险很高。"
-        printf -v "$__json" '%s' "$(jq -n --arg type "$type" --arg tag "$tag" --arg listen "$listen" --argjson port "$port" '{type:$type,tag:$tag,listen:$listen,listen_port:$port,users:[]}')"
-      fi
+      [[ -n $name || $listen == 127.0.0.1 || $listen == ::1 ]] || warn "公网无认证代理风险很高。"
+      protocol_build_proxy "$__json" "$type" "$tag" "$listen" "$port" "$name" "$password"
       ;;
   esac
   printf -v "$__host" '%s' "$client_host"

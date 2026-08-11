@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 bash -n src/certificate/cloudflare.sh
-bash -n src/certificate/environment.sh
+bash -n src/certificate/certbot.sh
 
 ! grep -Fq "'cloudflare<3'" src/certificate/cloudflare.sh
 ! grep -Fq -- '--no-deps' src/certificate/cloudflare.sh
