@@ -47,14 +47,14 @@ hy2_hop_check_conflicts 26001-27000
 
 touch "$XRAYCTL_BBR_CONFIG"
 [[ $(bbr_manager) == xrayctl ]]
-! disable_bbr >/dev/null 2>&1
-enable_bbr >/dev/null
-[[ ! -e $SBCTL_BBR_CONFIG ]]
-
 printf '# managed by sbctl\nnet.ipv4.tcp_congestion_control=bbr\n' >"$SBCTL_BBR_CONFIG"
 [[ $(bbr_manager) == both ]]
-rm -f "$XRAYCTL_BBR_CONFIG"
-[[ $(bbr_manager) == sbctl ]]
+external_bbr="$TMP/third-party-bbr.conf"
+touch "$external_bbr"
+bbr_remove_known_persistence
+[[ ! -e $SBCTL_BBR_CONFIG && ! -e $XRAYCTL_BBR_CONFIG ]]
+[[ -e $external_bbr ]]
+! declare -f disable_bbr | grep -Fq '拒绝关闭'
 
 mkdir -p "$CERTBOT_VENV/bin"
 cat >"$CERTBOT_BIN" <<'SH'

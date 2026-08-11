@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.1"
+readonly SBCTL_VERSION="0.4.2"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"

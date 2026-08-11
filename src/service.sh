@@ -16,25 +16,15 @@ bbr_manager() {
   if [[ $current == bbr ]]; then printf 'external'; else printf 'none'; fi
 }
 
+bbr_remove_known_persistence() {
+  rm -f -- "$SBCTL_BBR_CONFIG" "$XRAYCTL_BBR_CONFIG"
+  meta_resource_remove bbrConfig
+}
+
 enable_bbr() {
   ensure_dependencies bbr
   command_exists sysctl || die "缺少 sysctl。"
-  local config=$SBCTL_BBR_CONFIG qdisc_ok=0 available manager
-  manager=$(bbr_manager)
-  case $manager in
-    xrayctl)
-      info "BBR 已由 xrayctl 管理；sbctl 不会创建重复配置。"
-      return 0
-      ;;
-    both)
-      warn "同时检测到 sbctl 与 xrayctl 的 BBR 配置，请先保留一个管理方。"
-      return 1
-      ;;
-    external)
-      warn "BBR 已由其他系统配置启用；sbctl 不会接管。"
-      return 1
-      ;;
-  esac
+  local config=$SBCTL_BBR_CONFIG qdisc_ok=0 available
   if [[ -e $config ]] && ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
     warn "检测到非 sbctl 管理的 BBR 配置，拒绝覆盖：$config"
     return 1
@@ -49,6 +39,7 @@ enable_bbr() {
     return 0
   fi
   mkdir -p /etc/sysctl.d
+  rm -f -- "$XRAYCTL_BBR_CONFIG"
   {
     printf '# managed by sbctl\n'
     ((qdisc_ok)) && printf 'net.core.default_qdisc=fq\n'
@@ -61,29 +52,11 @@ enable_bbr() {
 disable_bbr() {
   ensure_dependencies bbr-disable
   command_exists sysctl || die "缺少 sysctl。"
-  local config=$SBCTL_BBR_CONFIG available fallback="" current="" manager
-  manager=$(bbr_manager)
-  case $manager in
-    xrayctl)
-      warn "BBR 由 xrayctl 管理，sbctl 拒绝关闭全局拥塞控制。"
-      return 1
-      ;;
-    both)
-      if grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
-      meta_resource_remove bbrConfig
-      info "已移除重复的 sbctl BBR 配置；BBR 继续由 xrayctl 管理。"
-      return 0
-      ;;
-    external)
-      warn "BBR 不是由 sbctl 管理，拒绝关闭全局拥塞控制。"
-      return 1
-      ;;
-  esac
+  local available fallback="" current=""
   current=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
   if [[ $current != bbr ]]; then
-    if [[ -f $config ]] && grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
-    meta_resource_remove bbrConfig
-    info "BBR 当前未启用。"
+    bbr_remove_known_persistence
+    info "BBR 当前未启用；已清理 xrayctl/sbctl 的已知持久化配置。"
     return 0
   fi
   [[ -w /proc/sys/net/ipv4/tcp_congestion_control ]] || { warn "当前环境不允许修改拥塞控制参数。"; return 0; }
@@ -95,8 +68,7 @@ disable_bbr() {
   run_bounded 5 sysctl -w net.ipv4.tcp_congestion_control="$fallback" >/dev/null 2>&1 \
     || { warn "恢复拥塞控制算法失败。"; return 1; }
   if [[ -e /proc/sys/net/core/default_qdisc ]]; then run_bounded 5 sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true; fi
-  if [[ -f $config ]] && grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
-  meta_resource_remove bbrConfig
+  bbr_remove_known_persistence
   info "BBR 已关闭；当前拥塞控制算法：${fallback}。"
 }
 # Canonical _remove_bbr_settings lives in uninstall.sh
@@ -132,7 +104,7 @@ system_diagnostics() {
   printf '公网 IPv4: %s\n' "${v4:-未检测到}"
   printf '公网 IPv6: %s\n' "${v6:-未检测到}"
   printf 'BBR: %s\n' "$(bbr_state_summary)"
-  printf 'BBR 管理方: %s\n' "$(bbr_manager)"
+  printf 'BBR 持久化来源: %s\n' "$(bbr_manager)"
   if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
     printf 'xrayctl 共存: 已检测到（Xray 入站 %s）\n' "$(jq '.inbounds|length' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || printf '?')"
   else
@@ -150,7 +122,7 @@ system_diagnostics() {
 
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用（%s 管理）' "$(bbr_manager)" || printf '未启用'
+    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'
   else
     printf '不可用'
   fi
