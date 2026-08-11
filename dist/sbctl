@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.4"
+readonly SBCTL_VERSION="0.4.5"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
@@ -22,7 +22,6 @@ QUICK_SYMLINK="${SBCTL_SYMLINK_PATH:-/usr/local/bin/sbctl}"
 SERVICE_NAME="${SBCTL_SERVICE_NAME:-sing-box}"
 LOCK_FILE="${SBCTL_LOCK_FILE:-/run/lock/sbctl.lock}"
 DATA_DIR="${SBCTL_DATA_DIR:-/var/lib/sing-box}"
-XRAYCTL_CONFIG_FILE="${SBCTL_XRAYCTL_CONFIG_FILE:-/usr/local/etc/xray/config.json}"
 SBCTL_BBR_CONFIG="${SBCTL_BBR_CONFIG:-/etc/sysctl.d/99-sbctl-bbr.conf}"
 XRAYCTL_BBR_CONFIG="${SBCTL_XRAYCTL_BBR_CONFIG:-/etc/sysctl.d/99-xrayctl-bbr.conf}"
 SYSTEMD_UNIT_DIR="${SBCTL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
@@ -1166,7 +1165,6 @@ hy2_internal_port_available() {
   validate_port "$port" || return 1
   hy2_port_in_range "$port" "$range" && return 1
   port_in_config "$port" && return 1
-  port_in_xrayctl_config "$port" && return 1
   port_in_use_os "$port" && return 1
 }
 
@@ -1193,7 +1191,6 @@ prompt_hy2_internal_port() {
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
     port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
-    port_in_xrayctl_config "$value" && { warn "该端口已被 xrayctl/Xray 入站使用。"; continue; }
     port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
     printf -v "$__var" '%s' "$value"; return 0
   done
@@ -1209,7 +1206,7 @@ hy2_build() {
 }
 
 hy2_hop_check_conflicts() {
-  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end peer_port
+  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
   new_start=${range%-*}; new_end=${range#*-}
   init_meta
   while IFS=$'\t' read -r tag existing; do
@@ -1222,15 +1219,6 @@ hy2_hop_check_conflicts() {
       return 1
     fi
   done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
-  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
-    while IFS= read -r peer_port; do
-      validate_port "$peer_port" || continue
-      if ((10#$peer_port >= 10#$new_start && 10#$peer_port <= 10#$new_end)); then
-        warn "端口跳跃范围包含 xrayctl/Xray 入站端口 ${peer_port}，请重新选择。"
-        return 1
-      fi
-    done < <(jq -r '.inbounds[]?.port // empty' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || true)
-  fi
   return 0
 }
 
@@ -1473,13 +1461,6 @@ port_in_use_os() {
   elif command_exists netstat; then netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"
   else return 1; fi
 }
-port_in_xrayctl_config() {
-  local port=$1
-  validate_port "$port" || return 1
-  [[ -r $XRAYCTL_CONFIG_FILE ]] || return 1
-  jq -e --argjson port "$port" '.inbounds[]? | select(.port==$port)' "$XRAYCTL_CONFIG_FILE" >/dev/null 2>&1
-}
-
 prompt_tag() {
   local __var=$1 default=$2 value
   while true; do
@@ -1496,7 +1477,6 @@ _random_port_avoiding_hops() {
     candidate=$((10000 + (16#$hex % 55536)))
     hy2_port_in_any_hop_range "$candidate" && continue
     port_in_config "$candidate" && continue
-    port_in_xrayctl_config "$candidate" && continue
     port_in_use_os "$candidate" && continue
     printf '%s' "$candidate"; return 0
   done
@@ -1504,13 +1484,16 @@ _random_port_avoiding_hops() {
 }
 
 prompt_port() {
-  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value
+  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value current_port=""
   while true; do
     prompt_value value "监听端口" "$default"
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
-    port_in_xrayctl_config "$value" && { warn "该端口已被 xrayctl/Xray 入站使用。"; continue; }
-    if port_in_use_os "$value" && [[ -z $except ]]; then confirm "系统检测到端口 ${value} 已占用，仍继续？" N || continue; fi
+    [[ -z $except ]] || current_port=$(jq -r --arg tag "$except" '.inbounds[]?|select(.tag==$tag)|.listen_port // empty' "$CONFIG_FILE")
+    if port_in_use_os "$value" && ! { [[ -n $except && $value == "$current_port" ]] && service_is_active; }; then
+      warn "系统检测到端口 ${value} 已被占用，请换一个端口。"
+      continue
+    fi
     printf -v "$__var" '%s' "$value"; return
   done
 }
@@ -3411,11 +3394,6 @@ system_diagnostics() {
   printf '公网 IPv6: %s\n' "${v6:-未检测到}"
   printf 'BBR: %s\n' "$(bbr_state_summary)"
   printf 'BBR 持久化来源: %s\n' "$(bbr_manager)"
-  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
-    printf 'xrayctl 共存: 已检测到（Xray 入站 %s）\n' "$(jq '.inbounds|length' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || printf '?')"
-  else
-    printf 'xrayctl 共存: 未检测到配置\n'
-  fi
   printf '配置: %s\n' "$CONFIG_FILE"
   printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
   printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"
