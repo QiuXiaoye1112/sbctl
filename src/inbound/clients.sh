@@ -144,7 +144,7 @@ rename_client() {
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
-  if [[ -z $old ]]; then list_clients "$tag"; select_client old "$tag" || return 0; fi
+  if [[ -z $old ]]; then select_client old "$tag" || return 0; fi
   client_exists "$tag" "$old" || die "找不到用户：$old"
   if [[ -z $new ]]; then prompt_value new "新用户名称" "$old"; fi
   [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
