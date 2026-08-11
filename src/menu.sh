@@ -296,7 +296,7 @@ sbctl - sing-box Linux 管理器
   - 公网 IP 证书使用 Certbot 5.4+ short-lived profile + HTTP 验证。
   - Certbot 使用 /opt/sbctl/certbot 独立环境，不污染系统 Certbot。
 
-支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP、Mixed
+支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP
 出站: SOCKS5/HTTP 代理、本地出口
 EOF_HELP
 }

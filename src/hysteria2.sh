@@ -127,8 +127,8 @@ EOF_UNIT
 #!/sbin/openrc-run
 name="sbctl-hy2-hop-restore"
 description="Restore sbctl Hysteria2 port hopping NAT rules"
-depend() { need net; }
-start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }
+$(printf '%s' 'depend() { need net; }')
+$(printf '%s' 'start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }')
 EOF_RC
       chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
       rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || true

@@ -8,12 +8,12 @@ bash -n sbctl.sh
 bash -n install.sh
 sh -n alpine/install.sh
 
-grep -q '^build_inbound()' lib/inbound.sh
-grep -q '^restore_backup()' lib/ops.sh
-grep -q '^build_reality_tls()' lib/inbound.sh
-grep -q '"AnyTLS" "VLESS" "Hysteria2" "Trojan"' lib/inbound.sh
+grep -q '^build_inbound()' src/inbound/core.sh
+grep -q '^restore_backup()' src/state_backup.sh
+grep -q '^build_reality_tls()' src/inbound/core.sh
+grep -q '"AnyTLS" "VLESS" "Hysteria2" "Trojan"' src/inbound/core.sh
 grep -q 'META_FILE="${SBCTL_META_FILE:-/var/lib/sbctl/meta.json}"' sbctl.sh
-grep -q -- '-c ${CONFIG_FILE}' lib/engine.sh
+grep -q -- '-c ${CONFIG_FILE}' src/state.sh
 
 MOCK=$(mktemp -d)
 trap 'rm -rf "$MOCK"' EXIT

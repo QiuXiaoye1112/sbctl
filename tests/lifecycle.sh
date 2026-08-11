@@ -5,10 +5,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 bash -n sbctl.sh
-bash -n lib/certmeta.sh
-bash -n lib/certops.sh
-bash -n lib/uninstall.sh
-bash -n lib/menu.sh
+bash -n src/certificate/metadata.sh
+bash -n src/certificate/lifecycle.sh
+bash -n src/uninstall.sh
+bash -n src/menu.sh
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

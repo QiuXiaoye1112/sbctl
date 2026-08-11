@@ -4,16 +4,16 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-bash -n lib/certificate.sh
-bash -n lib/protocols.sh
-bash -n lib/share.sh
-bash -n lib/inbound.sh
+bash -n src/certificate/core.sh
+bash -n src/protocols.sh
+bash -n src/share.sh
+bash -n src/inbound/core.sh
 
 # build_inbound now lives canonically in inbound.sh
-grep -Fq 'choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"' lib/inbound.sh
-grep -Fq '"Mixed(SOCKS+HTTP)"' lib/inbound.sh
-grep -Fq 'anytls://' lib/share.sh
-grep -Fq 'confirm "使用托管证书？" Y' lib/certificate.sh
-grep -Fq 'choose answer "选择 TLS serverName/SNI"' lib/certificate.sh
+grep -Fq 'choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"' src/inbound/core.sh
+! grep -Fq 'mixed)' src/inbound/core.sh
+grep -Fq 'anytls://' src/share.sh
+grep -Fq 'confirm "使用托管证书？" Y' src/certificate/core.sh
+grep -Fq 'choose answer "选择 TLS serverName/SNI"' src/certificate/core.sh
 
 printf 'protocol surface checks passed.\n'

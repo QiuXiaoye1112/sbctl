@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export SBCTL_TESTING=1
-export SBCTL_LIB_DIR="$ROOT/lib"
+export SBCTL_SRC_DIR="$ROOT/src"
 # shellcheck disable=SC1090
 source "$ROOT/sbctl.sh"
 

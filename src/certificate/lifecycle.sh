@@ -7,51 +7,8 @@ validate_certificate_identifier() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
 
 certbot_supports_ip() { [[ -x $CERTBOT_BIN ]] && "$CERTBOT_BIN" --help all 2>/dev/null | grep -q -- '--ip-address'; }
 
-certbot_cmd() {
-  "$CERTBOT_BIN" --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" --logs-dir "$CERTBOT_LOGS_DIR" "$@"
-}
-
 certbot_nginx_available() {
   [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_nginx' >/dev/null 2>&1
-}
-
-ensure_certbot_environment() {
-  local manager need_install=0
-  if [[ ! -x $CERTBOT_BIN ]] || ! certbot_supports_ip || ! certbot_nginx_available; then need_install=1; fi
-  if ((need_install)); then
-    manager=$(pkg_manager) || die "无法准备 Certbot 环境：未知包管理器。"
-    info "正在准备 sbctl 独立 Certbot 环境。"
-    case $manager in
-      apt) install_packages python3 python3-venv;;
-      apk) install_packages python3 py3-pip py3-virtualenv;;
-      dnf|yum) install_packages python3 python3-pip;;
-      pacman) install_packages python python-pip;;
-      zypper) install_packages python3 python3-pip;;
-    esac || die "Python/venv 安装失败。"
-    install -d -m 755 "$(dirname "$CERTBOT_VENV")"
-    if [[ ! -x $CERTBOT_VENV/bin/python ]]; then
-      if ! run_bounded 120 python3 -m venv "$CERTBOT_VENV" 2>/dev/null; then
-        run_bounded 120 python3 -m venv --without-pip "$CERTBOT_VENV" || die "无法创建 Certbot venv。"
-        local bootstrap
-        bootstrap=$(temp_file)
-        curl --fail --location --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 15 --max-time 60 \
-          https://bootstrap.pypa.io/get-pip.py -o "$bootstrap" || { rm -f "$bootstrap"; die "下载 pip 引导脚本失败。"; }
-        _cert_run_bounded 120 "$CERTBOT_VENV/bin/python" "$bootstrap" --disable-pip-version-check \
-          || { rm -f "$bootstrap"; die "pip 引导安装失败。"; }
-        rm -f "$bootstrap"
-      fi
-    fi
-    [[ -x $CERTBOT_VENV/bin/pip ]] || die "Certbot venv 缺少 pip，无法修复环境。"
-    run_bounded 180 "$CERTBOT_VENV/bin/pip" install --disable-pip-version-check --timeout 20 --retries 2 \
-      --upgrade 'certbot>=5.4' certbot-nginx >/dev/null || die "Certbot 安装失败。"
-  fi
-  certbot_supports_ip || die "当前 Certbot 不支持公网 IP 证书（需要 Certbot 5.4+）。"
-  certbot_nginx_available || die "Certbot nginx 插件不可用，请重新准备证书环境。"
-  mkdir -p "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR"
-  meta_resource_register certbotVenv "$CERTBOT_VENV"
-  meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
-  meta_resource_register certbotWorkDir "$CERTBOT_WORK_DIR"
-  meta_resource_register certbotLogsDir "$CERTBOT_LOGS_DIR"
 }
 
 install_certbot() { ensure_certbot_environment; }

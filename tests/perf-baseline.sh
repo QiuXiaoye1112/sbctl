@@ -208,7 +208,7 @@ echo '  ok   sbctl.sh == install.sh == alpine/install.sh'
 # 9. declare -f overrides
 # ========================================================================
 echo "--- declare -f ---"
-grep -rn 'declare -f' lib/ sbctl.sh 2>/dev/null && { echo '  FAIL' >&2; ((failures+=1)); } || echo '  ok   zero'
+grep -rn 'declare -f' src/ sbctl.sh 2>/dev/null && { echo '  FAIL' >&2; ((failures+=1)); } || echo '  ok   zero'
 
 # ========================================================================
 # 10. Cache directory lifecycle

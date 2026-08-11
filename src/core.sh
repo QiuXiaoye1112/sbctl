@@ -283,18 +283,6 @@ apt_ipv4_available() {
   ((available == 1))
 }
 
-apt_get_guarded() {
-  local total_timeout=${SBCTL_APT_TIMEOUT:-180}
-  local apt_options=(
-    -o Acquire::Retries=2
-    -o Acquire::http::Timeout=15
-    -o Acquire::https::Timeout=15
-    -o Dpkg::Use-Pty=0
-  )
-  apt_ipv4_available && apt_options+=(-o Acquire::ForceIPv4=true)
-  run_bounded "$total_timeout" apt-get "${apt_options[@]}" "$@"
-}
-
 # ---- package manager (no cache — pkg_manager is cached in cache.sh) ----
 install_packages() {
   local manager

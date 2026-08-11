@@ -4,12 +4,12 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-bash -n lib/cloudflare.sh
-bash -n lib/cert_guard.sh
+bash -n src/certificate/cloudflare.sh
+bash -n src/certificate/environment.sh
 
-! grep -Fq "'cloudflare<3'" lib/cloudflare.sh
-! grep -Fq -- '--no-deps' lib/cloudflare.sh
-grep -Fq 'certbot-dns-cloudflare==${certbot_version}' lib/cloudflare.sh
+! grep -Fq "'cloudflare<3'" src/certificate/cloudflare.sh
+! grep -Fq -- '--no-deps' src/certificate/cloudflare.sh
+grep -Fq 'certbot-dns-cloudflare==${certbot_version}' src/certificate/cloudflare.sh
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

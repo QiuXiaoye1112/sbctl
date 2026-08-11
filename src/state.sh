@@ -189,7 +189,7 @@ respawn_max=0
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.log"
 umask 077
-depend() { need net; }
+$(printf '%s' 'depend() { need net; }')
 EOF_RC
       chmod 755 "${OPENRC_INIT_DIR}/$SERVICE_NAME"
       meta_resource_register serviceDefinition "${OPENRC_INIT_DIR}/${SERVICE_NAME}"

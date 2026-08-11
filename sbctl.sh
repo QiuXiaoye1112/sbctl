@@ -32,23 +32,26 @@ CERTBOT_LOGS_DIR="${SBCTL_CERTBOT_LOGS_DIR:-/var/log/sbctl/certbot}"
 CERT_STOPPED_SERVICE=0
 APT_IPV4_AVAILABLE_CACHE=""
 
-SBCTL_ENTRYPOINT="${SBCTL_ENTRYPOINT:-$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")}"
-_repo_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/lib"
-if [[ -n ${SBCTL_LIB_DIR:-} ]]; then
-  LIB_DIR=$SBCTL_LIB_DIR
-elif [[ -d $_repo_lib ]]; then
-  LIB_DIR=$_repo_lib
-else
-  LIB_DIR=/usr/local/lib/sbctl
+if [[ -z ${SBCTL_ENTRYPOINT:-} ]]; then
+  SBCTL_ENTRYPOINT=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 fi
-unset _repo_lib
+_repo_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/src"
+SRC_DIR="${SBCTL_SRC_DIR:-$_repo_src}"
+LIB_DIR="${SBCTL_LIB_DIR:-/usr/local/lib/sbctl}"
+unset _repo_src
 
-# Module loading order: base lifecycle first, then late guard modules that harden
-# package/network and Certbot environment behavior without duplicating business logic.
-for _module in cache core ui engine compat certmeta inbound certificate reality outbound clients share ops certops cloudflare cert_guard hy2_hop hy2_create hy2_nft network_guard protocols system_guard management menu uninstall; do
-  [[ -r "$LIB_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$LIB_DIR/${_module}.sh" >&2; exit 1; }
+# Centralized dependency order. Source modules never source one another.
+for _module in \
+  platform core ui platform_network \
+  state_migrations state \
+  certificate/metadata certificate/core security \
+  outbound inbound/core inbound/clients share state_backup \
+  certificate/lifecycle certificate/cloudflare certificate/environment \
+  hysteria2 hysteria2_network protocols service management menu uninstall
+do
+  [[ -r "$SRC_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$SRC_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
-  source "$LIB_DIR/${_module}.sh"
+  source "$SRC_DIR/${_module}.sh"
 done
 unset _module
 
