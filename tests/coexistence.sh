@@ -12,25 +12,17 @@ export SBCTL_CONFIG_FILE="$SBCTL_CONFIG_DIR/config.json"
 export SBCTL_META_FILE="$TMP/sbctl-meta.json"
 export SBCTL_CERT_DIR="$SBCTL_CONFIG_DIR/certs"
 export SBCTL_LOCK_FILE="$TMP/sbctl.lock"
-export SBCTL_XRAYCTL_CONFIG_FILE="$TMP/xray/config.json"
 export SBCTL_BBR_CONFIG="$TMP/99-sbctl-bbr.conf"
 export SBCTL_XRAYCTL_BBR_CONFIG="$TMP/99-xrayctl-bbr.conf"
 export SBCTL_CERTBOT_VENV="$TMP/certbot-venv"
 export SBCTL_CERTBOT_SHARED_LOCK="$TMP/certbot.lock"
 export SBCTL_CERTBOT_SHARED_LOCK_WAIT=0
 
-mkdir -p "$(dirname "$SBCTL_XRAYCTL_CONFIG_FILE")"
-cat >"$SBCTL_XRAYCTL_CONFIG_FILE" <<'JSON'
-{"inbounds":[{"tag":"peer","port":25001,"protocol":"vless"}]}
-JSON
-
 source ./sbctl.sh
 write_default_config
 ensure_dependencies() { :; }
-port_in_use_os() { return 1; }
-
-port_in_xrayctl_config 25001
-! port_in_xrayctl_config 25002
+port_in_use_os() { [[ $1 == 25001 ]]; }
+! declare -F port_in_xrayctl_config >/dev/null
 
 prompt_values=(25001 25002)
 prompt_index=0
@@ -42,7 +34,7 @@ selected=""
 prompt_port selected 25001
 [[ $selected == 25002 ]]
 
-! hy2_hop_check_conflicts 24000-26000
+hy2_hop_check_conflicts 24000-26000
 hy2_hop_check_conflicts 26001-27000
 
 touch "$XRAYCTL_BBR_CONFIG"

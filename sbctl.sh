@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.4"
+readonly SBCTL_VERSION="0.4.5"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
@@ -22,7 +22,6 @@ QUICK_SYMLINK="${SBCTL_SYMLINK_PATH:-/usr/local/bin/sbctl}"
 SERVICE_NAME="${SBCTL_SERVICE_NAME:-sing-box}"
 LOCK_FILE="${SBCTL_LOCK_FILE:-/run/lock/sbctl.lock}"
 DATA_DIR="${SBCTL_DATA_DIR:-/var/lib/sing-box}"
-XRAYCTL_CONFIG_FILE="${SBCTL_XRAYCTL_CONFIG_FILE:-/usr/local/etc/xray/config.json}"
 SBCTL_BBR_CONFIG="${SBCTL_BBR_CONFIG:-/etc/sysctl.d/99-sbctl-bbr.conf}"
 XRAYCTL_BBR_CONFIG="${SBCTL_XRAYCTL_BBR_CONFIG:-/etc/sysctl.d/99-xrayctl-bbr.conf}"
 SYSTEMD_UNIT_DIR="${SBCTL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"

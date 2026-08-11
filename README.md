@@ -2,7 +2,7 @@
 
 `sbctl` 是面向 Linux 的 sing-box 终端管理器。交互思路参考 `xrayctl`，但配置、服务和协议实现均针对 sing-box。
 
-当前版本：`0.4.4`
+当前版本：`0.4.5`
 
 ## 支持环境
 
@@ -12,7 +12,7 @@
 
 ### 与 xrayctl 共存
 
-sbctl 可以与 xrayctl/Xray 同时安装。两者使用独立的命令、服务、配置、metadata、备份和 Certbot 环境。创建或修改 sing-box 入站时，sbctl 会读取现有 Xray 入站端口；创建 Hysteria2 端口跳跃范围时，也会拒绝覆盖任何 Xray 入站端口。
+sbctl 可以与 xrayctl/Xray 同时安装。两者使用独立的命令、服务、配置、metadata、备份和 Certbot 环境。创建或修改 sing-box 入站及 Hysteria2 内部监听端口时，sbctl 只依据自身配置和 `ss`/`netstat` 的实时监听结果避开端口，不读取 xrayctl 配置，也不为已停止的 Xray 服务预留端口。Hysteria2 自定义跳跃范围仍只检查 sbctl 自身范围是否重叠；双方约定由 Xray 自动端口避开默认范围 `30000-50000`。
 
 BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也都可以开启或关闭。关闭时会清理两者的已知持久化文件，避免重启后被另一份配置重新开启；第三方 sysctl 配置不会被修改。两套证书环境保持隔离，但 Certbot 操作会通过 `/run/lock/certbot.lock` 串行执行，避免同时操作 80 端口/nginx；同一个域名仍建议只交给一个工具自动签发和续期，避免重复申请。
 

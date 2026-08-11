@@ -105,11 +105,6 @@ system_diagnostics() {
   printf '公网 IPv6: %s\n' "${v6:-未检测到}"
   printf 'BBR: %s\n' "$(bbr_state_summary)"
   printf 'BBR 持久化来源: %s\n' "$(bbr_manager)"
-  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
-    printf 'xrayctl 共存: 已检测到（Xray 入站 %s）\n' "$(jq '.inbounds|length' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || printf '?')"
-  else
-    printf 'xrayctl 共存: 未检测到配置\n'
-  fi
   printf '配置: %s\n' "$CONFIG_FILE"
   printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
   printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"

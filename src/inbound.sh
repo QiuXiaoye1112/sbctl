@@ -10,13 +10,6 @@ port_in_use_os() {
   elif command_exists netstat; then netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"
   else return 1; fi
 }
-port_in_xrayctl_config() {
-  local port=$1
-  validate_port "$port" || return 1
-  [[ -r $XRAYCTL_CONFIG_FILE ]] || return 1
-  jq -e --argjson port "$port" '.inbounds[]? | select(.port==$port)' "$XRAYCTL_CONFIG_FILE" >/dev/null 2>&1
-}
-
 prompt_tag() {
   local __var=$1 default=$2 value
   while true; do
@@ -33,7 +26,6 @@ _random_port_avoiding_hops() {
     candidate=$((10000 + (16#$hex % 55536)))
     hy2_port_in_any_hop_range "$candidate" && continue
     port_in_config "$candidate" && continue
-    port_in_xrayctl_config "$candidate" && continue
     port_in_use_os "$candidate" && continue
     printf '%s' "$candidate"; return 0
   done
@@ -41,13 +33,16 @@ _random_port_avoiding_hops() {
 }
 
 prompt_port() {
-  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value
+  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value current_port=""
   while true; do
     prompt_value value "监听端口" "$default"
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
-    port_in_xrayctl_config "$value" && { warn "该端口已被 xrayctl/Xray 入站使用。"; continue; }
-    if port_in_use_os "$value" && [[ -z $except ]]; then confirm "系统检测到端口 ${value} 已占用，仍继续？" N || continue; fi
+    [[ -z $except ]] || current_port=$(jq -r --arg tag "$except" '.inbounds[]?|select(.tag==$tag)|.listen_port // empty' "$CONFIG_FILE")
+    if port_in_use_os "$value" && ! { [[ -n $except && $value == "$current_port" ]] && service_is_active; }; then
+      warn "系统检测到端口 ${value} 已被占用，请换一个端口。"
+      continue
+    fi
     printf -v "$__var" '%s' "$value"; return
   done
 }
