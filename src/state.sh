@@ -190,13 +190,15 @@ restore_backup() {
   if [[ -f $temp/${META_FILE#/} ]]; then cp -a "$temp/${META_FILE#/}" "$META_FILE"; else rm -f "$META_FILE"; fi
   init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
   [[ ! -d $temp/${CERT_DIR#/} ]] || cp -a "$temp/${CERT_DIR#/}/." "$CERT_DIR/"
-  if ! restart_service_checked; then
-    error "恢复后服务失败，正在整体回滚。"
+  if ! restart_service_checked || ! hy2_hop_sync; then
+    error "恢复后服务或 Hysteria2 端口跳跃规则失败，正在整体回滚。"
     cp -a "$snapshot/config.json" "$CONFIG_FILE"
     ((had_meta)) && cp -a "$snapshot/meta.json" "$META_FILE" || rm -f "$META_FILE"
     init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
     ((had_certs)) && cp -a "$snapshot/certs/." "$CERT_DIR/" || true
-    restart_service_checked || true; rm -rf "$temp"; die "恢复失败，已回滚 config/meta/certs。"
+    restart_service_checked || true
+    hy2_hop_sync || true
+    rm -rf "$temp"; die "恢复失败，已回滚 config/meta/certs 和端口跳跃规则。"
   fi
   local id source auto_renew cert_name warned=0
   while IFS= read -r id; do

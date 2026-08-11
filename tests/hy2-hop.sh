@@ -307,4 +307,47 @@ JSON
   [[ -z $(hy2_hop_range_for_tag hy2-mod) ]]
 '
 
+# ============================================================
+# Test 8: Backup restore synchronizes hopping rules
+# ============================================================
+SBCTL_TESTING=1 \
+SBCTL_SING_BOX_BIN="$TMP/t8/missing-sing-box" \
+SBCTL_CONFIG_DIR="$TMP/t8/cfg" \
+SBCTL_CONFIG_FILE="$TMP/t8/cfg/config.json" \
+SBCTL_META_FILE="$TMP/t8/meta.json" \
+SBCTL_CERT_DIR="$TMP/t8/cfg/certs" \
+SBCTL_BACKUP_DIR="$TMP/t8/backups" \
+SBCTL_LOCK_FILE="$TMP/t8/lock" \
+bash -c '
+  set -Eeuo pipefail
+  source ./sbctl.sh
+  ensure_dependencies() { :; }
+  restart_service_checked() { return 0; }
+  confirm() { return 0; }
+  write_default_config
+
+  candidate=$(temp_file)
+  jq '\''.inbounds=[{
+    type:"hysteria2",tag:"hy2-restored",listen:"127.0.0.1",listen_port:45555,
+    users:[{name:"u",password:"p"}],
+    tls:{enabled:true,server_name:"example.com",certificate_path:"/tmp/c.crt",key_path:"/tmp/c.key"}
+  }]'\'' "$CONFIG_FILE" >"$candidate"
+  mv "$candidate" "$CONFIG_FILE"
+  init_meta
+  hy2_hop_meta_set hy2-restored 20000-30000
+  backup="$SBCTL_BACKUP_DIR/restore.tar.gz"
+  backup_all "$backup" >/dev/null
+
+  candidate=$(temp_file)
+  jq '\''.inbounds=[]'\'' "$CONFIG_FILE" >"$candidate"
+  mv "$candidate" "$CONFIG_FILE"
+  hy2_hop_meta_disable hy2-restored
+
+  sync_count=0
+  hy2_hop_sync() { ((sync_count+=1)); }
+  restore_backup "$backup" >/dev/null
+  [[ $sync_count == 1 ]]
+  [[ $(hy2_hop_range_for_tag hy2-restored) == 20000-30000 ]]
+'
+
 printf 'hy2 hop tests passed.\n'
