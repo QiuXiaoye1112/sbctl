@@ -26,4 +26,35 @@ jq -e '.type=="hysteria2" and .up_mbps==100 and .down_mbps==200 and .obfs.type==
 protocol_capability vless reality
 ! protocol_capability hysteria2 reality
 
+# Hysteria2 without QUIC obfuscation must pass an initialized empty password.
+# Bash 5.2 treats an uninitialized `local` as unset under `set -u`, which used
+# to terminate the real interactive flow before hy2_build was called.
+choose() {
+  local __var=$1 prompt=$2
+  case $prompt in
+    "选择入站协议") printf -v "$__var" '%s' 3 ;;
+    "端口模式") printf -v "$__var" '%s' 1 ;;
+    "QUIC 混淆") printf -v "$__var" '%s' 1 ;;
+  esac
+}
+prompt_tag() { printf -v "$1" '%s' hy2-no-obfs; }
+prompt_value() {
+  local __var=$1 prompt=$2
+  case $prompt in
+    "监听地址") printf -v "$__var" '%s' 127.0.0.1 ;;
+    "用户名称") printf -v "$__var" '%s' alice ;;
+  esac
+}
+prompt_port() { printf -v "$1" '%s' 10443; }
+build_certificate_tls() {
+  printf -v "$1" '%s' '{"enabled":true,"server_name":"example.com","certificate_path":"/cert.crt","key_path":"/cert.key"}'
+  [[ -z ${2-} ]] || printf -v "$2" '%s' example.com
+}
+prompt_secret() { printf -v "$1" '%s' secret; }
+prompt_optional_positive_int() { printf -v "$1" '%s' ''; }
+
+inbound=''; host=''; public=''; hop=''
+build_inbound inbound host public hop
+jq -e '.type=="hysteria2" and (has("obfs")|not)' <<<"$inbound" >/dev/null
+
 printf 'protocol builder unit checks passed.\n'
