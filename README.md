@@ -2,13 +2,19 @@
 
 `sbctl` 是面向 Linux 的 sing-box 终端管理器。交互思路参考 `xrayctl`，但配置、服务和协议实现均针对 sing-box。
 
-当前版本：`0.4.0`
+当前版本：`0.4.1`
 
 ## 支持环境
 
 - systemd Linux：Debian、Ubuntu、RHEL 系、Arch、openSUSE 等
 - Alpine Linux / OpenRC
 - sing-box `1.12.0+`
+
+### 与 xrayctl 共存
+
+sbctl 可以与 xrayctl/Xray 同时安装。两者使用独立的命令、服务、配置、metadata、备份和 Certbot 环境。创建或修改 sing-box 入站时，sbctl 会读取现有 Xray 入站端口；创建 Hysteria2 端口跳跃范围时，也会拒绝覆盖任何 Xray 入站端口。
+
+BBR 是主机全局状态。若检测到 `/etc/sysctl.d/99-xrayctl-bbr.conf`，sbctl 不会创建重复配置，也不会关闭 xrayctl 管理的 BBR。两套证书环境保持隔离，但 Certbot 操作会通过 `/run/lock/xrayctl-sbctl-certbot.lock` 串行执行，避免同时操作 80 端口/nginx；同一个域名仍建议只交给一个工具自动签发和续期，避免重复申请。
 
 ## 主要能力
 

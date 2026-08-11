@@ -191,6 +191,40 @@ _certbot_exec() {
   "$CERTBOT_BIN" --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" --logs-dir "$CERTBOT_LOGS_DIR" "$@"
 }
 
+_certbot_shared_lock_acquire() {
+  local waited=0 owner="" lock=$CERTBOT_SHARED_LOCK parent
+  [[ ${lock##*/} == xrayctl-sbctl-certbot.lock ]] || { error "Certbot 共享锁路径不安全：${lock}"; return 1; }
+  [[ $CERTBOT_SHARED_LOCK_WAIT =~ ^[0-9]+$ ]] || { error "Certbot 共享锁等待时间无效。"; return 1; }
+  parent=${lock%/*}; [[ $parent == "$lock" ]] && parent=.
+  mkdir -p "$parent" || { warn "无法创建 Certbot 共享锁目录：${parent}"; return 1; }
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner=""
+    [[ -r $lock/pid ]] && IFS= read -r owner <"$lock/pid" || true
+    if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$lock/pid" "$lock/tool"
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
+    if ((waited >= CERTBOT_SHARED_LOCK_WAIT)); then
+      warn "另一个 xrayctl/sbctl Certbot 操作仍在运行，当前操作已取消。"
+      return 1
+    fi
+    sleep 1
+    ((waited+=1)) || true
+  done
+  chmod 700 "$lock" 2>/dev/null || true
+  printf '%s\n' "$$" >"$lock/pid"
+  printf 'sbctl\n' >"$lock/tool"
+}
+
+_certbot_shared_lock_release() {
+  local owner="" lock=$CERTBOT_SHARED_LOCK
+  [[ -r $lock/pid ]] && IFS= read -r owner <"$lock/pid" || true
+  [[ $owner == "$$" ]] || return 0
+  rm -f "$lock/pid" "$lock/tool"
+  rmdir "$lock" 2>/dev/null || true
+}
+
 _certbot_arg_value() {
   local wanted=$1; shift
   while (($#)); do
@@ -209,7 +243,7 @@ _certbot_renewal_authenticator() {
 # Keep certops.sh's public command surface, but self-heal the nginx plugin before
 # an unattended renewal whose lineage explicitly records the nginx authenticator.
 certbot_cmd() {
-  local cert_name="" authenticator=""
+  local cert_name="" authenticator="" rc=0
   if [[ ${1:-} == renew ]]; then
     cert_name=$(_certbot_arg_value --cert-name "$@" 2>/dev/null || true)
     if [[ -n $cert_name ]]; then
@@ -219,5 +253,8 @@ certbot_cmd() {
       fi
     fi
   fi
-  _certbot_exec "$@"
+  _certbot_shared_lock_acquire || return 1
+  _certbot_exec "$@" || rc=$?
+  _certbot_shared_lock_release
+  return "$rc"
 }

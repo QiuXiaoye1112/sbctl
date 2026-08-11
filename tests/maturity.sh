@@ -52,7 +52,7 @@ ensure_dependencies() { :; }
 sing_box_installed() { return 1; }
 
 write_default_config
-[[ $SBCTL_VERSION == 0.4.0 ]]
+[[ $SBCTL_VERSION == 0.4.1 ]]
 
 # Generated service definitions should include explicit sbctl hardening.
 create_service_definition

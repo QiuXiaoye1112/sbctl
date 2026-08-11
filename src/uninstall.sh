@@ -125,7 +125,16 @@ _remove_config_and_metadata() {
 }
 
 _remove_bbr_settings() {
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback=""
+  local config=$SBCTL_BBR_CONFIG available fallback=""
+  if [[ -f $XRAYCTL_BBR_CONFIG ]]; then
+    if grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
+    info "检测到 xrayctl 管理 BBR；仅移除 sbctl 自有配置，保留全局 BBR。"
+    return 0
+  fi
+  if ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
+    info "BBR 不由 sbctl 管理；保留全局拥塞控制设置。"
+    return 0
+  fi
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control && $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then
     available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
     if grep -qw cubic <<<"$available"; then fallback=cubic; elif grep -qw reno <<<"$available"; then fallback=reno; fi

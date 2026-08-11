@@ -2,10 +2,39 @@
 # BBR safety, diagnostics and residual scanning.
 # Service definition lives in engine.sh (canonical, hardened version).
 
+bbr_manager() {
+  local own=0 peer=0 unknown=0 current=""
+  if [[ -f $SBCTL_BBR_CONFIG ]]; then
+    if grep -q '^# managed by sbctl$' "$SBCTL_BBR_CONFIG" 2>/dev/null; then own=1; else unknown=1; fi
+  fi
+  [[ -f $XRAYCTL_BBR_CONFIG ]] && peer=1
+  if ((peer && (own || unknown))); then printf 'both'; return; fi
+  if ((own)); then printf 'sbctl'; return; fi
+  if ((peer)); then printf 'xrayctl'; return; fi
+  if ((unknown)); then printf 'external'; return; fi
+  [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && current=$(< /proc/sys/net/ipv4/tcp_congestion_control)
+  if [[ $current == bbr ]]; then printf 'external'; else printf 'none'; fi
+}
+
 enable_bbr() {
   ensure_dependencies bbr
   command_exists sysctl || die "缺少 sysctl。"
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf qdisc_ok=0 available
+  local config=$SBCTL_BBR_CONFIG qdisc_ok=0 available manager
+  manager=$(bbr_manager)
+  case $manager in
+    xrayctl)
+      info "BBR 已由 xrayctl 管理；sbctl 不会创建重复配置。"
+      return 0
+      ;;
+    both)
+      warn "同时检测到 sbctl 与 xrayctl 的 BBR 配置，请先保留一个管理方。"
+      return 1
+      ;;
+    external)
+      warn "BBR 已由其他系统配置启用；sbctl 不会接管。"
+      return 1
+      ;;
+  esac
   if [[ -e $config ]] && ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
     warn "检测到非 sbctl 管理的 BBR 配置，拒绝覆盖：$config"
     return 1
@@ -32,7 +61,24 @@ enable_bbr() {
 disable_bbr() {
   ensure_dependencies bbr-disable
   command_exists sysctl || die "缺少 sysctl。"
-  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback="" current=""
+  local config=$SBCTL_BBR_CONFIG available fallback="" current="" manager
+  manager=$(bbr_manager)
+  case $manager in
+    xrayctl)
+      warn "BBR 由 xrayctl 管理，sbctl 拒绝关闭全局拥塞控制。"
+      return 1
+      ;;
+    both)
+      if grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
+      meta_resource_remove bbrConfig
+      info "已移除重复的 sbctl BBR 配置；BBR 继续由 xrayctl 管理。"
+      return 0
+      ;;
+    external)
+      warn "BBR 不是由 sbctl 管理，拒绝关闭全局拥塞控制。"
+      return 1
+      ;;
+  esac
   current=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
   if [[ $current != bbr ]]; then
     if [[ -f $config ]] && grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
@@ -86,6 +132,12 @@ system_diagnostics() {
   printf '公网 IPv4: %s\n' "${v4:-未检测到}"
   printf '公网 IPv6: %s\n' "${v6:-未检测到}"
   printf 'BBR: %s\n' "$(bbr_state_summary)"
+  printf 'BBR 管理方: %s\n' "$(bbr_manager)"
+  if [[ -r $XRAYCTL_CONFIG_FILE ]]; then
+    printf 'xrayctl 共存: 已检测到（Xray 入站 %s）\n' "$(jq '.inbounds|length' "$XRAYCTL_CONFIG_FILE" 2>/dev/null || printf '?')"
+  else
+    printf 'xrayctl 共存: 未检测到配置\n'
+  fi
   printf '配置: %s\n' "$CONFIG_FILE"
   printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
   printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"
@@ -98,7 +150,7 @@ system_diagnostics() {
 
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'
+    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用（%s 管理）' "$(bbr_manager)" || printf '未启用'
   else
     printf '不可用'
   fi

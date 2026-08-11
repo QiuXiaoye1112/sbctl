@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.0"
+readonly SBCTL_VERSION="0.4.1"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
@@ -22,6 +22,9 @@ QUICK_SYMLINK="${SBCTL_SYMLINK_PATH:-/usr/local/bin/sbctl}"
 SERVICE_NAME="${SBCTL_SERVICE_NAME:-sing-box}"
 LOCK_FILE="${SBCTL_LOCK_FILE:-/run/lock/sbctl.lock}"
 DATA_DIR="${SBCTL_DATA_DIR:-/var/lib/sing-box}"
+XRAYCTL_CONFIG_FILE="${SBCTL_XRAYCTL_CONFIG_FILE:-/usr/local/etc/xray/config.json}"
+SBCTL_BBR_CONFIG="${SBCTL_BBR_CONFIG:-/etc/sysctl.d/99-sbctl-bbr.conf}"
+XRAYCTL_BBR_CONFIG="${SBCTL_XRAYCTL_BBR_CONFIG:-/etc/sysctl.d/99-xrayctl-bbr.conf}"
 SYSTEMD_UNIT_DIR="${SBCTL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 OPENRC_INIT_DIR="${SBCTL_OPENRC_INIT_DIR:-/etc/init.d}"
 CERTBOT_HOOK_DIR="${SBCTL_CERTBOT_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
@@ -30,6 +33,11 @@ CERTBOT_BIN="${SBCTL_CERTBOT_BIN:-${CERTBOT_VENV}/bin/certbot}"
 CERTBOT_CONFIG_DIR="${SBCTL_CERTBOT_CONFIG_DIR:-/var/lib/sbctl/letsencrypt}"
 CERTBOT_WORK_DIR="${SBCTL_CERTBOT_WORK_DIR:-/var/lib/sbctl/certbot-work}"
 CERTBOT_LOGS_DIR="${SBCTL_CERTBOT_LOGS_DIR:-/var/log/sbctl/certbot}"
+_default_certbot_shared_lock=/run/lock/xrayctl-sbctl-certbot.lock
+if [[ ${SBCTL_TESTING:-0} == 1 ]]; then _default_certbot_shared_lock="${LOCK_FILE%/*}/xrayctl-sbctl-certbot.lock"; fi
+CERTBOT_SHARED_LOCK="${SBCTL_CERTBOT_SHARED_LOCK:-$_default_certbot_shared_lock}"
+unset _default_certbot_shared_lock
+CERTBOT_SHARED_LOCK_WAIT="${SBCTL_CERTBOT_SHARED_LOCK_WAIT:-300}"
 CERT_STOPPED_SERVICE=0
 APT_IPV4_AVAILABLE_CACHE=""
 
