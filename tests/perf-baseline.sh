@@ -194,15 +194,14 @@ assert_eq "  sing-box execs (cache survived)" "$(count sing-box)" 1
 echo "  ok   cache intact after failed run_menu_action"
 
 # ========================================================================
-# 8. MODULES sync
+# 8. Standalone build is current
 # ========================================================================
-echo "--- MODULES sync ---"
-sbctl_mods=$(grep '^for _module in ' sbctl.sh | sed 's/.*for _module in //' | sed 's/; do//')
-install_mods=$(grep '^readonly MODULES=' install.sh | sed 's/readonly MODULES="//;s/"//')
-alpine_mods=$(grep '^MODULES=' alpine/install.sh | sed 's/MODULES="//;s/"//')
-[[ "$sbctl_mods" == "$install_mods" ]] || { echo '  FAIL sbctl.sh != install.sh' >&2; ((failures+=1)); }
-[[ "$sbctl_mods" == "$alpine_mods" ]] || { echo '  FAIL sbctl.sh != alpine/install.sh' >&2; ((failures+=1)); }
-echo '  ok   sbctl.sh == install.sh == alpine/install.sh'
+echo "--- standalone build ---"
+before=$(shasum -a 256 dist/sbctl | awk '{print $1}')
+bash scripts/build.sh >/dev/null
+after=$(shasum -a 256 dist/sbctl | awk '{print $1}')
+[[ $before == "$after" ]] || { echo '  FAIL dist/sbctl was stale' >&2; ((failures+=1)); }
+echo '  ok   dist/sbctl is reproducible'
 
 # ========================================================================
 # 9. declare -f overrides

@@ -6,8 +6,9 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SBCTL_VERSION="0.4.0"
+readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
-readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/sbctl.sh}"
+readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly OFFICIAL_INSTALLER_URL="https://sing-box.app/install.sh"
 
 SING_BOX_BIN="${SBCTL_SING_BOX_BIN:-$(command -v sing-box 2>/dev/null || printf /usr/local/bin/sing-box)}"
@@ -35,23 +36,39 @@ APT_IPV4_AVAILABLE_CACHE=""
 if [[ -z ${SBCTL_ENTRYPOINT:-} ]]; then
   SBCTL_ENTRYPOINT=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 fi
+LIB_DIR="${SBCTL_LIB_DIR:-/usr/local/lib/sbctl}"
+
+# BEGIN MODULE LOADER
 _repo_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/src"
 SRC_DIR="${SBCTL_SRC_DIR:-$_repo_src}"
-LIB_DIR="${SBCTL_LIB_DIR:-/usr/local/lib/sbctl}"
 unset _repo_src
 
 # Centralized dependency order. Source modules never source one another.
-for _module in \
-  platform core state \
-  certificate/core security \
-  outbound inbound inbound/clients share \
-  certificate/lifecycle certificate/cloudflare certificate/certbot \
-  hysteria2 protocols service menu uninstall
-do
+SBCTL_MODULES=(
+  "core"
+  "platform"
+  "state"
+  "certificate/core"
+  "security"
+  "protocols"
+  "hysteria2"
+  "inbound"
+  "inbound/clients"
+  "outbound"
+  "share"
+  "certificate/lifecycle"
+  "certificate/cloudflare"
+  "certificate/certbot"
+  "service"
+  "uninstall"
+  "menu"
+)
+for _module in "${SBCTL_MODULES[@]}"; do
   [[ -r "$SRC_DIR/${_module}.sh" ]] || { printf '[错误] 缺少 sbctl 模块: %s\n' "$SRC_DIR/${_module}.sh" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$SRC_DIR/${_module}.sh"
 done
-unset _module
+unset _module SBCTL_MODULES
+# END MODULE LOADER
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then dispatch "$@"; fi

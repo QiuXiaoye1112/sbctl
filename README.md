@@ -12,7 +12,7 @@
 
 ## 主要能力
 
-- AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP、Mixed 入站
+- AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP 入站
 - REALITY 与证书 TLS
 - 用户新增、重命名、删除和凭据轮换
 - SOCKS5 / HTTP / 本地地址出站与入站绑定
@@ -48,7 +48,7 @@ curl -fsSL https://github.com/QiuXiaoye1112/sbctl/raw/refs/heads/main/install.sh
 wget -qO- https://github.com/QiuXiaoye1112/sbctl/raw/refs/heads/main/alpine/install.sh | sh
 ```
 
-安装器会先解析 `main` 的精确 commit，并从同一个 commit 下载 `sbctl.sh` 与全部模块；所有文件下载和 Bash 语法校验完成后才覆盖当前安装，避免更新过程中出现主脚本与模块版本不一致。
+安装器只下载构建好的单文件 `dist/sbctl`，完成内容识别与 Bash 语法校验后才原子安装到 `/usr/local/sbin/sbctl`。服务器运行时不再依赖 `/usr/local/lib/sbctl/*.sh`，因此不会出现入口与模块版本不一致。
 
 安装完成后：
 
@@ -296,25 +296,41 @@ sbctl diagnose
 ## 项目结构
 
 ```text
-sbctl.sh                命令入口
-lib/core.sh              通用函数和服务抽象
-lib/certmeta.sh          schema 2 metadata 与资源归属
-lib/engine.sh            安装、配置校验和服务定义
-lib/inbound.sh           入站基础管理
-lib/outbound.sh          出站和路由绑定
-lib/certops.sh           证书签发/导入/续期/删除
-lib/cloudflare.sh        Cloudflare Global API Key 与 DNS 验证
-lib/uninstall.sh         三级卸载与安全清理
-lib/enhancements.sh      生命周期兼容扩展
-lib/network_guard.sh     包管理器、网络、Certbot 多账户与签发边界
-lib/state_guard.sh       config + metadata 事务与路由引用安全
-lib/system_guard.sh      systemd/OpenRC、BBR、诊断与残留安全
-install.sh               systemd Linux bootstrap
-alpine/install.sh        Alpine bootstrap
-tests/lifecycle.sh       证书/卸载生命周期测试
-tests/cloudflare.sh      Cloudflare 测试
-tests/maturity.sh        状态安全与成熟度回归测试
+sbctl.sh                         开发入口、路径初始化与集中模块加载
+src/core.sh                      日志、交互、validator、临时文件与表格输出
+src/platform.sh                  平台探测、包管理、网络和 systemd/OpenRC 抽象
+src/state.sh                     config/meta、migration、事务、备份与恢复
+src/security.sh                  TLS/REALITY 构造与密钥读取
+src/certificate/                 证书生命周期、Certbot 与 Cloudflare
+src/protocols.sh                 普通协议 capability 与 JSON builder
+src/hysteria2.sh                 Hysteria2 builder、端口跳跃与 nft/iptables
+src/inbound.sh                   入站生命周期
+src/inbound/clients.sh           入站用户 CRUD
+src/outbound.sh                  出站与路由绑定
+src/share.sh                     分享 URI / 客户端 JSON（只读）
+src/service.sh                   sing-box 安装、服务、BBR 与诊断
+src/uninstall.sh                 三级卸载与资源归属保护
+src/menu.sh                      菜单、CLI dispatch 与 help
+scripts/build.sh                 生成单文件 dist/sbctl
+scripts/lint.sh                  语法、ShellCheck 与 diff 校验
+scripts/test.sh                  可移植的单元/集成/冒烟安全网
+dist/sbctl                       服务器实际安装的单文件发行版
+install.sh                       通用 Linux bootstrap
+alpine/install.sh                Alpine bootstrap
+architecture-audit.md            重构前架构、重复函数与写入点审计
 ```
+
+模块依赖集中声明在 `sbctl.sh` 与 `scripts/build.sh`；`src/` 内模块不会自行 `source` 其他模块。正式函数名在整个 `src/` 中只能定义一次，architecture test 会在新增重复实现时直接失败。
+
+### 构建发行版
+
+```bash
+bash scripts/build.sh
+bash -n dist/sbctl
+SBCTL_TESTING=1 bash dist/sbctl version
+```
+
+构建顺序固定，`dist/sbctl` 完全来自当前工作树中的入口与领域源码。CI 会重新构建并要求生成结果与仓库中的发行版一致。
 
 ## 测试
 
@@ -329,6 +345,11 @@ GitHub Actions 会：
 本地常用：
 
 ```bash
+bash scripts/build.sh
+bash scripts/lint.sh
+bash scripts/test.sh
+
+# Linux 上的完整兼容回归
 SBCTL_TESTING=1 TERM=xterm bash tests/smoke-current.sh
 SBCTL_TESTING=1 TERM=xterm bash tests/lifecycle.sh
 SBCTL_TESTING=1 TERM=xterm bash tests/cloudflare.sh

@@ -5,12 +5,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 bash -n sbctl.sh
-bash -n lib/network_guard.sh lib/state_guard.sh lib/system_guard.sh
+bash -n src/platform.sh src/state.sh src/service.sh
 bash -n install.sh
 sh -n alpine/install.sh
-grep -Fq 'network_guard protocols system_guard menu uninstall' sbctl.sh
-grep -Fq 'commits/main' install.sh
-grep -Fq 'commits/main' alpine/install.sh
+grep -Fq '# BEGIN MODULE LOADER' sbctl.sh
+grep -Fq '/dist/sbctl' install.sh
+grep -Fq '/dist/sbctl' alpine/install.sh
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

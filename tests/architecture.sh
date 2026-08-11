@@ -8,6 +8,7 @@ MODULE_DIR=lib
 [[ ! -d src ]] || MODULE_DIR=src
 
 bash -n sbctl.sh install.sh "$MODULE_DIR"/*.sh "$MODULE_DIR"/*/*.sh tests/*.sh
+[[ ! -e dist/sbctl ]] || bash -n dist/sbctl
 sh -n alpine/install.sh
 
 if rg -n '^[[:space:]]*(source|\.)[[:space:]]+' "$MODULE_DIR"; then

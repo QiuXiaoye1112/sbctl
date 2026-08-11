@@ -1,0 +1,4224 @@
+#!/usr/bin/env bash
+# sbctl - sing-box Linux terminal manager
+# Inspired by xrayctl's interaction model, implemented for sing-box.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly SBCTL_VERSION="0.4.0"
+readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
+readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
+readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
+readonly OFFICIAL_INSTALLER_URL="https://sing-box.app/install.sh"
+
+SING_BOX_BIN="${SBCTL_SING_BOX_BIN:-$(command -v sing-box 2>/dev/null || printf /usr/local/bin/sing-box)}"
+CONFIG_DIR="${SBCTL_CONFIG_DIR:-/etc/sing-box}"
+CONFIG_FILE="${SBCTL_CONFIG_FILE:-${CONFIG_DIR}/config.json}"
+META_FILE="${SBCTL_META_FILE:-/var/lib/sbctl/meta.json}"
+CERT_DIR="${SBCTL_CERT_DIR:-${CONFIG_DIR}/certs}"
+BACKUP_DIR="${SBCTL_BACKUP_DIR:-/var/backups/sbctl}"
+QUICK_COMMAND="${SBCTL_COMMAND_PATH:-/usr/local/sbin/sbctl}"
+QUICK_SYMLINK="${SBCTL_SYMLINK_PATH:-/usr/local/bin/sbctl}"
+SERVICE_NAME="${SBCTL_SERVICE_NAME:-sing-box}"
+LOCK_FILE="${SBCTL_LOCK_FILE:-/run/lock/sbctl.lock}"
+DATA_DIR="${SBCTL_DATA_DIR:-/var/lib/sing-box}"
+SYSTEMD_UNIT_DIR="${SBCTL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+OPENRC_INIT_DIR="${SBCTL_OPENRC_INIT_DIR:-/etc/init.d}"
+CERTBOT_HOOK_DIR="${SBCTL_CERTBOT_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
+CERTBOT_VENV="${SBCTL_CERTBOT_VENV:-/opt/sbctl/certbot}"
+CERTBOT_BIN="${SBCTL_CERTBOT_BIN:-${CERTBOT_VENV}/bin/certbot}"
+CERTBOT_CONFIG_DIR="${SBCTL_CERTBOT_CONFIG_DIR:-/var/lib/sbctl/letsencrypt}"
+CERTBOT_WORK_DIR="${SBCTL_CERTBOT_WORK_DIR:-/var/lib/sbctl/certbot-work}"
+CERTBOT_LOGS_DIR="${SBCTL_CERTBOT_LOGS_DIR:-/var/log/sbctl/certbot}"
+CERT_STOPPED_SERVICE=0
+APT_IPV4_AVAILABLE_CACHE=""
+
+if [[ -z ${SBCTL_ENTRYPOINT:-} ]]; then
+  SBCTL_ENTRYPOINT=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+fi
+LIB_DIR="${SBCTL_LIB_DIR:-/usr/local/lib/sbctl}"
+
+
+# Built from modular sources by scripts/build.sh.
+
+# ---- module: core ----
+# sbctl core — logging, interaction, validators, temp files, and table helpers.
+# Domain and platform operations live in their dedicated modules.
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+fi
+
+info()    { printf '%s[信息]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()    { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error()   { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()     { error "$*"; exit 1; }
+heading() { printf '\n%s%s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
+clear_screen() { clear 2>/dev/null || true; }
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+is_root() { [[ $(id -u) -eq 0 ]]; }
+require_root() { [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0; is_root || die "此操作需要 root 权限，请使用 sudo sbctl $*."; }
+
+on_error() {
+  local exit_code=$? line=${BASH_LINENO[0]:-?}
+  error "命令在第 ${line} 行失败（退出码 ${exit_code}）。"
+  exit "$exit_code"
+}
+trap on_error ERR
+
+# Action-level cleanup: cert service restore ONLY.
+# Safe to run in subshells (run_menu_action) — does NOT delete session cache or lock.
+cleanup_action_on_exit() {
+  if [[ ${CERT_STOPPED_SERVICE:-0} == 1 ]]; then
+    service_start >/dev/null 2>&1 || true
+    CERT_STOPPED_SERVICE=0
+  fi
+}
+
+# Session-level cleanup: cache + lock + action cleanup.
+# Only runs on outermost sbctl process exit.
+cleanup_session_on_exit() {
+  if [[ -n ${_SBC_CACHE_DIR:-} && -d ${_SBC_CACHE_DIR:-} ]]; then
+    rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
+  fi
+  cleanup_action_on_exit
+}
+trap cleanup_session_on_exit EXIT
+
+pause() {
+  [[ -t 0 ]] || return 0
+  read -r -p "按回车键继续..." _ || true
+}
+
+confirm() {
+  local prompt=${1:-"确定继续吗？"} default=${2:-N} answer suffix
+  [[ $default == Y ]] && suffix='[Y/n]' || suffix='[y/N]'
+  if [[ ! -t 0 ]]; then [[ $default == Y ]]; return; fi
+  read -r -p "${prompt} ${suffix} " answer || { echo; answer=${default}; }
+  answer=${answer:-$default}
+  [[ $answer =~ ^[Yy]$ ]]
+}
+
+prompt_value() {
+  local __var=$1 prompt=$2 default=${3-} __input=""
+  printf -v "$__var" '%s' ''
+  while true; do
+    if [[ -n $default ]]; then
+      read -r -p "${prompt} [${default}]: " __input || return 1
+      __input=${__input:-$default}
+    else
+      read -r -p "${prompt}: " __input || return 1
+    fi
+    [[ -n $__input ]] || { warn "此项不能为空。"; continue; }
+    printf -v "$__var" '%s' "$__input"
+    return 0
+  done
+}
+
+prompt_optional() {
+  local __var=$1 prompt=$2 __input=""
+  printf -v "$__var" '%s' ''
+  read -r -p "${prompt}: " __input || return 1
+  printf -v "$__var" '%s' "$__input"
+}
+
+prompt_optional_positive_int() {
+  local __var=$1 prompt=$2 __candidate=""
+  while true; do
+    prompt_optional __candidate "$prompt" || return 1
+    if [[ -z $__candidate ]]; then printf -v "$__var" '%s' ""; return 0; fi
+    if [[ $__candidate =~ ^[0-9]+$ ]] && ((10#$__candidate > 0)); then printf -v "$__var" '%s' "$__candidate"; return 0; fi
+    warn "请输入正整数，或留空表示不限。"
+  done
+}
+
+prompt_secret() {
+  local __var=$1 prompt=$2 generated=${3-} __input=""
+  printf -v "$__var" '%s' ''
+  if [[ -n $generated ]]; then
+    read -r -p "${prompt}（留空自动生成）: " __input || return 1
+    __input=${__input:-$generated}
+  else
+    while [[ -z $__input ]]; do read -r -p "${prompt}: " __input || return 1; done
+  fi
+  printf -v "$__var" '%s' "$__input"
+}
+
+choose() {
+  local __var=$1 prompt=$2; shift 2
+  local options=("$@") __choice="" i
+  printf -v "$__var" '%s' ''
+  printf '%s\n' "$prompt"
+  for ((i=0;i<${#options[@]};i++)); do printf '  %d) %s\n' "$((i+1))" "${options[$i]}"; done
+  while true; do
+    read -r -p "请选择 [1-${#options[@]}]: " __choice || { echo; return 1; }
+    if [[ $__choice =~ ^[0-9]+$ ]] && ((__choice>=1 && __choice<=${#options[@]})); then
+      printf -v "$__var" '%s' "$__choice"; return 0
+    fi
+    warn "无效选项。"
+  done
+}
+
+run_menu_action() {
+  local status
+  # ERR traps still fire when `errexit` is disabled. Temporarily remove the
+  # outer session trap so a failed action can be captured instead of exiting
+  # the whole interactive program. The action itself keeps strict -e behavior.
+  trap - ERR
+  set +e
+  (
+    set -Eeuo pipefail
+    trap - ERR
+    trap cleanup_action_on_exit EXIT
+    "$@"
+  )
+  status=$?
+  set -e
+  trap on_error ERR
+  ((status == 0)) || warn "操作未完成，脚本仍在运行。"
+  return 0
+}
+
+# ---- validators ----
+validate_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
+validate_tag() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
+validate_domain() { [[ ${1:-} =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+validate_uuid() { [[ ${1:-} =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
+validate_short_id() { [[ ${1:-} =~ ^[0-9A-Fa-f]{0,8}$ ]]; }
+validate_ipv4() {
+  local IFS=. a b c d extra
+  read -r a b c d extra <<<"${1:-}"
+  [[ -z ${extra:-} && $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]] || return 1
+  ((10#$a<=255 && 10#$b<=255 && 10#$c<=255 && 10#$d<=255))
+}
+validate_ip_literal() { validate_ipv4 "$1" || [[ $1 == *:* && $1 =~ ^[0-9A-Fa-f:]+$ ]]; }
+validate_host() { validate_domain "$1" || validate_ip_literal "$1"; }
+
+random_hex() { openssl rand -hex "${1:-4}"; }
+random_password() { openssl rand -base64 32 | tr -d '\n=+/' | cut -c1-24; }
+generate_uuid() {
+  if [[ -x $SING_BOX_BIN ]] && "$SING_BOX_BIN" generate uuid >/dev/null 2>&1; then
+    "$SING_BOX_BIN" generate uuid | tail -n1
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then cat /proc/sys/kernel/random/uuid
+  elif command_exists uuidgen; then uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    local h; h=$(openssl rand -hex 16)
+    printf '%s-%s-4%s-%x%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$(((0x${h:16:1}&3)|8))" "${h:17:3}" "${h:20:12}"
+  fi
+}
+url_encode() { jq -rn --arg v "$1" '$v|@uri'; }
+uri_host() { [[ $1 == *:* && $1 != \[*\] ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
+
+prompt_public_host() {
+  local __var=$1 default=${2:-} v4="" v6="" choice value=""
+  if [[ -z $default ]]; then
+    v4=$(detect_public_ipv4 || true); v6=$(detect_public_ipv6 || true)
+    local labels=() values=() cert_id
+    [[ -n $v4 ]] && { labels+=("IPv4  $v4"); values+=("$v4"); }
+    [[ -n $v6 ]] && { labels+=("IPv6  $v6"); values+=("$v6"); }
+    while IFS= read -r cert_id; do
+      [[ -n $cert_id ]] || continue
+      # Skip internal IP-cert labels (ip4-*, ip6-*), only show real domains
+      [[ $cert_id == ip4-* || $cert_id == ip6-* ]] && continue
+      labels+=("${cert_id} (已托管)"); values+=("$cert_id")
+    done < <(meta_cert_list 2>/dev/null || true)
+    labels+=("域名/其他地址"); values+=("__manual__")
+    if ((${#labels[@]} == 1)); then
+      prompt_value value "客户端连接域名/IP" || return 1
+    else
+      choose choice "选择客户端连接地址" "${labels[@]}" || return 1
+      local selected="${values[$((choice-1))]}"
+      if [[ $selected == __manual__ ]]; then prompt_value value "客户端连接域名/IP" || return 1; else value=$selected; fi
+    fi
+  else value=$default; fi
+  [[ -n $value && $value != *' '* ]] || { error "客户端连接地址无效。"; return 1; }
+  printf -v "$__var" '%s' "$value"
+}
+
+# ---- bounded execution helpers ----
+run_bounded() {
+  local seconds=$1; shift
+  if declare -F "${1:-}" >/dev/null 2>&1; then "$@"
+  elif command_exists timeout; then timeout "$seconds" "$@"
+  else "$@"
+  fi
+}
+_cert_run_bounded() { run_bounded "$@"; }
+
+temp_file() { mktemp "${TMPDIR:-/tmp}/sbctl.XXXXXX"; }
+timestamp() { date '+%Y%m%d-%H%M%S'; }
+
+# ---- terminal table helpers ----
+display_width() {
+  local __var=$1 value=$2 char code computed_width=0 i
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}
+    printf -v code '%d' "'$char"
+    if ((code < 0 || code > 127)); then ((computed_width+=2)); else ((computed_width+=1)); fi
+  done
+  printf -v "$__var" '%s' "$computed_width"
+}
+
+print_table_cell() {
+  local value=$1 target_width=$2 cell_width=0 padding
+  display_width cell_width "$value"
+  padding=$((target_width-cell_width))
+  ((padding > 0)) || padding=1
+  printf '%s%*s' "$value" "$padding" ''
+}
+
+print_table_cell_clipped() {
+  local value=$1 target_width=$2 cell_width=0 limit clipped="" used=0 char char_width=0 i
+  display_width cell_width "$value"
+  if ((cell_width < target_width)); then print_table_cell "$value" "$target_width"; return; fi
+  limit=$((target_width-4)); ((limit > 0)) || limit=1
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}; display_width char_width "$char"
+    ((used+char_width <= limit)) || break
+    clipped+=$char; ((used+=char_width))
+  done
+  print_table_cell "${clipped}..." "$target_width"
+}
+
+# ---- module: platform ----
+# Session-level cache for values that don't change during sbctl's lifetime.
+# Uses mktemp-created directory under /tmp — survives $(...) subshells.
+# Cleanup is handled by core.sh's unified cleanup_on_exit (single EXIT trap).
+
+_SBC_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cache.XXXXXX") || {
+  printf '[错误] 无法创建 sbctl 缓存目录\n' >&2
+  _SBC_CACHE_DIR=""
+}
+if [[ -n $_SBC_CACHE_DIR ]]; then
+  chmod 700 "$_SBC_CACHE_DIR" 2>/dev/null || true
+fi
+
+_sbc_cached() {
+  local key=$1
+  [[ -n $_SBC_CACHE_DIR && -f $_SBC_CACHE_DIR/$key ]] && cat "$_SBC_CACHE_DIR/$key" 2>/dev/null
+}
+
+_sbc_cache() {
+  local key=$1 value=$2
+  [[ -n $_SBC_CACHE_DIR ]] || return
+  printf '%s' "$value" > "$_SBC_CACHE_DIR/$key" 2>/dev/null || true
+}
+
+sbc_invalidate_install_cache() {
+  [[ -n $_SBC_CACHE_DIR ]] || return
+  rm -f "$_SBC_CACHE_DIR/_sbc_sing_box_bin" "$_SBC_CACHE_DIR/_sbc_sing_box_version" 2>/dev/null || true
+}
+
+sbc_cache_flush() {
+  [[ -n $_SBC_CACHE_DIR ]] || return
+  rm -rf -- "$_SBC_CACHE_DIR" 2>/dev/null || true
+  _SBC_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cache.XXXXXX") || _SBC_CACHE_DIR=""
+  [[ -z $_SBC_CACHE_DIR ]] || chmod 700 "$_SBC_CACHE_DIR" 2>/dev/null || true
+}
+
+# Cached init_system — runs once per session
+init_system() {
+  local result
+  result=$(_sbc_cached _sbc_init_system) && { printf '%s' "$result"; return; }
+  if command_exists systemctl && [[ -d /run/systemd/system || ${SBCTL_TESTING:-0} == 1 ]]; then result=systemd
+  elif command_exists rc-service; then result=openrc
+  else result=unknown; fi
+  _sbc_cache _sbc_init_system "$result"
+  printf '%s' "$result"
+}
+
+# Cached pkg_manager — runs once per session
+pkg_manager() {
+  local result
+  result=$(_sbc_cached _sbc_pkg_manager) && { printf '%s' "$result"; return 0; }
+  if command_exists apk; then result=apk
+  elif command_exists apt-get; then result=apt
+  elif command_exists dnf; then result=dnf
+  elif command_exists yum; then result=yum
+  elif command_exists pacman; then result=pacman
+  elif command_exists zypper; then result=zypper
+  else return 1; fi
+  _sbc_cache _sbc_pkg_manager "$result"
+  printf '%s' "$result"
+}
+
+# Cached sing-box binary path
+refresh_binary_path() {
+  if [[ -n ${SBCTL_SING_BOX_BIN:-} ]]; then
+    SING_BOX_BIN=$SBCTL_SING_BOX_BIN
+    return
+  fi
+  local cached
+  cached=$(_sbc_cached _sbc_sing_box_bin) && { SING_BOX_BIN=$cached; return; }
+  SING_BOX_BIN=$(command -v sing-box 2>/dev/null || printf '%s' "$SING_BOX_BIN")
+  _sbc_cache _sbc_sing_box_bin "$SING_BOX_BIN"
+}
+
+# Cached sing-box version — survives $(...) calls
+sing_box_version() {
+  local version
+  version=$(_sbc_cached _sbc_sing_box_version) && { printf '%s' "$version"; return; }
+  refresh_binary_path
+  if [[ -x $SING_BOX_BIN ]]; then
+    version=$("$SING_BOX_BIN" version 2>/dev/null | sed -nE '1s/^sing-box version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+  fi
+  _sbc_cache _sbc_sing_box_version "${version:-}"
+  printf '%s' "${version:-}"
+}
+
+sing_box_installed() {
+  refresh_binary_path
+  [[ -x $SING_BOX_BIN ]] || command_exists sing-box
+}
+
+# ---- service state: single systemctl show, pure-bash parsing ----
+
+# Fetch all service states. Output: "load active unitfile" (three words).
+# systemd: one systemctl show call, parsed with bash parameter expansion.
+# openrc:  one rc-service + one rc-update call.
+_service_states() {
+  case $(init_system) in
+    systemd)
+      local load=not-found active=inactive unitfile=disabled line
+      while IFS= read -r line; do
+        case $line in
+          LoadState=*)   load=${line#LoadState=} ;;
+          ActiveState=*) active=${line#ActiveState=} ;;
+          UnitFileState=*) unitfile=${line#UnitFileState=} ;;
+        esac
+      done < <(systemctl show "$SERVICE_NAME" -p LoadState -p ActiveState -p UnitFileState --no-pager 2>/dev/null || true)
+      printf '%s\t%s\t%s' "$load" "$active" "$unitfile"
+      ;;
+    openrc)
+      local active=inactive enabled=disabled
+      [[ -x $OPENRC_INIT_DIR/$SERVICE_NAME ]] || { printf 'not-found\tinactive\tdisabled'; return; }
+      rc-service "$SERVICE_NAME" status >/dev/null 2>&1 && active=active || true
+      rc-update show default 2>/dev/null | grep -Eq "(^|[[:space:]])${SERVICE_NAME}([[:space:]]|$)" && enabled=enabled || true
+      printf 'loaded\t%s\t%s' "$active" "$enabled"
+      ;;
+    *) printf 'not-found\tinactive\tdisabled';;
+  esac
+}
+
+service_exists() {
+  if [[ ${SBCTL_TESTING:-0} == 1 ]]; then return 1; fi
+  local load
+  read -r load _ <<< "$(_service_states)"
+  [[ $load != not-found ]]
+}
+
+service_is_active() {
+  if [[ ${SBCTL_TESTING:-0} == 1 ]]; then return 1; fi
+  local _load active
+  read -r _load active _ <<< "$(_service_states)"
+  [[ $active == active ]]
+}
+
+service_is_enabled() {
+  local _load _active unitfile
+  read -r _load _active unitfile <<< "$(_service_states)"
+  [[ $unitfile == enabled ]]
+}
+
+# Single call returns all three summaries as tab-separated tokens (IFS=$'\n\t').
+# Callers use `read -r svc boot ver <<< "$(_service_summary_all)"`.
+_service_summary_all() {
+  if [[ ${SBCTL_TESTING:-0} == 1 ]]; then
+    printf '未安装\t未安装\t%s' "$(sing_box_version_summary)"
+    return
+  fi
+  local load active unitfile svc boot ver
+  read -r load active unitfile <<< "$(_service_states)"
+  if [[ $load == not-found ]]; then svc=未安装; elif [[ $active == active ]]; then svc=运行中; else svc=已停止; fi
+  if [[ $unitfile == enabled ]]; then boot=已开启; else boot=已关闭; fi
+  ver=$(sing_box_version_summary)
+  printf '%s\t%s\t%s' "$svc" "$boot" "$ver"
+}
+
+service_state_summary() { local s; read -r s _ <<< "$(_service_summary_all)"; printf '%s' "$s"; }
+startup_state_summary() { local _ s; read -r _ s _ <<< "$(_service_summary_all)"; printf '%s' "$s"; }
+
+sing_box_version_summary() {
+  local v
+  v=$(sing_box_version)
+  if [[ -n $v ]]; then printf '%s' "$v"; else printf '未安装'; fi
+}
+
+node_summary() {
+  local svc count=0 ver
+  if [[ ${SBCTL_TESTING:-0} != 1 ]]; then
+    local load active
+    read -r load active _ <<< "$(_service_states)"
+    if [[ $load == not-found ]]; then svc=未安装
+    elif [[ $active == active ]]; then svc=运行中
+    else svc=已停止; fi
+  else
+    svc=未安装
+  fi
+  [[ -f $CONFIG_FILE ]] && count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf 0)
+  ver=$(sing_box_version_summary)
+  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$svc" "$count" "${ver:-已安装}"
+}
+
+# APT uses a foreground timeout when available so package hooks cannot suspend
+# sbctl through SIGTTIN/SIGTTOU on a controlling terminal.
+_apt_run_bounded() {
+  local seconds=$1; shift
+  if command_exists timeout; then
+    if timeout --help 2>&1 | grep -F -- '--foreground' >/dev/null; then
+      timeout --foreground "$seconds" "$@"
+    else
+      timeout "$seconds" "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
+apt_get_guarded() {
+  local total_timeout=${SBCTL_APT_TIMEOUT:-180}
+  local apt_options=(
+    -o Acquire::Retries=2
+    -o Acquire::http::Timeout=15
+    -o Acquire::https::Timeout=15
+    -o Dpkg::Use-Pty=0
+  )
+  apt_ipv4_available && apt_options+=(-o Acquire::ForceIPv4=true)
+  _apt_run_bounded "$total_timeout" env \
+    DEBIAN_FRONTEND=noninteractive \
+    APT_LISTCHANGES_FRONTEND=none \
+    apt-get "${apt_options[@]}" "$@"
+}
+
+
+# ---- platform operations ----
+# ---- service actions (uncached — these have side effects) ----
+service_start() {
+  case $(init_system) in systemd) systemctl start "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" start;; *) return 1;; esac
+}
+service_stop() {
+  case $(init_system) in systemd) systemctl stop "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" stop;; *) return 1;; esac
+}
+service_restart() {
+  case $(init_system) in systemd) systemctl restart "$SERVICE_NAME";; openrc) rc-service "$SERVICE_NAME" restart;; *) return 1;; esac
+}
+service_enable() {
+  case $(init_system) in
+    systemd) systemctl enable "$SERVICE_NAME" >/dev/null ;;
+    openrc) rc-update add "$SERVICE_NAME" default >/dev/null ;;
+    *) return 1;;
+  esac
+}
+service_disable() {
+  case $(init_system) in
+    systemd) systemctl disable "$SERVICE_NAME" >/dev/null ;;
+    openrc) rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true ;;
+    *) return 1;;
+  esac
+}
+service_logs() {
+  local lines=${1:-100}
+  case $(init_system) in
+    systemd) journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager ;;
+    openrc) tail -n "$lines" /var/log/sing-box.log 2>/dev/null || warn "未找到 /var/log/sing-box.log。" ;;
+  esac
+}
+
+# ---- network helpers (lightweight, no-cache — used in creation flows) ----
+detect_public_ipv4() {
+  command_exists curl || return 1
+  local response
+  response=$({ curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true; } | tr -d '[:space:]')
+  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  response=$({ curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://checkip.amazonaws.com 2>/dev/null || true; } | tr -d '[:space:]')
+  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  local raw
+  raw=$(curl -4 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  response=$(awk -F= '$1=="ip" {print $2; exit}' <<<"$raw" | tr -d '[:space:]')
+  if validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  return 1
+}
+detect_public_ipv6() {
+  command_exists curl || return 1
+  local response
+  response=$({ curl -6 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://api6.ipify.org 2>/dev/null || true; } | tr -d '[:space:]')
+  if validate_ip_literal "$response" && ! validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  local raw
+  raw=$(curl -6 --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 3 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  response=$(awk -F= '$1=="ip" {print $2; exit}' <<<"$raw" | tr -d '[:space:]')
+  if validate_ip_literal "$response" && ! validate_ipv4 "$response"; then printf '%s' "$response"; return 0; fi
+  return 1
+}
+
+apt_ipv4_available() {
+  if [[ -n ${APT_IPV4_AVAILABLE_CACHE:-} ]]; then
+    [[ $APT_IPV4_AVAILABLE_CACHE == 1 ]]
+    return
+  fi
+  local available=0
+  if command_exists ip && ip -4 route get 1.1.1.1 >/dev/null 2>&1; then
+    available=1
+  elif [[ -r /proc/net/route ]] && awk '$2=="00000000" && $4 ~ /0003/ {found=1} END{exit !found}' /proc/net/route 2>/dev/null; then
+    available=1
+  fi
+  APT_IPV4_AVAILABLE_CACHE=$available
+  ((available == 1))
+}
+
+# ---- package manager (no cache — pkg_manager is cached in cache.sh) ----
+install_packages() {
+  local manager
+  manager=$(pkg_manager) || die "无法识别包管理器。"
+  case $manager in
+    apk) run_bounded 180 apk add --no-cache "$@" ;;
+    apt)
+      if ! DEBIAN_FRONTEND=noninteractive apt_get_guarded update -y; then
+        warn "APT 软件索引更新失败或超时，尝试使用现有索引继续安装。"
+      fi
+      DEBIAN_FRONTEND=noninteractive apt_get_guarded install -y --no-install-recommends "$@" \
+        || die "APT 依赖安装失败，请检查软件源、DNS 和服务器网络。"
+      ;;
+    dnf) run_bounded 180 dnf install -y "$@" ;;
+    yum) run_bounded 180 yum install -y "$@" ;;
+    pacman) run_bounded 180 pacman -Sy --noconfirm --needed "$@" ;;
+    zypper) run_bounded 180 zypper --non-interactive install "$@" ;;
+  esac
+}
+
+ensure_dependencies() {
+  require_root "$@"
+  local missing=() c
+  for c in curl jq openssl; do command_exists "$c" || missing+=("$c"); done
+  ((${#missing[@]} == 0)) || install_packages "${missing[@]}"
+}
+
+# ---- module: state ----
+# sbctl engine — config lifecycle, service definition, install/update, and state transactions.
+# This is the canonical implementation; no module overrides these functions.
+
+# ---- config bootstrap ----
+ensure_config() {
+  [[ -f $CONFIG_FILE ]] || write_default_config
+  jq -e 'type=="object" and (.inbounds|type=="array") and (.outbounds|type=="array")' "$CONFIG_FILE" >/dev/null || die "配置不是有效的 sing-box JSON：$CONFIG_FILE"
+  normalize_config_tags
+  jq -e '
+    all(.inbounds[]?; ((.tag // "")|type)=="string" and ((.tag // "")!="")) and
+    all(.outbounds[]?; ((.tag // "")|type)=="string" and ((.tag // "")!=""))
+  ' "$CONFIG_FILE" >/dev/null || die "配置中的入站/出站标签仍不完整。"
+  init_meta
+}
+
+write_default_config() {
+  mkdir -p "$CONFIG_DIR" "$CERT_DIR" "$(dirname "$META_FILE")"
+  cat >"$CONFIG_FILE" <<'JSON'
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+JSON
+  chmod 600 "$CONFIG_FILE"
+  init_meta
+}
+
+validate_candidate() {
+  local candidate=$1 output
+  jq -e 'type=="object" and (.inbounds|type=="array") and (.outbounds|type=="array")' "$candidate" >/dev/null || { error "JSON 结构检查失败。"; return 1; }
+  if sing_box_installed; then
+    refresh_binary_path
+    if ! output=$("$SING_BOX_BIN" check -c "$candidate" 2>&1); then
+      error "sing-box 拒绝了新配置："
+      printf '%s\n' "$output" >&2
+      return 1
+    fi
+  fi
+}
+
+# Transactional config+meta apply (from state_guard.sh)
+apply_candidate_with_meta() {
+  local candidate=$1 meta_candidate=${2:-} cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0
+  ensure_config
+  validate_candidate "$candidate" || return 1
+  if [[ -n $meta_candidate ]]; then
+    jq -e 'type=="object" and ((.inbounds // {})|type=="object")' "$meta_candidate" >/dev/null \
+      || { error "metadata 候选文件无效。"; return 1; }
+  fi
+  service_is_active && old_active=1
+  cfg_rollback=$(temp_file)
+  meta_rollback=$(temp_file)
+  cp -a "$CONFIG_FILE" "$cfg_rollback"
+  if [[ -f $META_FILE ]]; then cp -a "$META_FILE" "$meta_rollback"; had_meta=1; fi
+  install -m 600 "$candidate" "$CONFIG_FILE" || failed=1
+  if ((failed == 0)) && [[ -n $meta_candidate ]]; then install -m 600 "$meta_candidate" "$META_FILE" || failed=1; fi
+  if ((failed == 0 && old_active)) && ! restart_service_checked; then failed=1; fi
+  if ((failed)); then
+    error "状态应用失败，正在回滚 config/meta。"
+    install -m 600 "$cfg_rollback" "$CONFIG_FILE" || true
+    if ((had_meta)); then install -m 600 "$meta_rollback" "$META_FILE" || true; else rm -f "$META_FILE"; fi
+    if ((old_active)); then service_restart >/dev/null 2>&1 || true; fi
+    rm -f "$cfg_rollback" "$meta_rollback"
+    return 1
+  fi
+  rm -f "$cfg_rollback" "$meta_rollback"
+  info "配置已应用。"
+}
+
+# Simple apply (backward compat)
+apply_candidate() { apply_candidate_with_meta "$1"; }
+
+# Meta candidate builder (from state_guard.sh)
+build_inbound_meta_candidate() {
+  local tag=$1 host=$2 public_key=${3-} config_candidate=$4 output=$5 private="" private_sha=""
+  init_meta
+  if [[ -n $public_key ]]; then
+    private=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag)|.tls.reality.private_key // empty' "$config_candidate" 2>/dev/null || true)
+    [[ -z $private ]] || private_sha=$(printf '%s' "$private" | openssl dgst -sha256 -r | awk '{print $1}')
+  fi
+  jq --arg tag "$tag" --arg host "$host" --arg public "$public_key" --arg privateSHA "$private_sha" \
+     --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now}) |
+    if $public!="" and $privateSHA!="" then
+      .inbounds[$tag].realityPublicKey=$public | .inbounds[$tag].realityPrivateSHA256=$privateSHA
+    else
+      del(.inbounds[$tag].realityPublicKey,.inbounds[$tag].realityPrivateSHA256)
+    end' "$META_FILE" >"$output"
+}
+
+check_config() { ensure_config; require_supported_core; validate_candidate "$CONFIG_FILE" && info "配置检查通过。"; }
+
+edit_config() {
+  ensure_dependencies config-edit; ensure_config
+  local editor=${EDITOR:-vi} tmp
+  tmp=$(temp_file); cp -a "$CONFIG_FILE" "$tmp"
+  "$editor" "$tmp"
+  if cmp -s "$tmp" "$CONFIG_FILE"; then info "配置未更改。"; else apply_candidate "$tmp"; fi
+  rm -f "$tmp"
+}
+
+# ---- idempotent config migrations ----
+_config_has_missing_tags() {
+  jq -e '
+    any(.inbounds[]?; ((.tag // "") | type != "string") or ((.tag // "") == "")) or
+    any(.outbounds[]?; ((.tag // "") | type != "string") or ((.tag // "") == ""))
+  ' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+_unique_config_tag() {
+  local __var=$1 base=$2 candidate=$2 suffix=2
+  while jq -e --arg tag "$candidate" '
+    any(.inbounds[]?; (.tag // "") == $tag) or
+    any(.outbounds[]?; (.tag // "") == $tag)
+  ' "$3" >/dev/null 2>&1; do
+    candidate="${base}-${suffix}"; ((suffix+=1))
+  done
+  printf -v "$__var" '%s' "$candidate"
+}
+
+normalize_config_tags() {
+  _config_has_missing_tags || return 0
+  [[ -w $CONFIG_FILE ]] || die "检测到旧配置中存在未命名入站/出站；请使用 root 运行 sbctl 以自动兼容。"
+  local work next backup idx type base generated changed=0
+  work=$(temp_file); next=$(temp_file); cp -a "$CONFIG_FILE" "$work"
+  while IFS=$'\t' read -r idx type; do
+    [[ -n $idx ]] || continue
+    type=${type:-inbound}; base="legacy-${type}-$((idx+1))"
+    _unique_config_tag generated "$base" "$work"
+    jq --argjson idx "$idx" --arg tag "$generated" '.inbounds[$idx].tag=$tag' "$work" >"$next"
+    mv -f "$next" "$work"; next=$(temp_file); ((changed+=1))
+  done < <(jq -r '.inbounds|to_entries[]|select(((.value.tag // "")|type)!="string" or ((.value.tag // "")==""))|[.key,(.value.type//"inbound")]|@tsv' "$work")
+  while IFS=$'\t' read -r idx type; do
+    [[ -n $idx ]] || continue
+    type=${type:-outbound}
+    case $type in direct|block|dns) base=$type;; *) base="legacy-out-${type}-$((idx+1))";; esac
+    _unique_config_tag generated "$base" "$work"
+    jq --argjson idx "$idx" --arg tag "$generated" '.outbounds[$idx].tag=$tag' "$work" >"$next"
+    mv -f "$next" "$work"; next=$(temp_file); ((changed+=1))
+  done < <(jq -r '.outbounds|to_entries[]|select(((.value.tag // "")|type)!="string" or ((.value.tag // "")==""))|[.key,(.value.type//"outbound")]|@tsv' "$work")
+  rm -f "$next"
+  ((changed > 0)) || { rm -f "$work"; return 0; }
+  validate_candidate "$work" || { rm -f "$work"; die "旧配置补全标签后未通过 sing-box 检查，原配置未修改。"; }
+  mkdir -p "$BACKUP_DIR"; backup="${BACKUP_DIR}/pre-tag-migration-$(timestamp).json"
+  cp -a "$CONFIG_FILE" "$backup"; chmod 600 "$backup" 2>/dev/null || true
+  install -m 600 "$work" "$CONFIG_FILE"; rm -f "$work"
+  warn "检测到旧配置缺少 tag，已自动补全 ${changed} 个标签；原配置备份：${backup}"
+}
+
+# ---- backup and restore ----
+backup_all() {
+  require_root backup; ensure_config
+  local target=${1:-${BACKUP_DIR}/sbctl-$(timestamp).tar.gz} paths=("${CONFIG_FILE#/}" "${META_FILE#/}")
+  mkdir -p "$BACKUP_DIR" "$(dirname "$target")"
+  [[ ! -d $CERT_DIR ]] || paths+=("${CERT_DIR#/}")
+  tar -czf "$target" -C / "${paths[@]}" || die "备份失败。"
+  chmod 600 "$target"; meta_resource_register backupDir "$BACKUP_DIR"
+  info "备份已创建：$target"
+  info "提示：备份包含配置、metadata 和证书副本，不包含 Certbot 账户/lineage 数据。"
+}
+
+restore_backup() {
+  ensure_dependencies restore; ensure_config
+  local archive=${1-} temp extract_config snapshot had_meta=0 had_certs=0
+  [[ -n $archive ]] || prompt_value archive "备份文件路径"
+  [[ -r $archive ]] || die "无法读取备份。"
+  tar -tzf "$archive" >/dev/null || { warn "不是有效的 tar.gz 备份。"; return 0; }
+  if tar -tzf "$archive" | awk 'BEGIN{bad=0} /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END{exit !bad}'; then die "备份包含不安全路径。"; fi
+  extract_config="${CONFIG_FILE#/}"; temp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-restore.XXXXXX")
+  tar -xzf "$archive" -C "$temp"
+  [[ -f $temp/$extract_config ]] || { rm -rf "$temp"; die "备份中没有配置文件。"; }
+  validate_candidate "$temp/$extract_config" || { rm -rf "$temp"; die "备份配置验证失败。"; }
+  confirm "恢复会覆盖当前配置、元数据和托管证书，继续？" N || { rm -rf "$temp"; return; }
+  snapshot="$temp/.current"; mkdir -p "$snapshot"; cp -a "$CONFIG_FILE" "$snapshot/config.json"
+  [[ ! -f $META_FILE ]] || { cp -a "$META_FILE" "$snapshot/meta.json"; had_meta=1; }
+  [[ ! -d $CERT_DIR ]] || { cp -a "$CERT_DIR" "$snapshot/certs"; had_certs=1; }
+  cp -a "$temp/$extract_config" "$CONFIG_FILE"
+  if [[ -f $temp/${META_FILE#/} ]]; then cp -a "$temp/${META_FILE#/}" "$META_FILE"; else rm -f "$META_FILE"; fi
+  init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
+  [[ ! -d $temp/${CERT_DIR#/} ]] || cp -a "$temp/${CERT_DIR#/}/." "$CERT_DIR/"
+  if ! restart_service_checked; then
+    error "恢复后服务失败，正在整体回滚。"
+    cp -a "$snapshot/config.json" "$CONFIG_FILE"
+    ((had_meta)) && cp -a "$snapshot/meta.json" "$META_FILE" || rm -f "$META_FILE"
+    init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
+    ((had_certs)) && cp -a "$snapshot/certs/." "$CERT_DIR/" || true
+    restart_service_checked || true; rm -rf "$temp"; die "恢复失败，已回滚 config/meta/certs。"
+  fi
+  local id source auto_renew cert_name warned=0
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    source=$(meta_cert_get_field "$id" source); auto_renew=$(meta_cert_get_field "$id" autoRenew)
+    [[ $source == letsencrypt && $auto_renew == true ]] || continue
+    cert_name=$(meta_cert_get_field "$id" certName)
+    if [[ -z $cert_name || ! -d $CERTBOT_CONFIG_DIR/live/$cert_name ]]; then
+      warn "证书 ${id}: 副本已恢复，但 Certbot lineage 缺失，无法自动续期；请重新签发。"; ((warned+=1))
+    fi
+  done < <(meta_cert_list)
+  ((warned == 0)) || warn "共 ${warned} 张自动证书缺少 Certbot 续期数据。"
+  rm -rf "$temp"; info "备份已恢复。"
+}
+
+
+# ---- metadata primitives ----
+init_meta() {
+  mkdir -p "$(dirname "$META_FILE")"
+  if [[ ! -s $META_FILE ]] || ! jq -e 'type=="object" and ((.inbounds // {})|type=="object")' "$META_FILE" >/dev/null 2>&1; then
+    [[ ! -f $META_FILE ]] || cp -a "$META_FILE" "${META_FILE}.broken-$(timestamp)"
+    _sbctl_meta_default_json >"$META_FILE"
+    chmod 600 "$META_FILE"
+  else
+    _sbctl_meta_upgrade_file || die "无法升级 sbctl metadata。"
+  fi
+  _sbctl_meta_legacy_cert_scan
+}
+
+_sbctl_meta_default_json() {
+  printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{}}'
+}
+
+_sbctl_meta_upgrade_file() {
+  local tmp
+  tmp=$(temp_file)
+  jq '
+    .schema=2 |
+    .inbounds=(if (.inbounds|type)=="object" then .inbounds else {} end) |
+    .certificates=(if (.certificates|type)=="object" then .certificates else {} end) |
+    .managedResources=(if (.managedResources|type)=="object" then .managedResources else {} end) |
+    .migrations=(if (.migrations|type)=="object" then .migrations else {} end)
+  ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
+}
+
+_sbctl_meta_legacy_cert_scan() {
+  jq -e '.migrations.legacyCertScanV1 == true' "$META_FILE" >/dev/null 2>&1 && return 0
+  local cert key id subject tmp migrated=0
+  mkdir -p "$CERT_DIR"
+  for cert in "$CERT_DIR"/*.crt; do
+    [[ -r $cert ]] || continue
+    key=${cert%.crt}.key
+    [[ -r $key ]] || continue
+    id=$(basename "$cert" .crt)
+    jq -e --arg id "$id" '.certificates[$id] != null' "$META_FILE" >/dev/null 2>&1 && continue
+    subject=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null \
+      | sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -1 || true)
+    if [[ -z $subject ]]; then
+      subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null \
+        | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -1 || true)
+    fi
+    [[ -n $subject ]] || subject=$id
+    tmp=$(temp_file)
+    jq --arg id "$id" --arg subject "$subject" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+      .certificates[$id]={subject:$subject,certName:$id,source:"legacy",validation:"legacy",autoRenew:false,updatedAt:$now}
+    ' "$META_FILE" >"$tmp"
+    install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+    ((migrated+=1))
+  done
+  tmp=$(temp_file)
+  jq '.migrations.legacyCertScanV1=true' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+  ((migrated == 0)) || info "已将 ${migrated} 张旧版证书登记到 sbctl metadata。"
+}
+
+meta_set_inbound() {
+  local tag=$1 host=$2 public_key=${3-} tmp private private_sha=""
+  init_meta
+  if [[ -n $public_key && -f $CONFIG_FILE ]]; then
+    private=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag)|.tls.reality.private_key // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    [[ -z $private ]] || private_sha=$(printf '%s' "$private" | openssl dgst -sha256 -r | awk '{print $1}')
+  fi
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg host "$host" --arg public "$public_key" --arg privateSHA "$private_sha" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now}) |
+    if $public!="" and $privateSHA!="" then
+      .inbounds[$tag].realityPublicKey=$public | .inbounds[$tag].realityPrivateSHA256=$privateSHA
+    else
+      del(.inbounds[$tag].realityPublicKey,.inbounds[$tag].realityPrivateSHA256)
+    end' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+meta_set_host() {
+  local tag=$1 host=$2 tmp
+  init_meta; tmp=$(temp_file)
+  jq --arg tag "$tag" --arg host "$host" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    .inbounds[$tag]=((.inbounds[$tag]//{})+{host:$host,updatedAt:$now})' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+meta_delete_inbound() {
+  local tag=$1 tmp; init_meta; tmp=$(temp_file)
+  jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+public_host_for_tag() {
+  local tag=$1 host=""
+  init_meta
+  host=$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE")
+  if [[ -z $host ]]; then
+    prompt_public_host host || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
+    meta_set_host "$tag" "$host"
+  fi
+  printf '%s' "$host"
+}
+
+# ---- module: certificate/core ----
+# Certificate selection, validation, and metadata helpers.
+
+managed_certificate_count() { init_meta; jq -r '.certificates | length' "$META_FILE" 2>/dev/null || printf '0'; }
+
+select_managed_certificate() {
+  local __var=$1 always_choose=${2:-0} id answer
+  local ids=()
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    [[ -r "$CERT_DIR/${id}.crt" && -r "$CERT_DIR/${id}.key" ]] && ids+=("$id")
+  done < <(meta_cert_list)
+  ((${#ids[@]} > 0)) || { warn "请在 TLS 证书设置里导入有效证书。"; return 1; }
+  if ((${#ids[@]} == 1)) && [[ $always_choose != 1 ]]; then
+    printf -v "$__var" '%s' "${ids[0]}"; return 0
+  fi
+  choose answer "选择证书" "${ids[@]}" || return 1
+  printf -v "$__var" '%s' "${ids[$((answer-1))]}"
+}
+
+validate_certificate_pair() {
+  local cert=$1 key=$2 cert_pub key_pub
+  [[ -r $cert && -r $key ]] || return 1
+  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
+  openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1 || return 1
+  openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+  cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl sha256)
+  key_pub=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | openssl sha256)
+  [[ -n $cert_pub && $cert_pub == "$key_pub" ]]
+}
+
+certificate_server_names() {
+  local cert=$1 san concrete
+  san=$(openssl x509 -in "$cert" -noout -text 2>/dev/null \
+    | awk '/X509v3 Subject Alternative Name/ {getline; print; exit}' | tr ',' '\n' \
+    | sed -n -e 's/^[[:space:]]*DNS://p' -e 's/^[[:space:]]*IP Address://p')
+  if [[ -n $san ]]; then
+    concrete=$(printf '%s\n' "$san" | awk '$0 !~ /^\*\./ && !seen[$0]++')
+    if [[ -n $concrete ]]; then printf '%s\n' "$concrete"; else printf '%s\n' "$san" | awk '!seen[$0]++'; fi
+    return 0
+  fi
+  openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null \
+    | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p'
+}
+
+prompt_certificate_server_name() {
+  local __var=$1 cert=$2 answer selected name
+  local names=()
+  while IFS= read -r name; do [[ -n $name ]] && names+=("$name"); done < <(certificate_server_names "$cert")
+  if ((${#names[@]} == 0)); then
+    while true; do
+      prompt_value selected "TLS serverName/SNI" || return 1
+      validate_host "$selected" && break
+      warn "SNI 必须是有效域名/IP。"
+    done
+  elif ((${#names[@]} == 1)); then
+    selected=${names[0]}
+  else
+    choose answer "选择 TLS serverName/SNI" "${names[@]}"
+    selected=${names[$((answer-1))]}
+  fi
+  printf -v "$__var" '%s' "$selected"
+}
+
+prompt_certificate_files() {
+  local __cert=$1 __key=$2 default_cert=${3:-} default_key=${4:-} entered_cert entered_key
+  while true; do
+    prompt_value entered_cert "证书文件路径" "$default_cert" || return 1
+    prompt_value entered_key "私钥文件路径" "$default_key" || return 1
+    if validate_certificate_pair "$entered_cert" "$entered_key"; then
+      printf -v "$__cert" '%s' "$entered_cert"
+      printf -v "$__key" '%s' "$entered_key"
+      return 0
+    fi
+    warn "证书或私钥无效，或证书与私钥不匹配，请重新输入。"
+  done
+}
+
+prompt_tls_certificate() {
+  local __cert=$1 __key=$2 __sni=$3 identifier cert_value key_value sni_value
+  if (( $(managed_certificate_count) > 0 )) && confirm "使用托管证书？" Y; then
+    select_managed_certificate identifier || return 1
+    cert_value="${CERT_DIR}/${identifier}.crt"
+    key_value="${CERT_DIR}/${identifier}.key"
+    validate_certificate_pair "$cert_value" "$key_value" || { warn "托管证书与私钥校验失败。"; return 1; }
+    info "使用托管证书：${identifier}"
+  else
+    prompt_certificate_files cert_value key_value || return 1
+    info "使用证书文件：${cert_value}"
+  fi
+  prompt_certificate_server_name sni_value "$cert_value" || return 1
+  info "TLS serverName/SNI：${sni_value}"
+  printf -v "$__cert" '%s' "$cert_value"
+  printf -v "$__key" '%s' "$key_value"
+  printf -v "$__sni" '%s' "$sni_value"
+}
+
+# ---- certificate and managed-resource metadata ----
+meta_cert_exists() {
+  init_meta
+  jq -e --arg id "$1" '.certificates[$id] != null' "$META_FILE" >/dev/null 2>&1
+}
+
+meta_cert_set() {
+  local identifier=$1 subject=$2 cert_name=$3 source=$4 validation=$5 auto_renew=${6:-true} tmp
+  init_meta; tmp=$(temp_file)
+  jq --arg id "$identifier" --arg subject "$subject" --arg certName "$cert_name" \
+     --arg source "$source" --arg validation "$validation" --arg autoRenew "$auto_renew" \
+     --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    .certificates[$id]={subject:$subject,certName:$certName,source:$source,validation:$validation,
+      autoRenew:($autoRenew=="true"),updatedAt:$now}
+  ' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+
+meta_cert_delete() {
+  local identifier=$1 tmp
+  init_meta; tmp=$(temp_file)
+  jq --arg id "$identifier" 'del(.certificates[$id])' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+
+meta_cert_get_field() {
+  init_meta
+  jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] | if . == null then empty else . end' "$META_FILE"
+}
+
+meta_cert_list() { init_meta; jq -r '.certificates | keys[]' "$META_FILE" 2>/dev/null; }
+meta_cert_auto_renew_certs() { init_meta; jq -r '.certificates | to_entries[] | select(.value.autoRenew == true) | .key' "$META_FILE" 2>/dev/null; }
+
+meta_resource_register() {
+  local key=$1 value=$2 tmp
+  init_meta; tmp=$(temp_file)
+  jq --arg key "$key" --arg value "$value" '.managedResources[$key]=$value' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+
+meta_resource_get() { init_meta; jq -r --arg key "$1" '.managedResources[$key] // empty' "$META_FILE"; }
+
+meta_resource_remove() {
+  local key=$1 tmp
+  init_meta; tmp=$(temp_file)
+  jq --arg key "$key" 'del(.managedResources[$key])' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
+}
+
+# ---- module: security ----
+# TLS and REALITY configuration used by protocol builders.
+
+validate_reality_target() {
+  local value=$1 host port
+  [[ $value == *:* ]] || return 1
+  host=${value%:*}
+  port=${value##*:}
+  [[ -n $host ]] && validate_port "$port"
+}
+
+build_certificate_tls() {
+  local __json=$1 __host=${2-} identifier sni
+  select_managed_certificate identifier || return 1
+  prompt_certificate_server_name sni "$CERT_DIR/${identifier}.crt" || return 1
+  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$CERT_DIR/${identifier}.crt" --arg key "$CERT_DIR/${identifier}.key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
+  [[ -z $__host ]] || printf -v "$__host" '%s' "$sni"
+}
+
+generate_reality_keys() {
+  local __private=$1 __public=$2 output __key_private __key_public
+  require_sing_box
+  output=$("$SING_BOX_BIN" generate reality-keypair)
+  __key_private=$(awk '/PrivateKey/ {print $NF; exit}' <<<"$output" | tr -d '"')
+  __key_public=$(awk '/PublicKey/ {print $NF; exit}' <<<"$output" | tr -d '"')
+  [[ -n $__key_private && -n $__key_public ]] || { error "$output"; die "无法解析 REALITY 密钥。"; }
+  printf -v "$__private" '%s' "$__key_private"
+  printf -v "$__public" '%s' "$__key_public"
+}
+
+build_reality_tls() {
+  local __json=$1 __public=$2 target sni port __generated_private __generated_public short_id
+  while true; do
+    prompt_value target "REALITY 目标" "www.microsoft.com:443" || return 1
+    validate_reality_target "$target" && break
+    warn "目标格式应为 域名:端口，请重新输入。"
+  done
+  sni=${target%:*}; port=${target##*:}
+  while true; do
+    prompt_value sni "REALITY serverName/SNI" "$sni" || return 1
+    validate_domain "$sni" && break
+    warn "SNI 必须是有效域名，请重新输入。"
+  done
+  generate_reality_keys __generated_private __generated_public
+  short_id=$(random_hex 4)
+  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg server "${target%:*}" --argjson port "$port" --arg private "$__generated_private" --arg sid "$short_id" '{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$server,server_port:$port},private_key:$private,short_id:[$sid]}}')"
+  printf -v "$__public" '%s' "$__generated_public"
+}
+
+reality_public_key() {
+  local tag=$1 private cached expected_sha current_sha
+  private=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.private_key // empty' "$CONFIG_FILE")
+  [[ -n $private ]] || return 1
+  cached=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPublicKey // empty' "$META_FILE" 2>/dev/null || true)
+  expected_sha=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPrivateSHA256 // empty' "$META_FILE" 2>/dev/null || true)
+  [[ -n $cached && -n $expected_sha ]] || return 1
+  current_sha=$(printf '%s' "$private" | openssl dgst -sha256 -r | awk '{print $1}')
+  [[ $current_sha == "$expected_sha" ]] || return 1
+  printf '%s' "$cached"
+}
+
+# ---- module: protocols ----
+# Builders for ordinary inbound protocols. Interaction and persistence belong
+# to inbound.sh; these functions only construct sing-box JSON objects.
+
+protocol_capability() {
+  local type=$1 capability=$2
+  case "$type:$capability" in
+    vless:tls|vless:reality|vless:users|anytls:tls|anytls:reality|anytls:users|trojan:tls|trojan:reality|trojan:users|socks:users|http:users) return 0;;
+    *) return 1;;
+  esac
+}
+
+protocol_build_anytls() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 password=$6 tls=$7
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" \
+    '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls}')"
+}
+
+protocol_build_vless() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 uuid=$6 flow=$7 tls=${8-} transport=${9:-null} tls_json
+  [[ -n $tls ]] && tls_json=$tls || tls_json='{}'
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" --argjson tls "$tls_json" --argjson transport "$transport" '
+    {type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,uuid:$uuid,flow:$flow}]} +
+    (if $tls!={} then {tls:$tls} else {} end) +
+    (if $transport!=null then {transport:$transport} else {} end)')"
+}
+
+protocol_build_trojan() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 password=$6 tls=$7 transport=${8:-null}
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --argjson tls "$tls" --argjson transport "$transport" '
+    {type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} +
+    (if $transport!=null then {transport:$transport} else {} end)')"
+}
+
+protocol_build_proxy() {
+  local __out=$1 type=$2 tag=$3 listen=$4 port=$5 username=${6-} password=${7-}
+  if [[ -n $username ]]; then
+    printf -v "$__out" '%s' "$(jq -n --arg type "$type" --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg user "$username" --arg pass "$password" \
+      '{type:$type,tag:$tag,listen:$listen,listen_port:$port,users:[{username:$user,password:$pass}]}')"
+  else
+    printf -v "$__out" '%s' "$(jq -n --arg type "$type" --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
+      '{type:$type,tag:$tag,listen:$listen,listen_port:$port,users:[]}')"
+  fi
+}
+
+# ---- module: hysteria2 ----
+# Hysteria2 UDP port hopping support — NAT redirect table/chain for HY2.
+# No function overrides. Hooks into canonical CRUD via hy2_hop_sync and
+# hy2_hop_configure which are called directly from inbound.sh and uninstall.sh.
+
+validate_hy2_hop_range() {
+  local value=${1:-} start end
+  [[ $value =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+  start=${BASH_REMATCH[1]}; end=${BASH_REMATCH[2]}
+  validate_port "$start" && validate_port "$end" && ((10#$start < 10#$end))
+}
+
+hy2_port_in_range() {
+  local port=$1 range=$2 start end
+  start=${range%-*}; end=${range#*-}
+  validate_port "$port" && validate_hy2_hop_range "$range" || return 1
+  ((10#$port >= 10#$start && 10#$port <= 10#$end))
+}
+
+hy2_port_in_any_hop_range() {
+  local port=$1 range
+  init_meta 2>/dev/null || true
+  while IFS= read -r range; do
+    [[ -n $range ]] || continue
+    hy2_port_in_range "$port" "$range" && return 0
+  done < <(jq -r '.inbounds[]?.hysteria2PortHopping.range // empty' "$META_FILE" 2>/dev/null || true)
+  return 1
+}
+
+hy2_internal_port_available() {
+  local port=$1 range=$2
+  validate_port "$port" || return 1
+  hy2_port_in_range "$port" "$range" && return 1
+  port_in_config "$port" && return 1
+  port_in_use_os "$port" && return 1
+}
+
+hy2_pick_internal_port() {
+  local __var=$1 range=$2 candidate hex i
+  for ((i=0; i<256; i++)); do
+    hex=$(random_hex 2); candidate=$((10000 + (16#$hex % 55536)))
+    if hy2_internal_port_available "$candidate" "$range"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
+  done
+  for ((candidate=10000; candidate<=65535; candidate++)); do
+    if hy2_internal_port_available "$candidate" "$range"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+prompt_hy2_internal_port() {
+  local __var=$1 range=$2 value=""
+  while true; do
+    prompt_optional value "内部监听端口（留空自动选择）" || return 1
+    if [[ -z $value ]]; then
+      hy2_pick_internal_port value "$range" || { error "找不到可用的内部监听端口。"; return 1; }
+      info "内部监听端口：${value}"; printf -v "$__var" '%s' "$value"; return 0
+    fi
+    validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
+    hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
+    port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
+    port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
+    printf -v "$__var" '%s' "$value"; return 0
+  done
+}
+
+hy2_build() {
+  local __out=$1 tag=$2 listen=$3 port=$4 name=$5 password=$6 up=$7 down=$8 obfs=${9-} tls=${10}
+  printf -v "$__out" '%s' "$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg name "$name" --arg password "$password" --arg up "$up" --arg down "$down" --arg obfs "$obfs" --argjson tls "$tls" '
+    {type:"hysteria2",tag:$tag,listen:$listen,listen_port:$port,users:[{name:$name,password:$password}],tls:$tls} |
+    if $up!="" then .up_mbps=($up|tonumber) else . end |
+    if $down!="" then .down_mbps=($down|tonumber) else . end |
+    if $obfs!="" then .obfs={type:"salamander",password:$obfs} else . end')"
+}
+
+hy2_hop_check_conflicts() {
+  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
+  new_start=${range%-*}; new_end=${range#*-}
+  init_meta
+  while IFS=$'\t' read -r tag existing; do
+    [[ -n $tag && -n $existing ]] || continue
+    [[ $tag != "$except_tag" ]] || continue
+    existing_start=${existing%-*}; existing_end=${existing#*-}
+    # Overlap: new_start <= existing_end AND new_end >= existing_start
+    if ((10#$new_start <= 10#$existing_end && 10#$new_end >= 10#$existing_start)); then
+      warn "端口跳跃范围与入站 ${tag} 的 ${existing} 重叠，请重新选择。"
+      return 1
+    fi
+  done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  return 0
+}
+
+# Apply NAT rules only (meta must already be set). Called from add_inbound after apply.
+hy2_hop_apply_nat() {
+  hy2_hop_sync
+  return 0
+}
+
+hy2_hop_range_for_tag() {
+  local tag=$1
+  init_meta
+  jq -r --arg tag "$tag" '.inbounds[$tag].hysteria2PortHopping.range // empty' "$META_FILE"
+}
+
+hy2_hop_client_port_spec() {
+  local tag=$1 fallback=$2 range
+  range=$(hy2_hop_range_for_tag "$tag")
+  if [[ -n $range ]]; then printf '%s' "$range"; else printf '%s' "$fallback"; fi
+}
+
+hy2_hop_meta_set() {
+  local tag=$1 range=$2 tmp
+  init_meta
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg range "$range" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    .inbounds[$tag]=((.inbounds[$tag]//{})+{updatedAt:$now}) |
+    .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
+}
+
+hy2_hop_meta_disable() {
+  local tag=$1 tmp
+  init_meta
+  tmp=$(temp_file)
+  jq --arg tag "$tag" 'del(.inbounds[$tag].hysteria2PortHopping)' "$META_FILE" >"$tmp"
+  install -m 600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
+}
+
+hy2_hop_enabled_count() {
+  init_meta
+  jq '[.inbounds[]?|select(.hysteria2PortHopping.enabled==true and (.hysteria2PortHopping.range//"")!="")]|length' "$META_FILE"
+}
+
+hy2_hop_ensure_backend() {
+  if command_exists nft || command_exists iptables; then return 0; fi
+  info "端口跳跃需要 nftables/iptables，正在安装 nftables..."
+  install_packages nftables
+  command_exists nft || die "nftables 安装失败，无法启用 Hysteria2 端口跳跃。"
+}
+
+hy2_hop_clear_rules() {
+  if command_exists nft; then
+    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
+  elif command_exists iptables; then
+    iptables -t nat -F SBCTL_HY2_HOP 2>/dev/null || true
+    iptables -t nat -D PREROUTING -j SBCTL_HY2_HOP 2>/dev/null || true
+    iptables -t nat -X SBCTL_HY2_HOP 2>/dev/null || true
+  fi
+}
+
+hy2_hop_boot_service_remove() {
+  case $(init_system) in
+    systemd)
+      systemctl disable --now sbctl-hy2-hop-restore.service >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc)
+      rc-update del sbctl-hy2-hop-restore default >/dev/null 2>&1 || true
+      rm -f "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
+      ;;
+  esac
+}
+
+hy2_hop_boot_service_ensure() {
+  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  case $(init_system) in
+    systemd)
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service" <<EOF_UNIT
+[Unit]
+Description=Restore sbctl Hysteria2 port hopping NAT rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${QUICK_COMMAND} internal-hy2-hop-restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+      systemctl daemon-reload
+      systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || true
+      ;;
+    openrc)
+      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC'
+#!/sbin/openrc-run
+name="sbctl-hy2-hop-restore"
+description="Restore sbctl Hysteria2 port hopping NAT rules"
+$(printf '%s' 'depend() { need net; }')
+$(printf '%s' 'start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }')
+EOF_RC
+      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
+      rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+# Canonical hy2_hop_restore_all lives in hy2_nft.sh (nftables-aware version)
+
+hy2_hop_restore_all() {
+  [[ $(uname -s) == Linux ]] || return 0
+  init_meta
+  [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
+  local count tag range target start end cmd
+  count=$(hy2_hop_enabled_count)
+  if ((count == 0)); then hy2_hop_clear_rules; return 0; fi
+  hy2_hop_ensure_backend
+  if command_exists nft; then
+    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
+    nft add table inet sbctl_hy2_hop
+    nft 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }'
+    while IFS=$'\t' read -r tag range; do
+      [[ -n $tag && -n $range ]] || continue
+      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+      validate_port "$target" || continue
+      nft add rule inet sbctl_hy2_hop prerouting udp dport "$range" redirect to ":${target}"
+    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  else
+    for cmd in iptables ip6tables; do
+      command_exists "$cmd" || continue
+      "$cmd" -t nat -N SBCTL_HY2_HOP >/dev/null 2>&1 || true
+      "$cmd" -t nat -F SBCTL_HY2_HOP
+      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP
+    done
+    while IFS=$'\t' read -r tag range; do
+      [[ -n $tag && -n $range ]] || continue
+      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+      validate_port "$target" || continue
+      start=${range%-*}; end=${range#*-}
+      for cmd in iptables ip6tables; do
+        command_exists "$cmd" || continue
+        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target"
+      done
+    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  fi
+}
+
+# Sync all hop rules after CRUD operations (called from inbound.sh)
+hy2_hop_sync() {
+  hy2_hop_clear_rules
+  local count
+  count=$(hy2_hop_enabled_count)
+  if ((count > 0)); then
+    hy2_hop_restore_all
+    hy2_hop_boot_service_ensure
+  else
+    hy2_hop_boot_service_remove
+  fi
+}
+
+hy2_hop_configure() {
+  local tag=$1 assume_yes=${2:-0} type range current
+  inbound_exists "$tag" || { warn "入站不存在：$tag"; return 1; }
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  [[ $type == hysteria2 ]] || { warn "端口跳跃仅支持 Hysteria2 入站。"; return 1; }
+
+  current=$(hy2_hop_range_for_tag "$tag")
+  if [[ -n $current ]]; then
+    printf '当前端口跳跃范围: %s\n' "$current"
+    if [[ $assume_yes != 1 ]]; then
+      printf '1) 修改范围\n2) 关闭\n0) 返回\n'
+      local choice
+      read -r -p "请选择: " choice || { echo; return; }
+      case $choice in
+        1) :;;
+        2) hy2_hop_meta_disable "$tag"; hy2_hop_sync; info "端口跳跃已关闭。"; return 0;;
+        0) return 0;;
+        *) warn "无效选项。"; return 1;;
+      esac
+    fi
+  fi
+
+  while true; do
+    prompt_value range "端口跳跃范围" "${current:-30000-50000}"
+    validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
+    hy2_hop_check_conflicts "$range" "$tag" || continue
+    break
+  done
+
+  local listen_port internal_port
+  listen_port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  if hy2_port_in_range "$listen_port" "$range"; then
+    warn "listen_port ${listen_port} 在跳跃范围内，需要重新选择内部端口。"
+    hy2_pick_internal_port internal_port "$range" || { warn "无法分配可用端口。"; return 1; }
+    local tmp
+    tmp=$(temp_file)
+    jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp"
+    if apply_candidate "$tmp"; then
+      hy2_hop_meta_set "$tag" "$range"
+      hy2_hop_sync
+      info "Hysteria2 端口跳跃已启用：${range} -> UDP ${internal_port}（外部端口通过 NAT 重定向）"
+    else
+      rm -f "$tmp"
+      return 1
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
+
+  hy2_hop_meta_set "$tag" "$range"
+  hy2_hop_sync
+  info "Hysteria2 端口跳跃已启用：${range} -> UDP ${listen_port}"
+}
+
+# Internal commands (called via dispatch)
+internal_hy2_hop_restore() {
+  require_root internal-hy2-hop-restore
+  hy2_hop_restore_all
+}
+
+internal_hy2_hop_clear() {
+  require_root internal-hy2-hop-clear
+  hy2_hop_clear_rules
+}
+
+# ---- module: inbound ----
+# sbctl inbound — canonical inbound CRUD with transactional meta updates.
+# Optimized: single jq call per display page, no function overrides.
+
+inbound_exists() { jq -e --arg tag "$1" '.inbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; }
+port_in_config() { jq -e --argjson port "$1" --arg except "${2-}" '.inbounds[]?|select(.listen_port==$port and .tag!=$except)' "$CONFIG_FILE" >/dev/null; }
+port_in_use_os() {
+  local port=$1
+  if command_exists ss; then ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"
+  elif command_exists netstat; then netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"
+  else return 1; fi
+}
+
+prompt_tag() {
+  local __var=$1 default=$2 value
+  while true; do
+    prompt_value value "入站标签" "$default"
+    validate_tag "$value" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
+    inbound_exists "$value" && { warn "标签已存在。"; continue; }
+    printf -v "$__var" '%s' "$value"; return
+  done
+}
+_random_port_avoiding_hops() {
+  local candidate hex i
+  for ((i=0; i<64; i++)); do
+    hex=$(random_hex 2)
+    candidate=$((10000 + (16#$hex % 55536)))
+    hy2_port_in_any_hop_range "$candidate" && continue
+    port_in_config "$candidate" && continue
+    port_in_use_os "$candidate" && continue
+    printf '%s' "$candidate"; return 0
+  done
+  printf '443'
+}
+
+prompt_port() {
+  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value
+  while true; do
+    prompt_value value "监听端口" "$default"
+    validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
+    port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
+    if port_in_use_os "$value" && [[ -z $except ]]; then confirm "系统检测到端口 ${value} 已占用，仍继续？" N || continue; fi
+    printf -v "$__var" '%s' "$value"; return
+  done
+}
+
+build_inbound() {
+  local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host tls="" reality_public="" name password uuid flow="" obfs_choice obfs_password up down selected_hop_range="" transport_json="null" ws_path
+  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
+  case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; esac
+  prompt_tag tag "${type}-$(random_hex 2)"
+  prompt_value listen "监听地址" "0.0.0.0"
+
+  # ---- client_host resolution ----
+  #   cert TLS   → auto from certificate server_name (no prompt_public_host)
+  #   REALITY    → prompt_public_host (client_host may differ from SNI)
+  #   no TLS     → prompt_public_host
+  case $type in
+    vless)
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密"
+      case $choice in
+        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host ;;
+        2) build_certificate_tls tls client_host || return 1 ;;
+        3) tls=""; prompt_public_host client_host ;;
+      esac
+      prompt_port port
+      # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
+      if [[ $choice != 1 ]]; then
+        local tp_choice
+        choose tp_choice "传输方式" "tcp" "ws"
+        if [[ $tp_choice == 2 ]]; then
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+        fi
+      fi
+      ;;
+    anytls)
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      if [[ $choice == 1 ]]; then
+        build_reality_tls tls reality_public || return 1
+        prompt_public_host client_host
+      else
+        build_certificate_tls tls client_host || return 1
+      fi
+      prompt_port port
+      ;;
+    trojan)
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      if [[ $choice == 1 ]]; then
+        build_reality_tls tls reality_public || return 1
+        prompt_public_host client_host
+      else
+        build_certificate_tls tls client_host || return 1
+      fi
+      prompt_port port
+      # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
+      if [[ $choice != 1 ]]; then
+        local tp_choice
+        choose tp_choice "传输方式" "tcp" "ws"
+        if [[ $tp_choice == 2 ]]; then
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
+        fi
+      fi
+      ;;
+    hysteria2)
+      build_certificate_tls tls client_host || return 1
+      local hop_choice
+      choose hop_choice "端口模式" "普通端口" "端口跳跃"
+      if [[ $hop_choice == 2 ]]; then
+        while true; do
+          prompt_value selected_hop_range "端口跳跃范围" "30000-50000"
+          validate_hy2_hop_range "$selected_hop_range" && break
+          warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
+        done
+        if ! hy2_hop_check_conflicts "$selected_hop_range" "$tag"; then
+          warn "端口跳跃范围冲突，请重新设置。"
+          return 1
+        fi
+        prompt_hy2_internal_port port "$selected_hop_range" || return 1
+      else
+        prompt_port port
+      fi
+      ;;
+    socks|http)
+      prompt_public_host client_host
+      prompt_port port
+      ;;
+  esac
+
+  case $type in
+    anytls)
+      prompt_value name "用户名称" "user-$(random_hex 2)"
+      prompt_secret password "AnyTLS 密码" "$(random_password)"
+      protocol_build_anytls "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls"
+      ;;
+    vless)
+      prompt_value name "用户名称" "user-$(random_hex 2)"
+      uuid=$(generate_uuid)
+      if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
+      protocol_build_vless "$__json" "$tag" "$listen" "$port" "$name" "$uuid" "$flow" "$tls" "$transport_json"
+      ;;
+    hysteria2)
+      prompt_value name "用户名称" "user-$(random_hex 2)"
+      prompt_secret password "Hysteria2 密码" "$(random_password)"
+      prompt_optional_positive_int up "上行限制 Mbps（留空=不限）"
+      prompt_optional_positive_int down "下行限制 Mbps（留空=不限）"
+      choose obfs_choice "QUIC 混淆" "关闭" "Salamander"
+      if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)"; fi
+      hy2_build "$__json" "$tag" "$listen" "$port" "$name" "$password" "$up" "$down" "$obfs_password" "$tls"
+      ;;
+    trojan)
+      prompt_value name "用户名称" "user-$(random_hex 2)"
+      prompt_secret password "Trojan 密码" "$(random_password)"
+      protocol_build_trojan "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls" "$transport_json"
+      ;;
+    socks|http)
+      prompt_optional name "用户名（留空=无认证）"
+      if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)"; fi
+      [[ -n $name || $listen == 127.0.0.1 || $listen == ::1 ]] || warn "公网无认证代理风险很高。"
+      protocol_build_proxy "$__json" "$type" "$tag" "$listen" "$port" "$name" "$password"
+      ;;
+  esac
+  printf -v "$__host" '%s' "$client_host"
+  printf -v "$__public" '%s' "$reality_public"
+  [[ -z $__hop ]] || printf -v "$__hop" '%s' "$selected_hop_range"
+}
+
+# ---- canonical CRUD (merged from state_guard.sh and management.sh) ----
+
+add_inbound() {
+  ensure_dependencies inbound-add; require_supported_core; ensure_config
+  local inbound host public tag tmp meta_tmp rc=0 type hop_range
+  build_inbound inbound host public hop_range || return 0
+  tag=$(jq -r '.tag' <<<"$inbound")
+  type=$(jq -r '.type' <<<"$inbound")
+  tmp=$(temp_file); meta_tmp=$(temp_file)
+  jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$CONFIG_FILE" >"$tmp"
+  build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
+  # If port hopping was selected during build, stamp metadata before apply
+  if [[ $type == hysteria2 && -n $hop_range ]]; then
+    local meta_tmp2
+    meta_tmp2=$(temp_file)
+    jq --arg tag "$tag" --arg range "$hop_range" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+      .inbounds[$tag]=((.inbounds[$tag]//{})+{updatedAt:$now}) |
+      .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$meta_tmp" >"$meta_tmp2"
+    rm -f "$meta_tmp"
+    meta_tmp=$meta_tmp2
+  fi
+  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
+    # Configure NAT rules post-apply for port hopping
+    if [[ $type == hysteria2 && -n $hop_range ]]; then
+      if hy2_hop_apply_nat; then
+        info "Hysteria2 端口跳跃已启用：${hop_range} -> UDP $(jq -r '.listen_port' <<<"$inbound")"
+      else
+        warn "端口跳跃 NAT 配置失败，当前使用内部监听端口连接。"
+        hy2_hop_meta_disable "$tag"
+      fi
+    fi
+    heading "入站已创建"
+    show_inbound "$tag"
+    print_share "$tag" "" || true
+  else
+    rc=$?
+  fi
+  rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+# Single-jq list_inbounds — one jq call for the entire table.
+# Does NOT call ensure_config/init_meta — callers must ensure config is valid.
+list_inbounds() {
+  [[ -f $CONFIG_FILE ]] || { info "还没有入站。"; return 0; }
+  local rows tag_width=16 type_width=10 port_width=6 security_width=8 transport_width=7 users_width=4
+
+  # One jq call: produces TSV, empty means no inbounds
+  rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),(.transport.type // (if .type=="hysteria2" then "quic" else "tcp" end)),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
+  if [[ -z $rows ]]; then info "还没有入站。"; return 0; fi
+
+  print_table_cell_clipped "标签" "$tag_width"; printf '| '
+  print_table_cell_clipped "协议" "$type_width"; printf '| '
+  print_table_cell "端口" "$port_width"; printf '| '
+  print_table_cell_clipped "安全" "$security_width"; printf '| '
+  print_table_cell_clipped "传输" "$transport_width"; printf '| '
+  printf '用户\n'
+
+  while IFS=$'\t' read -r tag type port security transport users; do
+    print_table_cell_clipped "$tag" "$tag_width"; printf '| '
+    print_table_cell_clipped "$type" "$type_width"; printf '| '
+    print_table_cell "$port" "$port_width"; printf '| '
+    print_table_cell_clipped "$security" "$security_width"; printf '| '
+    print_table_cell_clipped "$transport" "$transport_width"; printf '| '
+    printf '%s\n' "$users"
+  done <<<"$rows"
+}
+
+show_inbound() {
+  local tag=$1
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)' "$CONFIG_FILE"
+}
+
+select_inbound() {
+  local __var=$1 filter=${2-} __item __answer __selected
+  local tags=()
+  ensure_config
+  while IFS= read -r __item; do [[ -n $__item ]] && tags+=("$__item"); done < <(
+    if [[ -n $filter ]]; then jq -r --arg re "$filter" '.inbounds[]|select(.type|test($re))|.tag' "$CONFIG_FILE"; else jq -r '.inbounds[].tag' "$CONFIG_FILE"; fi
+  )
+  ((${#tags[@]})) || { warn "没有可选入站。"; return 1; }
+  if ((${#tags[@]} == 1)); then __selected=${tags[0]}; else choose __answer "选择入站" "${tags[@]}" || return 1; __selected=${tags[$((__answer-1))]}; fi
+  printf -v "$__var" '%s' "$__selected"
+}
+
+delete_inbound() {
+  ensure_dependencies inbound-delete; ensure_config
+  local tag=${1-} yes=${2:-0} tmp meta_tmp rc=0
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return 0
+  tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
+  jq --arg tag "$tag" '
+    .inbounds |= map(select(.tag!=$tag)) |
+    .route.rules = [(.route.rules // [])[]? |
+      if ((.inbound // null)|type)=="array" and ((.inbound // [])|index($tag))!=null then
+        .inbound |= map(select(.!=$tag)) | select((.inbound|length)>0)
+      elif (.inbound // null)==$tag then empty
+      else . end]' "$CONFIG_FILE" >"$tmp"
+  jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$meta_tmp"
+  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
+    hy2_hop_sync
+    info "已删除入站 ${tag}。"
+  else
+    rc=$?
+  fi
+  rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+modify_inbound_basic() {
+  ensure_dependencies inbound-modify; ensure_config
+  local tag=${1-} listen port host public tmp meta_tmp rc=0
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")"
+  prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag"
+  prompt_public_host host "$(public_host_for_tag "$tag")"
+  public=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPublicKey // empty' "$META_FILE" 2>/dev/null || true)
+  tmp=$(temp_file); meta_tmp=$(temp_file)
+  jq --arg tag "$tag" --arg listen "$listen" --argjson port "$port" '(.inbounds[]|select(.tag==$tag)) |= (.listen=$listen | .listen_port=$port)' "$CONFIG_FILE" >"$tmp"
+  build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
+  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
+    hy2_hop_sync
+  else
+    rc=$?
+  fi
+  rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+modify_inbound_security() {
+  ensure_dependencies inbound-security; require_supported_core; ensure_config
+  local tag=${1-} type choice tls="" public="" tmp meta_tmp host rc=0
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  case $type in
+    anytls|vless|trojan)
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      if [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls; fi
+      ;;
+    hysteria2)
+      info "Hysteria2 必须使用证书 TLS。"
+      build_certificate_tls tls
+      ;;
+    *) die "${type} 入站没有 sbctl 可管理的 TLS/REALITY 安全层。";;
+  esac
+  host=$(public_host_for_tag "$tag" || true)
+  [[ -n $host ]] || prompt_public_host host
+  tmp=$(temp_file); meta_tmp=$(temp_file)
+  jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
+    (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
+    if $type=="vless" then
+      (.inbounds[]|select(.tag==$tag)|.users) |= map(.flow=(if $tls.reality.enabled==true then "xtls-rprx-vision" else "" end))
+    else . end' "$CONFIG_FILE" >"$tmp"
+  build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
+  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then info "入站 ${tag} 的安全方式已更新。"; else rc=$?; fi
+  rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+rename_inbound() {
+  ensure_dependencies inbound-rename; ensure_config
+  local old=${1-} new=${2-} tmp meta_tmp rc=0
+  [[ -n $old ]] || select_inbound old || return 0
+  inbound_exists "$old" || die "找不到入站：$old"
+  if [[ -z $new ]]; then
+    while true; do
+      prompt_value new "新入站名称" "$old"
+      [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
+      validate_tag "$new" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
+      if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
+      break
+    done
+  fi
+  validate_tag "$new" || die "标签格式无效。"
+  inbound_exists "$new" && die "入站标签已存在：$new"
+  outbound_exists "$new" && die "出站标签已存在：$new"
+  tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
+  jq --arg old "$old" --arg new "$new" '
+    (.inbounds[]|select(.tag==$old)|.tag)=$new |
+    .route.rules = [(.route.rules // [])[]? |
+      if ((.inbound // null)|type)=="array" then
+        .inbound |= map(if .==$old then $new else . end)
+      elif (.inbound // null)==$old then .inbound=$new
+      else . end]' "$CONFIG_FILE" >"$tmp"
+  jq --arg old "$old" --arg new "$new" 'if .inbounds[$old] then .inbounds[$new]=.inbounds[$old] | del(.inbounds[$old]) else . end' "$META_FILE" >"$meta_tmp"
+  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
+    hy2_hop_sync
+    info "入站已重命名：${old} -> ${new}"
+  else
+    rc=$?
+  fi
+  rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+# ---- module: inbound/clients ----
+client_label_field() {
+  case $1 in socks|http|mixed) printf username;; *) printf name;; esac
+}
+
+client_exists() {
+  local tag=$1 name=$2 type field
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  jq -e --arg tag "$tag" --arg name "$name" --arg field "$field" '.inbounds[]|select(.tag==$tag)|.users[]?|select(.[$field]==$name)' "$CONFIG_FILE" >/dev/null
+}
+
+add_client() {
+  ensure_dependencies client-add; ensure_config
+  local tag=${1-} type name password uuid flow user tmp
+  [[ -n $tag ]] || select_inbound tag '^(anytls|vless|hysteria2|trojan|socks|http|mixed)$' || return 0
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  while true; do
+    prompt_value name "用户名称" "user-$(random_hex 2)"
+    client_exists "$tag" "$name" && { warn "用户名称已存在。"; continue; }
+    break
+  done
+  case $type in
+    vless)
+      uuid=$(generate_uuid)
+      flow=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[0].flow // empty' "$CONFIG_FILE")
+      user=$(jq -n --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" '{name:$name,uuid:$uuid,flow:$flow}') ;;
+    anytls|hysteria2|trojan)
+      prompt_secret password "密码" "$(random_password)"
+      user=$(jq -n --arg name "$name" --arg password "$password" '{name:$name,password:$password}') ;;
+    socks|http|mixed)
+      prompt_secret password "密码" "$(random_password)"
+      user=$(jq -n --arg username "$name" --arg password "$password" '{username:$username,password:$password}') ;;
+    *) warn "该协议不支持用户管理。"; return 0;;
+  esac
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --argjson user "$user" '(.inbounds[]|select(.tag==$tag)|.users) += [$user]' "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then info "用户 ${name} 已添加。"; print_share "$tag" "$name" || true; fi
+  rm -f "$tmp"
+}
+
+list_clients() {
+  # Pure display — does NOT call ensure_config.
+  [[ -f $CONFIG_FILE ]] || { info "配置不存在。"; return 1; }
+  local tag=${1-} type i=0 name cred
+  [[ -n $tag ]] || select_inbound tag || return 0
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  heading "${tag} 用户"
+  case $type in
+    vless)
+      while IFS=$'\t' read -r name cred; do
+        ((i+=1))
+        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.uuid]|@tsv' "$CONFIG_FILE")
+      ;;
+    anytls|hysteria2|trojan)
+      while IFS=$'\t' read -r name cred; do
+        ((i+=1))
+        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.password]|@tsv' "$CONFIG_FILE")
+      ;;
+    socks|http|mixed)
+      while IFS=$'\t' read -r name cred; do
+        ((i+=1))
+        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.username,.password]|@tsv' "$CONFIG_FILE")
+      ;;
+  esac
+  (($i)) || info "还没有用户。"
+}
+
+select_client() {
+  local __var=$1 tag=$2 type field
+  local names=() _n
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  while IFS= read -r _n; do
+    [[ -n $_n ]] && names+=("$_n")
+  done < <(jq -r --arg tag "$tag" --arg field "$field" '.inbounds[]|select(.tag==$tag)|.users[]?|.[$field]' "$CONFIG_FILE")
+  ((${#names[@]})) || { warn "该入站还没有用户。"; return 1; }
+  if ((${#names[@]} == 1)); then
+    printf -v "$__var" '%s' "${names[0]}"
+    return 0
+  fi
+  local choice
+  choose choice "选择用户" "${names[@]}" || return 1
+  printf -v "$__var" '%s' "${names[$((choice-1))]}"
+}
+
+delete_client() {
+  ensure_dependencies client-delete; ensure_config
+  local tag=${1-} name=${2-} type field tmp
+  [[ -n $tag ]] || select_inbound tag || return 0
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  if [[ -z $name ]]; then
+    select_client name "$tag" || return 0
+  fi
+  client_exists "$tag" "$name" || die "找不到用户：${name}"
+  confirm "删除用户 ${name}？" N || return 0
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg name "$name" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users) |= map(select(.[$field]!=$name))' "$CONFIG_FILE" >"$tmp"
+  apply_candidate "$tmp"; rm -f "$tmp"
+}
+
+rotate_client_credential() {
+  ensure_dependencies client-rotate; ensure_config
+  local tag=${1-} name=${2-} type field value tmp
+  [[ -n $tag ]] || select_inbound tag || return 0
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  [[ -n $name ]] || { select_client name "$tag" || return 0; }
+  client_exists "$tag" "$name" || die "找不到用户：${name}"
+  tmp=$(temp_file)
+  if [[ $type == vless ]]; then
+    value=$(generate_uuid)
+    jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.uuid)=$value' "$CONFIG_FILE" >"$tmp"
+  else
+    value=$(random_password)
+    jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
+  fi
+  if apply_candidate "$tmp"; then info "新凭据：${value}"; fi
+  rm -f "$tmp"
+}
+
+client_json_for_anytls() {
+  local tag=$1 name=$2 host port password sni public sid
+  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"; port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  password=$(jq -r --arg tag "$tag" --arg name "$name" '.inbounds[]|select(.tag==$tag)|.users[]|select(.name==$name)|.password' "$CONFIG_FILE")
+  sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
+  jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"; return 0; }
+  if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+    public=$(reality_public_key "$tag") || warn "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"
+    sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
+    jq -n --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg public "$public" --arg sid "$sid" '{type:"anytls",tag:"proxy",server:$host,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$public,short_id:$sid}}}'
+  else
+    jq -n --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$sni" '{type:"anytls",tag:"proxy",server:$host,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni}}'
+  fi
+}
+
+rename_client() {
+  ensure_dependencies client-rename; ensure_config
+  local tag=${1-} old=${2-} new=${3-} type field tmp
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  field=$(client_label_field "$type")
+  if [[ -z $old ]]; then list_clients "$tag"; select_client old "$tag" || return 0; fi
+  client_exists "$tag" "$old" || die "找不到用户：$old"
+  if [[ -z $new ]]; then prompt_value new "新用户名称" "$old"; fi
+  [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
+  client_exists "$tag" "$new" && die "用户名称已存在：$new"
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg old "$old" --arg new "$new" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$old)|.[$field])=$new' "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then info "用户已重命名：${old} -> ${new}"; fi
+  rm -f "$tmp"
+}
+
+# Canonical print_share lives in share.sh
+
+# ---- module: outbound ----
+outbound_exists() {
+  jq -e --arg tag "$1" '.outbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null
+}
+
+detect_local_ips() {
+  local iface ip line
+  if command_exists ip; then
+    while IFS= read -r line; do
+      iface=$(awk '{print $2}' <<<"$line")
+      ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
+      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      validate_ipv4 "$ip" || continue
+      [[ $ip =~ ^127\. ]] && continue
+      printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ip -o -4 addr show 2>/dev/null)
+    while IFS= read -r line; do
+      iface=$(awk '{print $2}' <<<"$line")
+      ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
+      ip=${ip%%%*}
+      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ -z $ip || $ip == ::1 || $ip == fe80:* ]] && continue
+      printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ip -o -6 addr show 2>/dev/null)
+  elif command_exists ifconfig; then
+    while IFS= read -r line; do
+      iface=$(awk '{print $1}' <<<"$line" | sed 's/:$//')
+      ip=$(awk '{print $2}' <<<"$line")
+      validate_ipv4 "$ip" || continue
+      [[ $ip =~ ^127\. ]] && continue
+      printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127\.')
+    while IFS= read -r line; do
+      iface=$(awk '{print $1}' <<<"$line" | sed 's/:$//')
+      ip=$(awk '{print $2}' <<<"$line")
+      ip=${ip%%%*}
+      [[ -z $ip || $ip == ::1 || $ip == fe80:* ]] && continue
+      printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
+    done < <(ifconfig 2>/dev/null | grep 'inet6 ' | grep -v '::1\|fe80:')
+  fi
+}
+
+_local_tag_for_ip() {
+  local ip=$1
+  printf 'local-%s' "$(printf '%s' "$ip" | tr ':.' '-')"
+}
+
+_ensure_local_outbound() {
+  local ip=$1 tag tmp bind_field
+  tag=$(_local_tag_for_ip "$ip")
+  outbound_exists "$tag" && { printf '%s' "$tag"; return 0; }
+  # sing-box uses inet4_bind_address / inet6_bind_address
+  if [[ $ip == *:* ]]; then bind_field=inet6_bind_address; else bind_field=inet4_bind_address; fi
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg ip "$ip" --arg field "$bind_field" \
+    '.outbounds += [{type:"direct",tag:$tag} + {($field):$ip}]' \
+    "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp" >&2; then
+    printf '%s' "$tag"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+is_managed_inbound_route_rule() {
+  local inbound=$1
+  jq -e --arg inbound "$inbound" '
+    type=="object" and .action=="route" and (.inbound // [])==[$inbound] and
+    ((keys_unsorted | sort) == (["action","inbound","outbound"] | sort))' >/dev/null
+}
+
+current_outbound_for_inbound() {
+  local inbound=$1 selected
+  selected=$(jq -r --arg inbound "$inbound" '
+    [(.route.rules // [])[]? |
+      select(.action=="route" and (.inbound // [])==[$inbound] and
+        ((keys_unsorted | sort) == (["action","inbound","outbound"] | sort))) |
+      .outbound][0] // empty' "$CONFIG_FILE")
+  if [[ -n $selected ]]; then printf '%s' "$selected"; else jq -r '.route.final // "direct"' "$CONFIG_FILE"; fi
+}
+
+# Pure display — does NOT call ensure_config. Callers must validate config.
+list_outbound_overview() {
+  [[ -f $CONFIG_FILE ]] || { info "还没有配置。"; return 0; }
+  local inbound outbound type server port user number=0
+  heading "入站与出站规则"
+  if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then
+    info "还没有入站。"
+  else
+    print_table_cell_clipped "入站" 26; printf '| 出站\n'
+    while IFS= read -r inbound; do
+      outbound=$(current_outbound_for_inbound "$inbound")
+      local display="$outbound"
+      if [[ $outbound =~ ^local- ]]; then
+        local ip; ip=$(jq -r --arg tag "$outbound" '.outbounds[]?|select(.tag==$tag)|(.inet4_bind_address // .inet6_bind_address // empty)' "$CONFIG_FILE" 2>/dev/null || true)
+        display="${ip:-$outbound}"
+      fi
+      print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$display"
+    done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+  fi
+
+  heading "SOCKS5 / HTTP 出站"
+  if ! jq -e '.outbounds[]?|select(.type=="socks" or .type=="http")' "$CONFIG_FILE" >/dev/null; then
+    info "还没有代理出站。"
+    return 0
+  fi
+  print_table_cell "序号" 6; printf '| '
+  print_table_cell_clipped "标签" 22; printf '| '
+  print_table_cell "协议" 8; printf '| '
+  print_table_cell_clipped "地址" 26; printf '| 用户\n'
+  while IFS=$'\t' read -r outbound type server port user; do
+    ((number+=1))
+    print_table_cell "$number" 6; printf '| '
+    print_table_cell_clipped "$outbound" 22; printf '| '
+    print_table_cell "$type" 8; printf '| '
+    print_table_cell_clipped "$(uri_host "$server"):${port}" 26; printf '| %s\n' "${user:-无}"
+  done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|[.tag,.type,.server,(.server_port|tostring),(.username//"")]|@tsv' "$CONFIG_FILE")
+}
+
+prompt_outbound_tag() {
+  local __var=$1 default=$2 candidate
+  while true; do
+    prompt_value candidate "出站标签" "$default" || return 1
+    validate_tag "$candidate" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
+    if outbound_exists "$candidate" || inbound_exists "$candidate"; then warn "标签已存在。"; continue; fi
+    printf -v "$__var" '%s' "$candidate"
+    return 0
+  done
+}
+
+add_outbound() {
+  ensure_dependencies outbound-add; require_supported_core; ensure_config
+  local choice type tag server port auth username="" password="" outbound tmp
+  choose choice "选择出站协议" "SOCKS5" "HTTP"
+  [[ $choice == 1 ]] && type=socks || type=http
+  prompt_outbound_tag tag "${type}-out-$(random_hex 2)"
+  prompt_value server "代理服务器地址"
+  prompt_value port "代理服务器端口"
+  validate_port "$port" || die "端口必须为 1-65535。"
+  choose auth "认证方式" "无认证" "用户名密码"
+  if [[ $auth == 2 ]]; then
+    prompt_value username "用户名"
+    prompt_secret password "密码"
+  fi
+  if [[ $type == socks ]]; then
+    outbound=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg user "$username" --arg pass "$password" '
+      {type:"socks",tag:$tag,server:$server,server_port:$port,version:"5"} |
+      if $user!="" then .username=$user|.password=$pass else . end')
+  else
+    outbound=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg user "$username" --arg pass "$password" '
+      {type:"http",tag:$tag,server:$server,server_port:$port} |
+      if $user!="" then .username=$user|.password=$pass else . end')
+  fi
+  tmp=$(temp_file)
+  jq --argjson outbound "$outbound" '.outbounds += [$outbound]' "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then info "出站 ${tag} 已添加。"; fi
+  rm -f "$tmp"
+}
+
+select_outbound() {
+  local __var=$1 include_direct=${2:-1} item answer selected
+  local tags=() local_ips=() local_ip_tags=() local_raw_ips=()
+  ((include_direct == 0)) || tags+=(direct)
+  while IFS= read -r item; do [[ -n $item ]] && tags+=("$item"); done < <(
+    jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|.tag' "$CONFIG_FILE"
+  )
+  # 检测本地 IP
+  while IFS=$'\t' read -r label ip iface; do
+    local tag; tag=$(_local_tag_for_ip "$ip")
+    local_ip_tags+=("$tag")
+    local found=0
+    for t in "${tags[@]}"; do [[ $t == "$tag" ]] && { found=1; break; }; done
+    if ((!found)); then tags+=("$tag"); fi
+    local_ips+=("$label")
+    local_raw_ips+=("$ip")
+  done < <(ensure_config 2>/dev/null || true; detect_local_ips 2>/dev/null)
+  ((${#tags[@]})) || { warn "没有可选出站。"; return 1; }
+  # 构建显示标签
+  local display_labels=()
+  for t in "${tags[@]}"; do
+    if [[ $t == direct ]]; then
+      display_labels+=("direct")
+    elif [[ $t =~ ^local- ]]; then
+      local dlabel="" found=0 i
+      for ((i=0; i<${#local_ip_tags[@]}; i++)); do
+        [[ ${local_ip_tags[$i]} == "$t" ]] && { dlabel="${local_ips[$i]}"; found=1; break; }
+      done
+      if ((found)); then display_labels+=("${dlabel}"); else display_labels+=("$t"); fi
+    else
+      local stype; stype=$(jq -r --arg tag "$t" '.outbounds[]?|select(.tag==$tag)|.type' "$CONFIG_FILE" 2>/dev/null || printf '?')
+      local saddr; saddr=$(jq -r --arg tag "$t" '.outbounds[]?|select(.tag==$tag)|"\(.server // "?"):\(.server_port // "?")"' "$CONFIG_FILE" 2>/dev/null || printf '?:?')
+      display_labels+=("$t ($stype · $saddr)")
+    fi
+  done
+  choose answer "选择出站" "${display_labels[@]}"
+  selected=${tags[$((answer-1))]}
+  if [[ $selected =~ ^local- ]]; then
+    local ip=""
+    ip=$(jq -r --arg tag "$selected" '.outbounds[]?|select(.tag==$tag)|(.inet4_bind_address // .inet6_bind_address // empty)' "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -z $ip ]]; then
+      for ((i=0; i<${#local_ip_tags[@]}; i++)); do
+        [[ ${local_ip_tags[$i]} == "$selected" ]] && { ip="${local_raw_ips[$i]}"; break; }
+      done
+    fi
+    [[ -n $ip ]] || { error "无法解析本地 IP。"; return 1; }
+    selected=$(_ensure_local_outbound "$ip") || { error "无法创建本地出口。"; return 1; }
+  fi
+  printf -v "$__var" '%s' "$selected"
+}
+
+assign_outbound() {
+  ensure_dependencies outbound-assign; require_supported_core; ensure_config
+  local inbound=${1-} outbound=${2-} tmp
+  [[ -n $inbound ]] || select_inbound inbound || return 0
+  inbound_exists "$inbound" || die "找不到入站：$inbound"
+  [[ -n $outbound ]] || select_outbound outbound 1 || return 0
+  [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
+
+  tmp=$(temp_file)
+  jq --arg inbound "$inbound" --arg outbound "$outbound" '
+    .route = (.route // {}) |
+    .route.rules = ((.route.rules // []) | map(
+      select(.action!="route" or (.inbound // [])!=[$inbound] or
+        ((keys_unsorted | sort) != (["action","inbound","outbound"] | sort))))) |
+    if $outbound=="direct" then .
+    else .route.rules = ([{inbound:[$inbound],action:"route",outbound:$outbound}] + .route.rules) end' \
+    "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then info "入站 ${inbound} 已设置为出站 ${outbound}。"; fi
+  rm -f "$tmp"
+}
+
+delete_outbound() {
+  ensure_dependencies outbound-delete; require_supported_core; ensure_config
+  local tag=${1-} answer item tmp manual_refs
+  if [[ -z $tag ]]; then
+    local tags=()
+    while IFS= read -r item; do [[ -n $item ]] && tags+=("$item"); done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|.tag' "$CONFIG_FILE")
+    ((${#tags[@]})) || { warn "没有可删除的代理出站。"; return 0; }
+    if ((${#tags[@]} == 1)); then tag=${tags[0]}; else choose answer "选择出站" "${tags[@]}" || return 0; tag=${tags[$((answer-1))]}; fi
+  fi
+  [[ $tag != direct ]] || { warn "direct 出站不能删除。"; return 0; }
+  outbound_exists "$tag" || die "找不到出站：$tag"
+  manual_refs=$(jq -r --arg tag "$tag" '[.route.rules[]? | select(.outbound==$tag) | select((.action=="route" and ((.inbound//[])|length)==1 and ((keys_unsorted|sort)==(["action","inbound","outbound"]|sort))) | not)] | length' "$CONFIG_FILE")
+  ((manual_refs == 0)) || { warn "该出站仍被自定义路由规则引用，请先在完整配置中处理。"; return 0; }
+  confirm "删除出站 ${tag}？使用它的 sbctl 入站绑定会恢复 direct。" N || return 0
+  tmp=$(temp_file)
+  jq --arg tag "$tag" '
+    .outbounds |= map(select(.tag!=$tag)) |
+    .route.rules = ((.route.rules // []) | map(select(.outbound!=$tag)))' "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then info "出站 ${tag} 已删除。"; fi
+  rm -f "$tmp"
+}
+
+# ---- outbound overview display (from layout.sh) ----
+
+# ---- module: share ----
+# Share output aligned with xrayctl's interaction style.
+
+share_separator() {
+  printf '%s\n' '------------------------------------------------------------------------'
+}
+
+print_share_entry() {
+  local label=$1 field=$2 value=$3
+  share_separator
+  printf '用户: %s\n%s: %s\n' "$label" "$field" "$value"
+}
+
+print_share() {
+  # Does NOT call ensure_config — caller validates config once at entry.
+  [[ -f $CONFIG_FILE ]] || { warn "配置不存在。"; return 1; }
+  local tag=${1-} filter=${2-} type host uri_host port name value flow sni public sid security tls_enabled obfs obfs_password link json
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"
+  uri_host=$(uri_host "$host")
+  port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  heading "${tag} 分享信息"
+
+  case $type in
+    vless)
+      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
+      tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
+      if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+        security=reality
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
+        sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
+      elif [[ $tls_enabled == true ]]; then
+        security=tls
+      else
+        security=none
+      fi
+      while IFS=$'\t' read -r name value flow; do
+        [[ -z $filter || $name == "$filter" ]] || continue
+        if [[ $security == reality ]]; then
+          link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
+          [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
+        elif [[ $security == tls ]]; then
+          link="vless://${value}@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+        else
+          link="vless://${value}@${uri_host}:${port}?type=tcp"
+        fi
+        link+="#$(url_encode "${tag}-${name}")"
+        print_share_entry "$name" "链接" "$link"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.uuid,(.flow//"")]|@tsv' "$CONFIG_FILE")
+      ;;
+
+    trojan)
+      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
+      tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
+      if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+        security=reality
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
+        sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
+      elif [[ $tls_enabled == true ]]; then
+        security=tls
+      else
+        warn "Trojan 入站未启用 TLS/REALITY，无法生成分享链接。"; return 0
+      fi
+      while IFS=$'\t' read -r name value; do
+        [[ -z $filter || $name == "$filter" ]] || continue
+        if [[ $security == reality ]]; then
+          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
+        else
+          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+        fi
+        link+="#$(url_encode "${tag}-${name}")"
+        print_share_entry "$name" "链接" "$link"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
+      ;;
+
+    hysteria2)
+      jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "Hysteria2 必须启用 TLS。"; return 0; }
+      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
+      obfs=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.type // empty' "$CONFIG_FILE")
+      obfs_password=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.obfs.password // empty' "$CONFIG_FILE")
+      share_port=$(hy2_hop_client_port_spec "$tag" "$port")
+      while IFS=$'\t' read -r name value; do
+        [[ -z $filter || $name == "$filter" ]] || continue
+        link="hysteria2://$(url_encode "$value")@${uri_host}:${share_port}?sni=$(url_encode "$sni")"
+        [[ -z $obfs ]] || link+="&obfs=$(url_encode "$obfs")&obfs-password=$(url_encode "$obfs_password")"
+        link+="#$(url_encode "${tag}-${name}")"
+        print_share_entry "$name" "链接" "$link"
+      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
+      ;;
+
+    anytls)
+      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
+      tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
+      [[ $tls_enabled == true ]] || { warn "AnyTLS 入站未启用 TLS，无法生成分享信息。"; return 0; }
+      if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+        while IFS= read -r name; do
+          [[ -z $filter || $name == "$filter" ]] || continue
+          json=$(client_json_for_anytls "$tag" "$name")
+          print_share_entry "$name" "客户端 outbound JSON" "$json"
+        done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
+      else
+        while IFS=$'\t' read -r name value; do
+          [[ -z $filter || $name == "$filter" ]] || continue
+          link="anytls://$(url_encode "$value")@${uri_host}:${port}/?sni=$(url_encode "$sni")#$(url_encode "${tag}-${name}")"
+          print_share_entry "$name" "链接" "$link"
+        done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
+      fi
+      ;;
+
+    socks|http)
+      if [[ $(jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users//[])|length' "$CONFIG_FILE") == 0 ]]; then
+        link="${type}://${uri_host}:${port}  无认证"
+        print_share_entry "无认证" "链接" "$link"
+      else
+        while IFS=$'\t' read -r name value; do
+          [[ -z $filter || $name == "$filter" ]] || continue
+          link="${type}://$(url_encode "$name"):$(url_encode "$value")@${uri_host}:${port}#$(url_encode "${tag}-${name}")"
+          print_share_entry "$name" "链接" "$link"
+        done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
+      fi
+      ;;
+    *)
+      warn "该入站协议不提供 sbctl 分享信息：${type}"; return 0
+      ;;
+  esac
+  share_separator
+}
+
+print_all_share() {
+  ensure_config
+  local tag
+  if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then info "还没有入站。"; return 0; fi
+  while IFS= read -r tag; do
+    print_share "$tag" "" || warn "${tag} 分享信息生成失败。"
+  done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+}
+
+# ---- module: certificate/lifecycle ----
+# sbctl certificate lifecycle — canonical implementation.
+# Includes Let's Encrypt, Cloudflare DNS, manual DNS, and IP certificate flows.
+
+validate_email_address() { [[ ${1:-} == *@*.* && ${1:-} != *" "* ]]; }
+validate_certificate_identifier() { [[ ${1:-} =~ ^[A-Za-z0-9_.-]+$ ]]; }
+
+certbot_supports_ip() { [[ -x $CERTBOT_BIN ]] && "$CERTBOT_BIN" --help all 2>/dev/null | grep -q -- '--ip-address'; }
+
+certbot_nginx_available() {
+  [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_nginx' >/dev/null 2>&1
+}
+
+install_certbot() { ensure_certbot_environment; }
+
+certbot_account_ids() {
+  local file id
+  for file in "$CERTBOT_CONFIG_DIR"/accounts/*/*/*/regr.json; do
+    [[ -f $file ]] || continue
+    id=$(basename "$(dirname "$file")")
+    printf '%s\n' "$id"
+  done | sort -u
+}
+
+certbot_account_exists() {
+  local wanted=$1 id
+  while IFS= read -r id; do [[ $id == "$wanted" ]] && return 0; done < <(certbot_account_ids)
+  return 1
+}
+
+certbot_lineage_account() {
+  local cert_name=$1
+  local conf="$CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf"
+  [[ -r $conf ]] || return 1
+  sed -n 's/^[[:space:]]*account[[:space:]]*=[[:space:]]*//p' "$conf" | sed -n '1p'
+}
+
+select_certbot_account() {
+  local __var=$1 cert_name=${2:-} configured=${SBCTL_CERTBOT_ACCOUNT:-} lineage="" id answer
+  local ids=()
+  if [[ -n $cert_name ]]; then
+    lineage=$(certbot_lineage_account "$cert_name" 2>/dev/null || true)
+    if [[ -n $lineage ]]; then
+      if certbot_account_exists "$lineage"; then printf -v "$__var" '%s' "$lineage"; return 0; fi
+      warn "证书 ${cert_name} 记录的 Certbot 账户 ${lineage} 已不存在。"
+    fi
+  fi
+  if [[ -n $configured ]]; then
+    certbot_account_exists "$configured" || { warn "SBCTL_CERTBOT_ACCOUNT 指定的账户不存在：$configured"; return 1; }
+    printf -v "$__var" '%s' "$configured"
+    return 0
+  fi
+  while IFS= read -r id; do [[ -n $id ]] && ids+=("$id"); done < <(certbot_account_ids)
+  case ${#ids[@]} in
+    0) printf -v "$__var" '%s' ""; return 0;;
+    1) printf -v "$__var" '%s' "${ids[0]}"; return 0;;
+  esac
+  if [[ ! -t 0 ]]; then
+    warn "检测到多个 Certbot 账户；非交互模式请设置 SBCTL_CERTBOT_ACCOUNT=<账户ID>。"
+    return 1
+  fi
+  choose answer "选择 Let's Encrypt / Certbot 账户" "${ids[@]}" || return 1
+  printf -v "$__var" '%s' "${ids[$((answer-1))]}"
+}
+
+certbot_issue_cmd() {
+  local cert_name=$1; shift
+  local account="" args=("$@")
+  select_certbot_account account "$cert_name" || return 1
+  [[ -z $account ]] || args+=(--account "$account")
+  certbot_cmd "${args[@]}"
+}
+
+detect_port80_owner() {
+  local pid pname="" line
+  if command_exists ss; then
+    line=$(ss -H -ltnp 2>/dev/null | awk '$4 ~ /:80$/ || $4 ~ /\]:80$/ {print; exit}')
+    pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$line" | head -1)
+    [[ -z $pid ]] || pname=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')
+    [[ -n $line ]] || { printf free; return; }
+  elif command_exists netstat; then
+    line=$(netstat -ltnp 2>/dev/null | awk '$4 ~ /:80$/ {print; exit}')
+    [[ -n $line ]] || { printf free; return; }
+    pname=$(awk '{print $7}' <<<"$line" | sed 's#^[0-9]*/##')
+  else
+    printf unknown; return
+  fi
+  case $pname in
+    sing-box) printf sing-box;;
+    nginx) printf nginx;;
+    httpd|apache2) printf apache;;
+    "") printf other;;
+    *) printf other;;
+  esac
+}
+
+# ---- cert renewal helpers ----
+
+# Legacy hook writer — creates per-cert deploy hook for Certbot.
+# Still available for compatibility; canonical renewal uses setup_certbot_renewal_timer.
+write_certbot_hook() {
+  local domain=$1 hook
+  hook="${CERTBOT_HOOK_DIR}/sbctl-${domain}"
+  mkdir -p "$(dirname "$hook")"
+  case $(init_system) in
+    systemd)
+      cat >"$hook" <<EOF_HOOK
+#!/usr/bin/env bash
+set -e
+install -m 600 /etc/letsencrypt/live/${domain}/fullchain.pem ${CERT_DIR}/${domain}.crt
+install -m 600 /etc/letsencrypt/live/${domain}/privkey.pem ${CERT_DIR}/${domain}.key
+systemctl try-restart ${SERVICE_NAME}.service || true
+EOF_HOOK
+      ;;
+    openrc)
+      cat >"$hook" <<EOF_HOOK
+#!/usr/bin/env bash
+set -e
+install -m 600 /etc/letsencrypt/live/${domain}/fullchain.pem ${CERT_DIR}/${domain}.crt
+install -m 600 /etc/letsencrypt/live/${domain}/privkey.pem ${CERT_DIR}/${domain}.key
+rc-service ${SERVICE_NAME} restart || true
+EOF_HOOK
+      ;;
+  esac
+  chmod 700 "$hook"
+}
+
+replace_certificate_pair() {
+  local source_cert=$1 source_key=$2 cert_target=$3 key_target=$4 __changed_var=${5:-}
+  local cert_tmp="${cert_target}.new" key_tmp="${key_target}.new" cert_bak="${cert_target}.bak" key_bak="${key_target}.bak"
+  local replace_changed=1 had_cert=0 had_key=0 failed=0
+  mkdir -p "$(dirname "$cert_target")"
+  install -m 600 "$source_cert" "$cert_tmp" || return 1
+  install -m 600 "$source_key" "$key_tmp" || { rm -f "$cert_tmp"; return 1; }
+  validate_certificate_pair "$cert_tmp" "$key_tmp" || { rm -f "$cert_tmp" "$key_tmp"; warn "新证书或私钥无效/不匹配/已过期。"; return 1; }
+  if [[ -f $cert_target && -f $key_target ]] && cmp -s "$cert_tmp" "$cert_target" && cmp -s "$key_tmp" "$key_target"; then
+    replace_changed=0; rm -f "$cert_tmp" "$key_tmp"
+    [[ -z $__changed_var ]] || printf -v "$__changed_var" '%s' "$replace_changed"
+    return 0
+  fi
+  [[ ! -f $cert_target ]] || { cp -a "$cert_target" "$cert_bak"; had_cert=1; }
+  [[ ! -f $key_target ]] || { cp -a "$key_target" "$key_bak"; had_key=1; }
+  mv -f "$cert_tmp" "$cert_target" || failed=1
+  mv -f "$key_tmp" "$key_target" || failed=1
+  if ((failed)); then
+    ((had_cert)) && mv -f "$cert_bak" "$cert_target" || rm -f "$cert_target"
+    ((had_key)) && mv -f "$key_bak" "$key_target" || rm -f "$key_target"
+    rm -f "$cert_tmp" "$key_tmp" "$cert_bak" "$key_bak"
+    warn "证书替换失败，已恢复原状态。"; return 1
+  fi
+  rm -f "$cert_bak" "$key_bak"
+  [[ -z $__changed_var ]] || printf -v "$__changed_var" '%s' "$replace_changed"
+}
+
+restart_sing_box_if_certificate_changed() {
+  [[ ${1:-0} == 1 ]] || return 0
+  service_is_active || return 0
+  if restart_service_checked; then info "sing-box 已重启以加载新证书。"; else warn "证书已更新，但 sing-box 重启失败。"; return 1; fi
+}
+
+sync_managed_certificate() {
+  local identifier=$1 cert_name=${2:-$1} __changed_var=${3:-}
+  local source_cert="${CERTBOT_CONFIG_DIR}/live/${cert_name}/fullchain.pem"
+  local source_key="${CERTBOT_CONFIG_DIR}/live/${cert_name}/privkey.pem"
+  [[ -r $source_cert ]] || { warn "无法读取 Certbot 证书：$source_cert"; return 1; }
+  [[ -r $source_key ]] || { warn "无法读取 Certbot 私钥：$source_key"; return 1; }
+  replace_certificate_pair "$source_cert" "$source_key" "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" "$__changed_var"
+}
+
+certificate_identifier_for_subject() {
+  local subject=$1
+  if validate_ip_literal "$subject"; then
+    if [[ $subject == *:* ]]; then printf 'ip6-%s' "$(printf '%s' "$subject" | openssl dgst -sha256 -r | awk '{print substr($1,1,8)}')"
+    else printf 'ip4-%s' "$(printf '%s' "$subject" | openssl dgst -sha256 -r | awk '{print substr($1,1,8)}')"; fi
+  else printf '%s' "$subject"; fi
+}
+
+setup_certbot_renewal_timer() {
+  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  case $(init_system) in
+    systemd)
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE
+[Unit]
+Description=Renew certificates managed by sbctl
+
+[Service]
+Type=oneshot
+ExecStart=${QUICK_COMMAND} cert renew-auto
+EOF_SERVICE
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER'
+[Unit]
+Description=Renew certificates managed by sbctl
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+      systemctl daemon-reload
+      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
+      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service"
+      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      ;;
+    openrc)
+      mkdir -p /etc/periodic/daily
+      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON
+#!/bin/sh
+${QUICK_COMMAND} cert renew-auto
+EOF_CRON
+      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
+      meta_resource_register renewPeriodic /etc/periodic/daily/sbctl-certbot-renew
+      ;;
+    *) die "无法配置证书自动续期：未检测到 systemd/OpenRC。";;
+  esac
+}
+
+# ---- cert issuance sub-flows ----
+_issue_domain_http() {
+  local domain=$1 email=$2 force=$3 __validation=$4 owner was_active=0
+  owner=$(detect_port80_owner)
+  local args=(certonly --non-interactive --agree-tos --cert-name "$domain" -m "$email" -d "$domain")
+  [[ $force == 1 ]] && args+=(--force-renewal)
+  case $owner in
+    free)
+      args+=(--standalone --preferred-challenges http)
+      printf -v "$__validation" '%s' http-standalone
+      certbot_issue_cmd "$domain" "${args[@]}"
+      ;;
+    sing-box)
+      service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; }
+      args+=(--standalone --preferred-challenges http)
+      printf -v "$__validation" '%s' http-standalone
+      if ! certbot_issue_cmd "$domain" "${args[@]}"; then
+        ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }
+        return 1
+      fi
+      ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
+      ;;
+    nginx)
+      printf -v "$__validation" '%s' nginx
+      local nginx_args=(certonly --nginx --non-interactive --agree-tos --cert-name "$domain" -m "$email" -d "$domain")
+      [[ $force == 1 ]] && nginx_args+=(--force-renewal)
+      certbot_issue_cmd "$domain" "${nginx_args[@]}"
+      ;;
+    apache) warn "80 端口被 Apache 占用；请改用 DNS 手动验证。"; return 1;;
+    *) warn "80 端口被其他程序占用或无法识别；请改用 DNS 手动验证。"; return 1;;
+  esac
+}
+
+_issue_domain_manual_dns() {
+  local domain=$1 email=$2 force=$3
+  local args=(certonly --manual --agree-tos --cert-name "$domain" -m "$email" --preferred-challenges dns -d "$domain")
+  [[ $force == 1 ]] && args+=(--force-renewal)
+  info "Certbot 将提示添加 TXT 记录；验证完成后该证书不会被标记为自动续期。"
+  certbot_issue_cmd "$domain" "${args[@]}"
+}
+
+_issue_ip_certificate() {
+  local ip=$1 email=$2 force=$3 identifier owner was_active=0
+  identifier=$(certificate_identifier_for_subject "$ip")
+  owner=$(detect_port80_owner)
+  local args=(certonly --standalone --non-interactive --agree-tos --preferred-challenges http \
+    --cert-name "$identifier" -m "$email" --preferred-profile shortlived --ip-address "$ip")
+  [[ $force == 1 ]] && args+=(--force-renewal)
+  case $owner in
+    free) certbot_issue_cmd "$identifier" "${args[@]}";;
+    sing-box)
+      service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; }
+      if ! certbot_issue_cmd "$identifier" "${args[@]}"; then
+        ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }; return 1
+      fi
+      ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
+      ;;
+    *) warn "公网 IP 证书必须使用 80 端口 HTTP 验证，但端口 80 当前不可用。"; return 1;;
+  esac
+}
+
+_issue_domain_cloudflare() {
+  local domain=$1 email=$2 force=$3
+  load_cloudflare_credentials || { warn "Cloudflare 邮箱 / Global API Key 未配置。"; return 1; }
+  ensure_cloudflare_certbot_plugin || return 1
+  local args=(certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_INI" \
+    --dns-cloudflare-propagation-seconds 10 --non-interactive --agree-tos --cert-name "$domain" -m "$email" -d "$domain")
+  [[ $force == 1 ]] && args+=(--force-renewal)
+  certbot_issue_cmd "$domain" "${args[@]}"
+}
+
+# ---- canonical issue_certificate (includes Cloudflare DNS path) ----
+issue_certificate() {
+  ensure_dependencies cert-issue
+  ensure_certbot_environment
+  local subject=${1-} email=${2-} mode=domain verify_method="" identifier cert_name validation auto_renew=false force=0 changed=0
+  if [[ -z $subject ]]; then
+    local default_subject=""
+    default_subject=$(detect_public_ipv4 || true); [[ -n $default_subject ]] || default_subject=$(detect_public_ipv6 || true)
+    while true; do
+      prompt_value subject "证书域名/IP" "$default_subject" || return 1
+      validate_host "$subject" && break
+      warn "证书域名/IP 无效。"
+    done
+  fi
+  if validate_ip_literal "$subject"; then mode=ip; elif ! validate_domain "$subject"; then die "证书域名/IP 无效。"; fi
+  identifier=$(certificate_identifier_for_subject "$subject"); cert_name=$identifier
+  [[ $mode == domain ]] && cert_name=$subject
+
+  if [[ $mode == domain ]]; then
+    choose verify_method "选择验证方式" \
+      "Cloudflare DNS（自动验证/自动续期）" \
+      "HTTP（自动续期，需要 80 端口）" \
+      "DNS（手动添加 TXT，不自动续期）" || return 1
+    case $verify_method in
+      1) verify_method=dns-cloudflare;;
+      2) verify_method=http;;
+      3) verify_method=dns-manual;;
+    esac
+    if [[ $verify_method == dns-cloudflare ]] && ! load_cloudflare_credentials; then
+      info "首次使用 Cloudflare DNS 自动验证，需要配置 Cloudflare 邮箱和 Global API Key。"
+      save_cloudflare_credentials || return 1
+    fi
+  fi
+
+  while [[ -z $email ]]; do
+    prompt_value email "Let's Encrypt 联系邮箱" || return 1
+    validate_email_address "$email" || { warn "邮箱格式无效。"; email=""; }
+  done
+  validate_email_address "$email" || die "邮箱格式无效。"
+
+  if meta_cert_exists "$identifier" || [[ -f $CERT_DIR/${identifier}.crt || -f $CERT_DIR/${identifier}.key ]]; then
+    local users
+    users=$(certificate_inbound_users "$identifier" 2>/dev/null || true)
+    [[ -z $users ]] || warn "证书正在被入站使用：$(paste -sd ',' <<<"$users")"
+    confirm "证书 ${identifier} 已存在，是否强制重新签发？" N || { info "已取消。"; return 0; }
+    force=1
+  fi
+
+  if [[ $mode == ip ]]; then
+    validation=http-standalone; auto_renew=true
+    _issue_ip_certificate "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+  elif [[ $verify_method == dns-cloudflare ]]; then
+    validation=dns-cloudflare; auto_renew=true
+    _issue_domain_cloudflare "$subject" "$email" "$force" || { warn "Cloudflare DNS 证书签发失败。"; return 1; }
+  elif [[ $verify_method == dns-manual ]]; then
+    validation=dns-manual; auto_renew=false
+    _issue_domain_manual_dns "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+  else
+    _issue_domain_http "$subject" "$email" "$force" validation || { warn "证书签发失败。"; return 1; }
+    auto_renew=true
+  fi
+
+  sync_managed_certificate "$identifier" "$cert_name" changed || { warn "证书已签发，但同步到 sbctl 托管目录失败。"; return 1; }
+  meta_cert_set "$identifier" "$subject" "$cert_name" letsencrypt "$validation" "$auto_renew"
+  [[ $auto_renew == true ]] && setup_certbot_renewal_timer
+  restart_sing_box_if_certificate_changed "$changed" || return 1
+  info "证书已签发并托管：${identifier}"
+}
+
+import_certificate() {
+  ensure_dependencies cert-import
+  local identifier=${1-} cert=${2-} key=${3-} subject changed=0
+  [[ -n $identifier ]] || prompt_value identifier "证书标识/域名" || return 1
+  validate_certificate_identifier "$identifier" || die "证书标识无效。"
+  [[ -n $cert ]] || prompt_value cert "证书文件路径" || return 1
+  [[ -n $key ]] || prompt_value key "私钥文件路径" || return 1
+  validate_certificate_pair "$cert" "$key" || { warn "证书/私钥无效、不匹配或已过期。"; return 1; }
+  subject=$(certificate_server_names "$cert" | head -1 || true); [[ -n $subject ]] || subject=$identifier
+  replace_certificate_pair "$cert" "$key" "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" changed || return 1
+  meta_cert_set "$identifier" "$subject" "$identifier" imported imported false
+  restart_sing_box_if_certificate_changed "$changed" || return 1
+  info "证书已导入：${identifier}"
+}
+
+list_certificates() {
+  init_meta
+  local id cert found=0 subject source validation auto_renew cert_name
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    found=1; cert="$CERT_DIR/${id}.crt"
+    subject=$(meta_cert_get_field "$id" subject); source=$(meta_cert_get_field "$id" source)
+    validation=$(meta_cert_get_field "$id" validation); auto_renew=$(meta_cert_get_field "$id" autoRenew)
+    cert_name=$(meta_cert_get_field "$id" certName)
+    printf '标识: %s\n' "$id"
+    [[ -z $subject || $subject == "$id" ]] || printf '域名/IP: %s\n' "$subject"
+    [[ -z $cert_name || $cert_name == "$id" ]] || printf 'Certbot 名称: %s\n' "$cert_name"
+    case $source in letsencrypt) printf "来源: Let's Encrypt\n";; imported) printf '来源: 手动导入\n';; legacy) printf '来源: 旧版本迁移\n';; *) printf '来源: %s\n' "${source:-未知}";; esac
+    printf '验证: %s\n自动续期: %s\n' "${validation:-未知}" "$([[ $auto_renew == true ]] && printf 是 || printf 否)"
+    [[ $source != legacy ]] || printf '状态: 旧版证书仅登记副本；建议重新签发以接入新续期机制\n'
+    if [[ -r $cert ]]; then openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'; else printf '  [证书文件缺失]\n'; fi
+    printf '\n'
+  done < <(meta_cert_list)
+  ((found)) || info "没有托管证书。"
+}
+
+certificate_inbound_users() {
+  local identifier=$1 cert="$CERT_DIR/${identifier}.crt" key="$CERT_DIR/${identifier}.key"
+  [[ -r $CONFIG_FILE ]] || return 0
+  jq -r --arg cert "$cert" --arg key "$key" '
+    .inbounds[]? | select(.tls.enabled==true) |
+    select((.tls.certificate_path // "")==$cert or (.tls.key_path // "")==$key) | .tag
+  ' "$CONFIG_FILE"
+}
+
+# Disable renewal timer if no certs need it
+_disable_renewal_job_if_unused() {
+  local remaining
+  remaining=$(meta_cert_auto_renew_certs | head -1 || true)
+  [[ -z $remaining ]] || return 0
+  case $(init_system) in
+    systemd)
+      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
+      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
+  esac
+}
+
+delete_certificate() {
+  ensure_dependencies cert-delete
+  local identifier=${1-} assume_yes=${2:-0} users source cert_name subject tag rc=0
+  [[ -n $identifier ]] || select_managed_certificate identifier 1 || return 0
+  validate_certificate_identifier "$identifier" || die "证书标识无效。"
+  meta_cert_exists "$identifier" || { warn "该证书不在 sbctl 托管列表中。"; return 1; }
+  users=$(certificate_inbound_users "$identifier")
+  if [[ -n $users ]]; then
+    warn "证书正在被以下 TLS 入站使用，不能删除："
+    while IFS= read -r tag; do [[ -n $tag ]] && printf '  - %s\n' "$tag" >&2; done <<<"$users"
+    return 0
+  fi
+  [[ $assume_yes == 1 ]] || confirm "删除托管证书 ${identifier}？" N || return 0
+  source=$(meta_cert_get_field "$identifier" source); cert_name=$(meta_cert_get_field "$identifier" certName); subject=$(meta_cert_get_field "$identifier" subject)
+  if [[ $source == letsencrypt && -n $cert_name && -f $CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf ]]; then
+    if [[ -x $CERTBOT_BIN ]]; then
+      certbot_cmd delete --cert-name "$cert_name" --non-interactive || { warn "Certbot lineage 删除失败，托管副本未删除。"; return 1; }
+    else
+      warn "Certbot 环境缺失，无法安全删除 Let's Encrypt lineage。"; return 1;
+    fi
+  fi
+  rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key"
+  rm -f "$CERTBOT_HOOK_DIR/sbctl-${identifier}" "$CERTBOT_HOOK_DIR/sbctl-${subject}"
+  meta_cert_delete "$identifier"
+  _disable_renewal_job_if_unused
+  info "托管证书已删除：${identifier}"
+}
+
+# ---- canonical renewal (includes Cloudflare DNS path) ----
+renew_one_certificate() {
+  local identifier=$1 __result_var=${2:-} cert_name validation owner before_serial="" after_serial="" changed=0 was_active=0 renewal_result_internal=failed
+  meta_cert_exists "$identifier" || { warn "证书不在托管列表：$identifier"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  cert_name=$(meta_cert_get_field "$identifier" certName); validation=$(meta_cert_get_field "$identifier" validation)
+
+  # Cloudflare DNS path
+  if [[ $validation == dns-cloudflare ]]; then
+    if ! load_cloudflare_credentials; then
+      warn "${identifier}: Cloudflare 邮箱 / Global API Key 缺失，自动续期阻塞。"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked
+      return 0
+    fi
+    if ! ensure_cloudflare_certbot_plugin; then
+      warn "${identifier}: Cloudflare DNS 插件不可用。"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed
+      return 1
+    fi
+    [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && before_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
+    if ! certbot_cmd renew --cert-name "$cert_name" --quiet; then
+      warn "证书续期失败：${identifier}"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed
+      return 1
+    fi
+    [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
+    sync_managed_certificate "$identifier" "$cert_name" changed || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+    restart_sing_box_if_certificate_changed "$changed" || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+    if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then renewal_result_internal=renewed; else renewal_result_internal=unchanged; fi
+    [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$renewal_result_internal"
+    return 0
+  fi
+
+  # Non-Cloudflare paths
+  case $validation in
+    dns-manual|legacy|imported)
+      warn "${identifier}: 当前类型不能自动续期，请重新签发/导入。"
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked
+      return 0
+      ;;
+    http-standalone)
+      owner=$(detect_port80_owner)
+      case $owner in free) :;; sing-box) service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; };; *) warn "${identifier}: 80 端口被占用，自动续期阻塞。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked; return 0;; esac
+      ;;
+    nginx) :;;
+    *) warn "${identifier}: 未知验证方式 ${validation}。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1;;
+  esac
+  [[ -x $CERTBOT_BIN ]] || { warn "Certbot 环境缺失，请重新执行证书签发。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && before_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
+  if ! certbot_cmd renew --cert-name "$cert_name" --quiet; then
+    ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }
+    warn "证书续期失败：${identifier}"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
+  fi
+  ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
+  [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
+  sync_managed_certificate "$identifier" "$cert_name" changed || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  restart_sing_box_if_certificate_changed "$changed" || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then renewal_result_internal=renewed; else renewal_result_internal=unchanged; fi
+  [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$renewal_result_internal"
+}
+
+renew_managed_certificates() {
+  ensure_dependencies cert-renew
+  local id result renewed=0 unchanged=0 blocked=0 failed=0
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue; result=""
+    renew_one_certificate "$id" result || result=${result:-failed}
+    case $result in renewed) ((renewed+=1));; unchanged) ((unchanged+=1));; blocked) ((blocked+=1));; *) ((failed+=1));; esac
+  done < <(meta_cert_auto_renew_certs)
+  printf '续期检查：已续期 %d，无需续期 %d，阻塞 %d，失败 %d\n' "$renewed" "$unchanged" "$blocked" "$failed"
+  ((failed == 0))
+}
+
+renew_certificate_command() {
+  local identifier=${1-} result=""
+  ensure_dependencies cert-renew
+  [[ -n $identifier ]] || die "请提供证书标识。"
+  renew_one_certificate "$identifier" result || return 1
+  case $result in renewed) info "${identifier}: 已续期。";; unchanged) info "${identifier}: 无需续期。";; blocked) warn "${identifier}: 自动续期被阻塞。";; esac
+}
+
+# ---- module: certificate/cloudflare ----
+# Cloudflare DNS credential management.
+# No certificate-lifecycle overrides — certops.sh owns issuance/renewal while
+# cert_guard.sh owns the shared Certbot environment/bootstrap policy.
+
+CLOUDFLARE_INI="${SBCTL_CLOUDFLARE_INI:-${CERTBOT_CONFIG_DIR}/cloudflare.ini}"
+
+cloudflare_plugin_available() {
+  [[ -x $CERTBOT_VENV/bin/python ]] && "$CERTBOT_VENV/bin/python" -c 'import certbot_dns_cloudflare' >/dev/null 2>&1
+}
+
+ensure_cloudflare_certbot_plugin() {
+  local certbot_version installed_version="" force=0
+  ensure_certbot_environment
+  certbot_version=$(certbot_core_version) || { warn "无法读取 Certbot 版本，不能安装 Cloudflare DNS 插件。"; return 1; }
+  installed_version=$(certbot_distribution_version certbot-dns-cloudflare 2>/dev/null || true)
+
+  if [[ $installed_version == "$certbot_version" ]] && cloudflare_plugin_available && certbot_pip_check; then
+    return 0
+  fi
+
+  # If the distribution metadata says the right version is installed but the
+  # import is broken, reinstall the plugin. Otherwise let pip resolve only the
+  # exact plugin version and its declared dependencies. Never hand-pin the
+  # Cloudflare SDK and never use --no-deps: those requirements change between
+  # Certbot releases and belong to the plugin's own package metadata.
+  [[ $installed_version == "$certbot_version" ]] && force=1
+  info "正在安装/修复 Certbot Cloudflare DNS 插件。"
+  if ((force)); then
+    certbot_pip_install "Certbot Cloudflare DNS 插件" --force-reinstall \
+      "certbot-dns-cloudflare==${certbot_version}" || return 1
+  else
+    certbot_pip_install "Certbot Cloudflare DNS 插件" \
+      "certbot-dns-cloudflare==${certbot_version}" || return 1
+  fi
+
+  certbot_distribution_matches_core certbot-dns-cloudflare \
+    || { warn "Cloudflare DNS 插件版本与 Certbot 核心不一致。"; return 1; }
+  cloudflare_plugin_available || { warn "Cloudflare DNS 插件安装后仍不可用。"; return 1; }
+  certbot_pip_check || { warn "Certbot Python 依赖不一致，Cloudflare DNS 插件不可安全使用。"; return 1; }
+}
+
+load_cloudflare_credentials() {
+  [[ -f $CLOUDFLARE_INI && -r $CLOUDFLARE_INI ]] || return 1
+  grep -Eq '^[[:space:]]*dns_cloudflare_email[[:space:]]*=[[:space:]]*[^[:space:]].*$' "$CLOUDFLARE_INI" || return 1
+  grep -Eq '^[[:space:]]*dns_cloudflare_api_key[[:space:]]*=[[:space:]]*[^[:space:]].*$' "$CLOUDFLARE_INI"
+}
+
+cloudflare_dependent_certificates() {
+  init_meta
+  jq -r '.certificates | to_entries[] | select(.value.validation == "dns-cloudflare") | .key' "$META_FILE" 2>/dev/null
+}
+
+cloudflare_dependency_count() {
+  local deps
+  deps=$(cloudflare_dependent_certificates)
+  [[ -n $deps ]] && printf '%s\n' "$deps" | grep -c . || printf '0'
+}
+
+prompt_cloudflare_api_key() {
+  local __var=$1 key=""
+  while [[ -z $key ]]; do
+    if [[ -t 0 ]]; then
+      printf 'Cloudflare Global API Key: '
+      read -r -s key || { printf '\n'; return 1; }
+      printf '\n'
+    else
+      read -r key || return 1
+    fi
+    [[ -n $key ]] || warn "API Key 不能为空。"
+  done
+  [[ $key != *$'\n'* && $key != *$'\r'* ]] || { warn "API Key 格式无效。"; return 1; }
+  printf -v "$__var" '%s' "$key"
+}
+
+save_cloudflare_credentials() {
+  local email=${1-} api_key=${2-} tmp
+  while [[ -z $email ]]; do
+    prompt_value email "Cloudflare 邮箱" || return 1
+    validate_email_address "$email" || { warn "邮箱格式无效。"; email=""; }
+  done
+  validate_email_address "$email" || { warn "邮箱格式无效。"; return 1; }
+  [[ -n $api_key ]] || prompt_cloudflare_api_key api_key || return 1
+  [[ $api_key != *$'\n'* && $api_key != *$'\r'* ]] || { warn "API Key 格式无效。"; return 1; }
+
+  mkdir -p "$(dirname "$CLOUDFLARE_INI")"
+  tmp=$(temp_file)
+  printf 'dns_cloudflare_email = %s\ndns_cloudflare_api_key = %s\n' "$email" "$api_key" >"$tmp"
+  install -m 600 "$tmp" "$CLOUDFLARE_INI"
+  rm -f "$tmp"
+  meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
+  meta_resource_register cloudflareCredentials "$CLOUDFLARE_INI"
+  info "Cloudflare Global API Key 已保存：${CLOUDFLARE_INI}"
+}
+
+delete_cloudflare_credentials() {
+  local deps
+  load_cloudflare_credentials || { info "尚未配置 Cloudflare Global API Key。"; return 0; }
+  deps=$(cloudflare_dependent_certificates)
+  if [[ -n $deps ]]; then
+    warn "以下证书依赖 Cloudflare 凭据自动续期："
+    while IFS= read -r id; do [[ -n $id ]] && printf '  - %s\n' "$id" >&2; done <<<"$deps"
+    confirm "删除后这些证书将无法自动续期，仍然删除？" N || { info "已取消。"; return 0; }
+  else
+    confirm "删除 Cloudflare Global API Key？" N || return 0
+  fi
+  rm -f "$CLOUDFLARE_INI"
+  meta_resource_remove cloudflareCredentials
+  info "Cloudflare 凭据已删除。"
+}
+
+cloudflare_credentials_menu() {
+  local choice email=""
+  while true; do
+    clear_screen; heading "Cloudflare DNS 凭据"
+    if load_cloudflare_credentials; then
+      email=$(sed -n 's/^[[:space:]]*dns_cloudflare_email[[:space:]]*=[[:space:]]*//p' "$CLOUDFLARE_INI" | head -1)
+      printf 'Cloudflare 邮箱: %s\nGlobal API Key: 已配置\n' "${email:-未知}"
+    else
+      printf 'Cloudflare 凭据: 未配置\n'
+    fi
+    printf '依赖自动续期证书: %s\n\n' "$(cloudflare_dependency_count)"
+    printf '1) 设置/替换邮箱和 Global API Key\n2) 删除凭据\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action save_cloudflare_credentials; pause;;
+      2) run_menu_action delete_cloudflare_credentials; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+# ---- module: certificate/certbot ----
+# Certbot environment hardening. Loaded after certops.sh/cloudflare.sh so it can
+# replace only environment/bootstrap primitives while keeping certificate
+# lifecycle logic canonical in certops.sh.
+
+certbot_distribution_version() {
+  local distribution=$1
+  [[ -x $CERTBOT_VENV/bin/python ]] || return 1
+  "$CERTBOT_VENV/bin/python" -c \
+    'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' \
+    "$distribution" 2>/dev/null
+}
+
+certbot_core_version() { certbot_distribution_version certbot; }
+
+certbot_version_in_supported_range() {
+  local version=${1:-} major minor
+  [[ -n $version ]] || version=$(certbot_core_version) || return 1
+  IFS=. read -r major minor _ <<<"$version"
+  [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] || return 1
+  ((major == 5 && minor >= 4))
+}
+
+certbot_version_supported() {
+  local version
+  version=$(certbot_core_version) || return 1
+  certbot_version_in_supported_range "$version" || return 1
+  certbot_supports_ip
+}
+
+certbot_distribution_matches_core() {
+  local distribution=$1 core installed
+  core=$(certbot_core_version) || return 1
+  installed=$(certbot_distribution_version "$distribution") || return 1
+  [[ $installed == "$core" ]]
+}
+
+_certbot_report_memory() {
+  local mem_total_kb mem_available_kb swap_total_kb
+  [[ -r /proc/meminfo ]] || return 0
+  mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  mem_available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+  swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+  warn "内存约 $((mem_total_kb / 1024)) MiB，可用约 $((mem_available_kb / 1024)) MiB，Swap 约 $((swap_total_kb / 1024)) MiB。"
+}
+
+certbot_pip_install() {
+  local label=$1; shift
+  local pip_timeout=${SBCTL_PIP_TIMEOUT:-300} log_file status
+  [[ -x $CERTBOT_VENV/bin/pip ]] || { warn "Certbot venv 缺少 pip，无法安装 ${label}。"; return 1; }
+  log_file=$(temp_file)
+  : >"$log_file"
+  if _cert_run_bounded "$pip_timeout" env \
+    PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    "$CERTBOT_VENV/bin/pip" install \
+      --disable-pip-version-check --no-cache-dir --no-compile --prefer-binary \
+      --timeout 20 --retries 2 "$@" >>"$log_file" 2>&1; then
+    rm -f "$log_file"
+    return 0
+  else
+    status=$?
+  fi
+  case $status in
+    137)
+      warn "${label} 安装进程被 SIGKILL；通常表示 VPS 内存不足并触发 OOM。"
+      _certbot_report_memory
+      ;;
+    124) warn "${label} 安装超过 ${pip_timeout} 秒，已终止。" ;;
+    *) warn "${label} 安装失败（退出码 ${status}）。" ;;
+  esac
+  [[ ! -s $log_file ]] || { warn "pip 最后输出："; tail -n 20 "$log_file" >&2; }
+  rm -f "$log_file"
+  return "$status"
+}
+
+certbot_pip_check() {
+  [[ -x $CERTBOT_VENV/bin/pip ]] && "$CERTBOT_VENV/bin/pip" check >/dev/null 2>&1
+}
+
+_certbot_install_system_python() {
+  local manager
+  manager=$(pkg_manager) || { warn "无法准备 Certbot 环境：未知包管理器。"; return 1; }
+  case $manager in
+    apt) install_packages python3 python3-venv;;
+    apk) install_packages python3 py3-pip py3-virtualenv;;
+    dnf|yum) install_packages python3 python3-pip;;
+    pacman) install_packages python python-pip;;
+    zypper) install_packages python3 python3-pip;;
+  esac
+}
+
+_certbot_prepare_venv() {
+  local bootstrap
+  install -d -m 755 "$(dirname "$CERTBOT_VENV")"
+
+  if [[ ! -x $CERTBOT_VENV/bin/python ]]; then
+    if ! command_exists python3 || ! run_bounded 120 python3 -m venv "$CERTBOT_VENV" 2>/dev/null; then
+      _certbot_install_system_python || return 1
+      if ! run_bounded 120 python3 -m venv "$CERTBOT_VENV" 2>/dev/null; then
+        run_bounded 120 python3 -m venv --without-pip "$CERTBOT_VENV" || return 1
+      fi
+    fi
+  fi
+
+  if [[ ! -x $CERTBOT_VENV/bin/pip ]]; then
+    "$CERTBOT_VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  fi
+  if [[ ! -x $CERTBOT_VENV/bin/pip ]]; then
+    bootstrap=$(temp_file)
+    curl --fail --location --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 15 --max-time 60 \
+      https://bootstrap.pypa.io/get-pip.py -o "$bootstrap" || { rm -f "$bootstrap"; return 1; }
+    _cert_run_bounded 120 "$CERTBOT_VENV/bin/python" "$bootstrap" --disable-pip-version-check \
+      || { rm -f "$bootstrap"; return 1; }
+    rm -f "$bootstrap"
+  fi
+  [[ -x $CERTBOT_VENV/bin/python && -x $CERTBOT_VENV/bin/pip ]]
+}
+
+_ensure_certbot_nginx_for_version() {
+  local version=$1 installed="" force=0
+  installed=$(certbot_distribution_version certbot-nginx 2>/dev/null || true)
+  if [[ $installed == "$version" ]] && certbot_nginx_available; then return 0; fi
+  [[ $installed == "$version" ]] && force=1
+  info "正在安装/修复 Certbot nginx 插件。"
+  if ((force)); then
+    certbot_pip_install "Certbot nginx 插件" --force-reinstall "certbot-nginx==${version}" || return 1
+  else
+    certbot_pip_install "Certbot nginx 插件" "certbot-nginx==${version}" || return 1
+  fi
+  certbot_distribution_matches_core certbot-nginx && certbot_nginx_available
+}
+
+ensure_certbot_nginx_plugin() {
+  local version
+  if ! certbot_version_supported; then
+    ensure_certbot_environment
+    return $?
+  fi
+  version=$(certbot_core_version) || return 1
+  _ensure_certbot_nginx_for_version "$version" || return 1
+  certbot_pip_check || { warn "Certbot Python 依赖不一致，nginx 插件不可安全使用。"; return 1; }
+}
+
+_repair_installed_cloudflare_version() {
+  local version=$1 installed
+  installed=$(certbot_distribution_version certbot-dns-cloudflare 2>/dev/null || true)
+  [[ -n $installed ]] || return 0
+  [[ $installed == "$version" ]] && return 0
+  info "检测到 Certbot Cloudflare 插件版本不一致，正在同步到 ${version}。"
+  certbot_pip_install "Certbot Cloudflare DNS 插件" "certbot-dns-cloudflare==${version}"
+}
+
+ensure_certbot_environment() {
+  local version cf_installed="" repair_specs=()
+  _certbot_prepare_venv || die "无法创建/修复 Certbot venv。"
+
+  if ! certbot_version_supported; then
+    version=$(certbot_core_version 2>/dev/null || true)
+    info "正在安装/修复 Certbot 5.x 核心。"
+    if certbot_version_in_supported_range "$version"; then
+      certbot_pip_install "Certbot 核心" --force-reinstall "certbot==${version}" || die "Certbot 安装失败。"
+    else
+      certbot_pip_install "Certbot 核心" 'certbot>=5.4,<6' || die "Certbot 安装失败。"
+    fi
+  fi
+
+  certbot_version_supported || die "当前 Certbot 不受支持（需要 5.4 <= 版本 < 6）。"
+  version=$(certbot_core_version) || die "无法读取 Certbot 版本。"
+  _ensure_certbot_nginx_for_version "$version" || die "Certbot nginx 插件安装/修复失败。"
+  _repair_installed_cloudflare_version "$version" || die "Certbot Cloudflare 插件版本修复失败。"
+
+  if ! certbot_pip_check; then
+    warn "检测到 Certbot Python 依赖不一致，正在按当前版本修复依赖。"
+    repair_specs+=("certbot==${version}" "certbot-nginx==${version}")
+    cf_installed=$(certbot_distribution_version certbot-dns-cloudflare 2>/dev/null || true)
+    [[ -z $cf_installed ]] || repair_specs+=("certbot-dns-cloudflare==${version}")
+    certbot_pip_install "Certbot Python 依赖" "${repair_specs[@]}" || die "Certbot Python 依赖修复失败。"
+    certbot_pip_check || die "Certbot Python 依赖仍不一致，请检查 pip check 输出。"
+  fi
+
+  certbot_distribution_matches_core certbot-nginx || die "Certbot nginx 插件版本与 Certbot 核心不一致。"
+  certbot_nginx_available || die "Certbot nginx 插件不可用，请重新准备证书环境。"
+  mkdir -p "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR"
+  meta_resource_register certbotVenv "$CERTBOT_VENV"
+  meta_resource_register certbotConfigDir "$CERTBOT_CONFIG_DIR"
+  meta_resource_register certbotWorkDir "$CERTBOT_WORK_DIR"
+  meta_resource_register certbotLogsDir "$CERTBOT_LOGS_DIR"
+}
+
+_certbot_exec() {
+  "$CERTBOT_BIN" --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" --logs-dir "$CERTBOT_LOGS_DIR" "$@"
+}
+
+_certbot_arg_value() {
+  local wanted=$1; shift
+  while (($#)); do
+    if [[ $1 == "$wanted" && $# -ge 2 ]]; then printf '%s' "$2"; return 0; fi
+    shift
+  done
+  return 1
+}
+
+_certbot_renewal_authenticator() {
+  local cert_name=$1 conf="$CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf"
+  [[ -r $conf ]] || return 1
+  sed -n 's/^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*//p' "$conf" | sed -n '1p'
+}
+
+# Keep certops.sh's public command surface, but self-heal the nginx plugin before
+# an unattended renewal whose lineage explicitly records the nginx authenticator.
+certbot_cmd() {
+  local cert_name="" authenticator=""
+  if [[ ${1:-} == renew ]]; then
+    cert_name=$(_certbot_arg_value --cert-name "$@" 2>/dev/null || true)
+    if [[ -n $cert_name ]]; then
+      authenticator=$(_certbot_renewal_authenticator "$cert_name" 2>/dev/null || true)
+      if [[ $authenticator == nginx ]]; then
+        ensure_certbot_nginx_plugin || { warn "${cert_name}: Certbot nginx 插件无法修复，续期已停止。"; return 1; }
+      fi
+    fi
+  fi
+  _certbot_exec "$@"
+}
+
+# ---- module: service ----
+# BBR safety, diagnostics and residual scanning.
+# Service definition lives in engine.sh (canonical, hardened version).
+
+enable_bbr() {
+  ensure_dependencies bbr
+  command_exists sysctl || die "缺少 sysctl。"
+  local config=/etc/sysctl.d/99-sbctl-bbr.conf qdisc_ok=0 available
+  if [[ -e $config ]] && ! grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then
+    warn "检测到非 sbctl 管理的 BBR 配置，拒绝覆盖：$config"
+    return 1
+  fi
+  [[ -w /proc/sys/net/ipv4/tcp_congestion_control ]] || { warn "当前容器/内核不允许修改拥塞控制参数。"; return 0; }
+  if command_exists modprobe; then run_bounded 5 modprobe tcp_bbr >/dev/null 2>&1 || true; fi
+  available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+  grep -qw bbr <<<"$available" || { warn "当前内核未提供 BBR。"; return 0; }
+  if [[ -e /proc/sys/net/core/default_qdisc ]] && run_bounded 5 sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1; then qdisc_ok=1; fi
+  if ! run_bounded 5 sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+    warn "无法启用 BBR；可能处于受限 NAT/LXC/OpenVZ 容器。"
+    return 0
+  fi
+  mkdir -p /etc/sysctl.d
+  {
+    printf '# managed by sbctl\n'
+    ((qdisc_ok)) && printf 'net.core.default_qdisc=fq\n'
+    printf 'net.ipv4.tcp_congestion_control=bbr\n'
+  } >"$config"
+  meta_resource_register bbrConfig "$config"
+  info "BBR 已启用。"
+}
+
+disable_bbr() {
+  ensure_dependencies bbr-disable
+  command_exists sysctl || die "缺少 sysctl。"
+  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback="" current=""
+  current=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+  if [[ $current != bbr ]]; then
+    if [[ -f $config ]] && grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
+    meta_resource_remove bbrConfig
+    info "BBR 当前未启用。"
+    return 0
+  fi
+  [[ -w /proc/sys/net/ipv4/tcp_congestion_control ]] || { warn "当前环境不允许修改拥塞控制参数。"; return 0; }
+  available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+  if grep -qw cubic <<<"$available"; then fallback=cubic
+  elif grep -qw reno <<<"$available"; then fallback=reno
+  else fallback=$(tr ' ' '\n' <<<"$available" | awk '$0!="" && $0!="bbr" {print; exit}'); fi
+  [[ -n $fallback ]] || { warn "没有找到可恢复的拥塞控制算法。"; return 1; }
+  run_bounded 5 sysctl -w net.ipv4.tcp_congestion_control="$fallback" >/dev/null 2>&1 \
+    || { warn "恢复拥塞控制算法失败。"; return 1; }
+  if [[ -e /proc/sys/net/core/default_qdisc ]]; then run_bounded 5 sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true; fi
+  if [[ -f $config ]] && grep -q '^# managed by sbctl$' "$config" 2>/dev/null; then rm -f "$config"; fi
+  meta_resource_remove bbrConfig
+  info "BBR 已关闭；当前拥塞控制算法：${fallback}。"
+}
+# Canonical _remove_bbr_settings lives in uninstall.sh
+# Canonical _scan_sbctl_residuals lives in uninstall.sh
+
+system_diagnostics() {
+  ensure_dependencies diagnose
+  local v4="" v6="" virt=unknown certs=0 auto=0 account_count=0 unit="" hardening=不适用
+  command_exists systemd-detect-virt && virt=$(systemd-detect-virt 2>/dev/null || printf none)
+  v4=$(detect_public_ipv4 || true)
+  v6=$(detect_public_ipv6 || true)
+  init_meta
+  certs=$(managed_certificate_count 2>/dev/null || printf 0)
+  auto=$(meta_cert_auto_renew_certs 2>/dev/null | awk 'NF{n++} END{print n+0}')
+  account_count=$(certbot_account_ids 2>/dev/null | awk 'NF{n++} END{print n+0}')
+  case $(init_system) in
+    systemd)
+      unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
+      if [[ -r $unit ]] && grep -q '^NoNewPrivileges=true$' "$unit" && grep -q '^ProtectSystem=strict$' "$unit"; then hardening=已启用; else hardening=缺失; fi
+      ;;
+    openrc)
+      unit="${OPENRC_INIT_DIR}/${SERVICE_NAME}"
+      if [[ -r $unit ]] && grep -q '^supervisor="supervise-daemon"$' "$unit"; then hardening=supervise-daemon; else hardening=缺失; fi
+      ;;
+  esac
+  heading "系统诊断"
+  printf '系统: %s %s\n' "$(uname -s)" "$(uname -r)"
+  printf '虚拟化: %s\n' "$virt"
+  printf '初始化: %s\n' "$(init_system)"
+  printf 'sing-box: %s\n' "$(sing_box_version_summary)"
+  printf '服务: %s  |  开机自启: %s\n' "$(service_state_summary)" "$(startup_state_summary)"
+  printf '服务硬化: %s\n' "$hardening"
+  printf '公网 IPv4: %s\n' "${v4:-未检测到}"
+  printf '公网 IPv6: %s\n' "${v6:-未检测到}"
+  printf 'BBR: %s\n' "$(bbr_state_summary)"
+  printf '配置: %s\n' "$CONFIG_FILE"
+  printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
+  printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"
+  if load_cloudflare_credentials 2>/dev/null; then printf 'Cloudflare DNS: 已配置\n'; else printf 'Cloudflare DNS: 未配置\n'; fi
+  if [[ -f $CONFIG_FILE ]]; then
+    printf '入站: %s  |  出站: %s\n' "$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?')" "$(jq '.outbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?')"
+    if validate_candidate "$CONFIG_FILE"; then printf '配置检查: 通过\n'; else printf '配置检查: 失败\n'; fi
+  fi
+}
+
+bbr_state_summary() {
+  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+    [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'
+  else
+    printf '不可用'
+  fi
+}
+
+toggle_bbr() {
+  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then
+    disable_bbr
+  else
+    enable_bbr
+  fi
+}
+
+repair_quick_command() {
+  ensure_dependencies quick-command
+  install_quick_command
+  [[ -x $QUICK_COMMAND ]] || die "快捷命令修复失败。"
+  info "快捷命令已修复：${QUICK_SYMLINK}"
+}
+
+
+# ---- sing-box lifecycle ----
+version_ge() {
+  local have=$1 need=$2 h1 h2 h3 n1 n2 n3
+  IFS=. read -r h1 h2 h3 <<<"$have"
+  IFS=. read -r n1 n2 n3 <<<"$need"
+  h1=${h1:-0}; h2=${h2:-0}; h3=${h3:-0}
+  n1=${n1:-0}; n2=${n2:-0}; n3=${n3:-0}
+  ((10#$h1 > 10#$n1)) && return 0
+  ((10#$h1 < 10#$n1)) && return 1
+  ((10#$h2 > 10#$n2)) && return 0
+  ((10#$h2 < 10#$n2)) && return 1
+  ((10#$h3 >= 10#$n3))
+}
+
+require_sing_box() { refresh_binary_path; sing_box_installed || die "sing-box 尚未安装，请先运行 sbctl install。"; }
+
+require_supported_core() {
+  local version
+  require_sing_box
+  version=$(sing_box_version)
+  [[ -n $version ]] || die "无法识别 sing-box 版本。"
+  version_ge "$version" 1.12.0 || die "sbctl 需要 sing-box >= 1.12.0（AnyTLS 从 1.12.0 起支持），当前为 ${version}。"
+}
+
+restart_service_checked() {
+  service_exists || return 0
+  service_restart || return 1
+  sleep 0.2
+  service_is_active
+}
+
+# Canonical service definition (from system_guard.sh — hardened version)
+create_service_definition() {
+  refresh_binary_path
+  mkdir -p "$DATA_DIR" "$CONFIG_DIR"
+  case $(init_system) in
+    systemd)
+      mkdir -p "$SYSTEMD_UNIT_DIR"
+      cat >"${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" <<EOF_UNIT
+[Unit]
+Description=sing-box service managed by sbctl
+Documentation=https://sing-box.sagernet.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${SING_BOX_BIN} run -D ${DATA_DIR} -c ${CONFIG_FILE}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=infinity
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=${DATA_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+      systemctl daemon-reload
+      meta_resource_register serviceDefinition "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
+      ;;
+    openrc)
+      mkdir -p "$OPENRC_INIT_DIR"
+      cat >"${OPENRC_INIT_DIR}/$SERVICE_NAME" <<EOF_RC
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box service managed by sbctl"
+command="${SING_BOX_BIN}"
+command_args="run -D ${DATA_DIR} -c ${CONFIG_FILE}"
+command_user="root:root"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+umask 077
+$(printf '%s' 'depend() { need net; }')
+EOF_RC
+      chmod 755 "${OPENRC_INIT_DIR}/$SERVICE_NAME"
+      meta_resource_register serviceDefinition "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
+      ;;
+    *) die "未检测到 systemd 或 OpenRC。";;
+  esac
+  meta_resource_register dataDir "$DATA_DIR"
+}
+
+install_quick_command() {
+  local source=${SBCTL_ENTRYPOINT:-${BASH_SOURCE[0]:-}} downloaded=""
+  mkdir -p "$(dirname "$QUICK_COMMAND")" "$(dirname "$QUICK_SYMLINK")"
+  if [[ -z $source || ! -r $source ]] || ! grep -q '^# sbctl - sing-box Linux terminal manager' "$source" 2>/dev/null; then
+    downloaded=$(temp_file)
+    curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$SCRIPT_DOWNLOAD_URL" -o "$downloaded" || die "sbctl 下载失败。"
+    grep -q '^# sbctl - sing-box Linux terminal manager' "$downloaded" || die "下载内容校验失败。"
+    source=$downloaded
+  fi
+  if [[ $(readlink -f "$source" 2>/dev/null || printf '%s' "$source") == $(readlink -f "$QUICK_COMMAND" 2>/dev/null || printf '%s' "$QUICK_COMMAND") ]]; then
+    chmod 755 "$QUICK_COMMAND"
+  else
+    install -m 755 "$source" "$QUICK_COMMAND"
+  fi
+  ln -sfn "$QUICK_COMMAND" "$QUICK_SYMLINK"
+  [[ -z $downloaded ]] || rm -f "$downloaded"
+  meta_resource_register quickCommand "$QUICK_COMMAND"
+  meta_resource_register quickSymlink "$QUICK_SYMLINK"
+  [[ $LIB_DIR != /usr/local/lib/sbctl ]] || meta_resource_register libDir "$LIB_DIR"
+}
+
+install_or_update_sing_box() {
+  ensure_dependencies install
+  local version=${1-} installer manager had_config=0
+  [[ -f $CONFIG_FILE ]] && had_config=1
+  manager=$(pkg_manager)
+  if [[ $manager == apk ]]; then
+    run_bounded 180 apk add --no-cache --upgrade sing-box || die "sing-box 安装/更新失败或超时。"
+  else
+    installer=$(temp_file)
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 \
+      "$OFFICIAL_INSTALLER_URL" -o "$installer" || { rm -f "$installer"; die "sing-box 官方安装器下载失败或超时。"; }
+    chmod 700 "$installer"
+    if [[ -n $version ]]; then
+      TERM=${TERM:-xterm} run_bounded 180 bash "$installer" --version "${version#v}" || { rm -f "$installer"; die "sing-box 安装失败或超时。"; }
+    else
+      TERM=${TERM:-xterm} run_bounded 180 bash "$installer" || { rm -f "$installer"; die "sing-box 安装失败或超时。"; }
+    fi
+    rm -f "$installer"
+  fi
+  # Invalidate caches after install/update
+  sbc_invalidate_install_cache
+  refresh_binary_path
+  sing_box_installed || die "sing-box 安装失败。"
+  require_supported_core
+  if ((had_config)); then
+    ensure_config
+  else
+    write_default_config
+  fi
+  create_service_definition
+  install_quick_command
+  validate_candidate "$CONFIG_FILE"
+  service_enable
+  if ! service_is_active; then service_start; else service_restart; fi
+  info "sing-box 已就绪：$($SING_BOX_BIN version | sed -n '1p')"
+}
+
+# ---- status / ops ----
+show_status() {
+  heading "sing-box 状态"
+  if sing_box_installed; then "$SING_BOX_BIN" version | sed -n '1,2p'; else printf 'sing-box: 未安装\n'; fi
+  printf '初始化系统: %s\n' "$(init_system)"
+  if service_exists; then
+    printf '服务: %s\n' "$(service_state_summary)"
+    printf '开机自启: %s\n' "$(startup_state_summary)"
+  else printf '服务: 未安装\n'; fi
+  [[ -f $CONFIG_FILE ]] && printf '入站数: %s\n配置: %s\n' "$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?')" "$CONFIG_FILE"
+}
+
+service_action() {
+  ensure_dependencies service
+  local action=$1
+  service_exists || die "sing-box 服务不存在。"
+  case $action in
+    start) service_start;; stop) service_stop;; restart) service_restart;;
+    enable) service_enable; service_start;; disable) service_disable; service_stop;;
+    *) die "未知服务操作：$action";;
+  esac
+  info "服务操作完成：${action}"
+}
+
+# ---- module: uninstall ----
+# Three-level uninstall model aligned with xrayctl, adapted to sing-box/systemd/OpenRC.
+
+cleanup_step() {
+  local description=$1; shift
+  printf '  %s ... ' "$description"
+  if "$@"; then printf '✓\n'; return 0; else printf '✗\n'; return 1; fi
+}
+
+_uninstall_snapshot_metadata() {
+  SNAPSHOT_META=$(temp_file)
+  if [[ -f $META_FILE ]] && jq -e 'type=="object"' "$META_FILE" >/dev/null 2>&1; then cp -a "$META_FILE" "$SNAPSHOT_META"
+  else printf '%s\n' '{"certificates":{},"managedResources":{}}' >"$SNAPSHOT_META"; fi
+}
+
+_snapshot_meta_cert_list() { jq -r '.certificates // {} | keys[]' "$SNAPSHOT_META" 2>/dev/null; }
+_snapshot_meta_cert_get_field() { jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] // empty' "$SNAPSHOT_META" 2>/dev/null; }
+_snapshot_meta_resource_get() { jq -r --arg key "$1" '.managedResources[$key] // empty' "$SNAPSHOT_META" 2>/dev/null; }
+
+_safe_remove_sbctl_dir() {
+  local path=$1 key=${2:-} recorded=""
+  [[ -n $path && $path == /* ]] || return 1
+  case $path in /|/etc|/usr|/usr/local|/var|/var/lib|/var/log|/opt|/home|/root) warn "拒绝删除危险路径：$path"; return 1;; esac
+  [[ -z $key ]] || recorded=$(_snapshot_meta_resource_get "$key")
+  case $path in
+    /opt/sbctl/certbot|/var/lib/sbctl/letsencrypt|/var/lib/sbctl/certbot-work|/var/log/sbctl/certbot|/var/backups/sbctl|/usr/local/lib/sbctl|/etc/sing-box/certs) :;;
+    *) [[ -n $recorded && $recorded == "$path" ]] || { warn "未确认目录归 sbctl 所有，跳过：$path"; return 1; };;
+  esac
+  [[ ! -e $path ]] || rm -rf -- "$path"
+}
+
+_remove_renewal_jobs() {
+  case $(init_system) in
+    systemd)
+      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
+      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
+  esac
+}
+
+_remove_legacy_certbot_assets() {
+  local hook name
+  for hook in "$CERTBOT_HOOK_DIR"/sbctl-*; do
+    [[ -e $hook ]] || continue
+    name=$(basename "$hook"); name=${name#sbctl-}
+    if [[ -n $name && -f /etc/letsencrypt/renewal/${name}.conf ]] && command_exists certbot; then
+      certbot delete --cert-name "$name" --non-interactive >/dev/null 2>&1 || warn "旧版 Certbot lineage 删除失败：$name"
+    fi
+    rm -f "$hook"
+  done
+}
+
+_remove_managed_certificates() {
+  local id source cert_name
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    source=$(_snapshot_meta_cert_get_field "$id" source); cert_name=$(_snapshot_meta_cert_get_field "$id" certName)
+    if [[ $source == letsencrypt && -n $cert_name && -x $CERTBOT_BIN && -f $CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf ]]; then
+      certbot_cmd delete --cert-name "$cert_name" --non-interactive >/dev/null 2>&1 || warn "Certbot lineage 删除失败：$cert_name"
+    fi
+    rm -f "$CERT_DIR/${id}.crt" "$CERT_DIR/${id}.key"
+  done < <(_snapshot_meta_cert_list)
+  _remove_legacy_certbot_assets
+}
+
+_remove_certbot_environment() {
+  _safe_remove_sbctl_dir "$CERTBOT_CONFIG_DIR" certbotConfigDir || true
+  _safe_remove_sbctl_dir "$CERTBOT_WORK_DIR" certbotWorkDir || true
+  _safe_remove_sbctl_dir "$CERTBOT_LOGS_DIR" certbotLogsDir || true
+  _safe_remove_sbctl_dir "$CERTBOT_VENV" certbotVenv || true
+  rmdir /var/log/sbctl /opt/sbctl 2>/dev/null || true
+}
+
+_remove_sbctl_service_definition() {
+  case $(init_system) in
+    systemd)
+      local unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
+      if [[ -f $unit ]] && grep -q 'managed by sbctl' "$unit" 2>/dev/null; then rm -f "$unit"; fi
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    openrc)
+      local init="${OPENRC_INIT_DIR}/${SERVICE_NAME}"
+      if [[ -f $init ]] && grep -q 'managed by sbctl' "$init" 2>/dev/null; then rm -f "$init"; fi
+      ;;
+  esac
+}
+
+_remove_sing_box_core() {
+  service_stop >/dev/null 2>&1 || true
+  service_disable >/dev/null 2>&1 || true
+  local manager
+  manager=$(pkg_manager 2>/dev/null || true)
+  case $manager in
+    apk) apk del sing-box >/dev/null 2>&1 || true;;
+    apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1 || true;;
+    dnf) dnf remove -y sing-box >/dev/null 2>&1 || true;;
+    yum) yum remove -y sing-box >/dev/null 2>&1 || true;;
+    pacman) pacman -Rns --noconfirm sing-box >/dev/null 2>&1 || true;;
+    zypper) zypper --non-interactive remove sing-box >/dev/null 2>&1 || true;;
+  esac
+  _remove_sbctl_service_definition
+}
+
+_remove_quick_command_and_libs() {
+  if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then rm -f "$QUICK_SYMLINK"; fi
+  if [[ -f $QUICK_COMMAND ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then rm -f "$QUICK_COMMAND"; fi
+  if [[ $LIB_DIR == /usr/local/lib/sbctl ]]; then _safe_remove_sbctl_dir "$LIB_DIR" libDir || true; fi
+  hash -r 2>/dev/null || true
+}
+
+_remove_config_and_metadata() {
+  rm -f "$CONFIG_FILE"
+  _safe_remove_sbctl_dir "$CERT_DIR" certDir || true
+  [[ ! -d $CONFIG_DIR ]] || rmdir "$CONFIG_DIR" 2>/dev/null || true
+  rm -f "$META_FILE"
+  rmdir "$(dirname "$META_FILE")" 2>/dev/null || true
+  if [[ -d $DATA_DIR ]]; then
+    local recorded_data
+    recorded_data=$(_snapshot_meta_resource_get dataDir)
+    if [[ -n $recorded_data && $recorded_data == "$DATA_DIR" ]]; then _safe_remove_sbctl_dir "$DATA_DIR" dataDir || true; else rmdir "$DATA_DIR" 2>/dev/null || true; fi
+  fi
+  rm -f /var/log/sing-box.log 2>/dev/null || true
+}
+
+_remove_bbr_settings() {
+  local config=/etc/sysctl.d/99-sbctl-bbr.conf available fallback=""
+  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control && $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then
+    available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+    if grep -qw cubic <<<"$available"; then fallback=cubic; elif grep -qw reno <<<"$available"; then fallback=reno; fi
+    [[ -z $fallback ]] || sysctl -w net.ipv4.tcp_congestion_control="$fallback" >/dev/null 2>&1 || true
+  fi
+  rm -f "$config"
+}
+
+_remove_backups() {
+  _safe_remove_sbctl_dir "$BACKUP_DIR" backupDir
+}
+
+_scan_sbctl_residuals() {
+  local __count_var=$1 include_backups=${2:-0} count=0 path
+  local paths=("$QUICK_COMMAND" "$QUICK_SYMLINK" "$CONFIG_FILE" "$META_FILE" "$CERT_DIR" "$CERTBOT_VENV" "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR" \
+    "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" /etc/periodic/daily/sbctl-certbot-renew)
+  [[ $LIB_DIR != /usr/local/lib/sbctl ]] || paths+=("$LIB_DIR")
+  ((include_backups == 0)) || paths+=("$BACKUP_DIR" /etc/sysctl.d/99-sbctl-bbr.conf)
+  for path in "${paths[@]}"; do
+    [[ ! -e $path && ! -L $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }
+  done
+  for path in "$CERTBOT_HOOK_DIR"/sbctl-*; do [[ ! -e $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }; done
+  pgrep -x sing-box >/dev/null 2>&1 && { printf '  ✗ 残留: sing-box 进程仍在运行\n'; ((count+=1)); }
+  printf -v "$__count_var" '%s' "$count"
+}
+
+_sbctl_uninstall_level_0() {
+  heading "卸载程序"
+  confirm "卸载 sing-box 核心，但保留配置、证书、备份、sbctl 和自动续期？" N || return 0
+  if [[ -f $CONFIG_FILE ]]; then
+    local backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
+    backup_all "$backup" >/dev/null 2>&1 && info "卸载前备份：$backup" || warn "卸载前备份失败，仍继续仅卸载核心。"
+  fi
+  _remove_sing_box_core
+  info "sing-box 核心已卸载；配置、证书、sbctl、续期任务和备份已保留。"
+  info "需要时运行 sbctl install 可重新安装。"
+}
+
+_sbctl_uninstall_level_1() {
+  heading "完全卸载"
+  confirm "将卸载 sing-box/sbctl，并删除配置、托管证书和 Certbot 数据；备份保留。确定吗？" N || return 0
+  local backup residual=0 failures=0
+  if [[ -f $CONFIG_FILE ]]; then
+    backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
+    backup_all "$backup" >/dev/null 2>&1 || { warn "最终备份失败，已取消完全卸载。"; return 1; }
+    info "最终备份已创建：$backup"
+  fi
+  _uninstall_snapshot_metadata
+  cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
+  cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
+  cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
+  cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1))
+  cleanup_step "删除配置与元数据" _remove_config_and_metadata || ((failures+=1))
+  cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
+  heading "残留检查"; _scan_sbctl_residuals residual 0
+  rm -f "$SNAPSHOT_META"
+  ((failures == 0)) || warn "有 ${failures} 个清理步骤未完全成功。"
+  ((residual == 0)) || warn "检测到 ${residual} 项残留。"
+  info "完全卸载完成；备份保留在 ${BACKUP_DIR}。"
+}
+
+_sbctl_uninstall_level_2() {
+  heading "彻底删除"
+  cat <<'EOF_ERASE'
+
+⚠ 即将永久删除 sbctl 管理的全部数据：
+  - sing-box 核心与 sbctl
+  - 配置、用户凭据、托管证书
+  - sbctl 签发的 Let's Encrypt 数据
+  - 独立 Certbot 环境与自动续期任务
+  - sbctl 的 BBR 配置
+  - 所有 sbctl 备份
+
+不会删除系统 Certbot、其他网站的 /etc/letsencrypt 数据或其他系统软件包。
+此模式不会保留最终备份。
+EOF_ERASE
+  printf '输入 DELETE 确认：'
+  local answer failures=0 residual=0
+  read -r answer || { echo; return 0; }
+  [[ $answer == DELETE ]] || { info "已取消彻底删除。"; return 0; }
+  _uninstall_snapshot_metadata
+  cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
+  cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
+  cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
+  cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1))
+  cleanup_step "撤销 BBR 配置" _remove_bbr_settings || ((failures+=1))
+  cleanup_step "删除配置与元数据" _remove_config_and_metadata || ((failures+=1))
+  cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
+  cleanup_step "删除所有备份" _remove_backups || ((failures+=1))
+  heading "残留检查"; _scan_sbctl_residuals residual 1
+  rm -f "$SNAPSHOT_META"
+  printf '执行结果：失败步骤 %d，检测残留 %d\n' "$failures" "$residual"
+}
+
+uninstall_sing_box() {
+  ensure_dependencies uninstall
+  local level=${1:-0}
+  case $level in
+    0) _sbctl_uninstall_level_0;;
+    1) _sbctl_uninstall_level_1;;
+    2) _sbctl_uninstall_level_2;;
+    *) die "无效卸载级别：$level";;
+  esac
+  # Clean up Hysteria2 port hopping rules if sing-box was removed
+  if ! sing_box_installed; then
+    hy2_hop_clear_rules
+    hy2_hop_boot_service_remove
+  fi
+}
+
+# ---- module: menu ----
+# sbctl menus — canonical interactive UI, dispatch, and help.
+# All menus are defined exactly once. No overrides.
+
+# ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
+manage_inbound_menu() {
+  local tag=$1 choice row
+  while inbound_exists "$tag"; do
+    clear_screen
+    # Single-jq: fetch type, port, security, user_count in one call
+    row=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|[.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),((.users//[])|length|tostring)]|@tsv' "$CONFIG_FILE")
+    IFS=$'\t' read -r type port security user_count <<<"$row"
+    heading "入站 · ${tag}"
+    printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
+
+    case $type in
+      anytls|vless|trojan|hysteria2)
+        printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        read -r -p "请选择: " choice || { echo; return; }
+        case $choice in
+          1) run_menu_action print_share "$tag"; pause;;
+          2) client_menu "$tag";;
+          3) modify_inbound_menu "$tag";;
+          4) run_menu_action show_inbound "$tag"; pause;;
+          0) return;; *) warn "无效选项。"; pause;;
+        esac
+        ;;
+      socks|http)
+        if ((user_count > 0)); then
+          printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+          read -r -p "请选择: " choice || { echo; return; }
+          case $choice in
+            1) run_menu_action print_share "$tag"; pause;;
+            2) client_menu "$tag";;
+            3) modify_inbound_menu "$tag";;
+            4) run_menu_action show_inbound "$tag"; pause;;
+            0) return;; *) warn "无效选项。"; pause;;
+          esac
+        else
+          printf '1) 客户端配置\n2) 修改入站信息\n3) 查看 JSON\n0) 返回列表\n'
+          read -r -p "请选择: " choice || { echo; return; }
+          case $choice in
+            1) run_menu_action print_share "$tag"; pause;;
+            2) modify_inbound_menu "$tag";;
+            3) run_menu_action show_inbound "$tag"; pause;;
+            0) return;; *) warn "无效选项。"; pause;;
+          esac
+        fi
+        ;;
+      *) warn "不支持的入站协议：${type}"; return;;
+    esac
+  done
+}
+
+# ---- modify inbound menu (from hy2_hop.sh — adds port hopping for hysteria2) ----
+modify_inbound_menu() {
+  local tag=$1 choice type
+  while inbound_exists "$tag"; do
+    clear_screen
+    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+    heading "修改入站信息 · ${tag}"
+    if [[ $type == hysteria2 ]]; then
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
+    else
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+    fi
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
+      2) run_menu_action modify_inbound_basic "$tag"; pause;;
+      3) run_menu_action modify_inbound_security "$tag"; pause;;
+      4) [[ $type == hysteria2 ]] && { run_menu_action hy2_hop_configure "$tag"; pause; } || { warn "无效选项。"; pause; };;
+      0) return;;
+      *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+inbound_menu() {
+  ensure_config  # once at entry, not on every redraw
+  local choice tag
+  while true; do
+    clear_screen
+    heading "入站管理"
+    list_inbounds
+    printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
+    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action add_inbound; pause;;
+      2) select_inbound tag && manage_inbound_menu "$tag";;
+      3) run_menu_action print_all_share; pause;;
+      4) run_menu_action delete_inbound; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+client_menu() {
+  ensure_config  # once at entry
+  local tag=$1 choice
+  while inbound_exists "$tag"; do
+    clear_screen; heading "用户管理 · ${tag}"; list_clients "$tag"
+    printf '\n1) 添加用户\n2) 重命名用户\n3) 更换 UUID/密码\n4) 删除用户\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action add_client "$tag"; pause;;
+      2) run_menu_action rename_client "$tag"; pause;;
+      3) run_menu_action rotate_client_credential "$tag"; pause;;
+      4) run_menu_action delete_client "$tag"; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+outbound_menu() {
+  ensure_config  # once at entry
+  local choice
+  while true; do
+    clear_screen
+    heading "出站管理"
+    list_outbound_overview
+    printf '\n1) 选择入站设置出站\n2) 添加 SOCKS5/HTTP 出站\n3) 删除出站\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action assign_outbound; pause;;
+      2) run_menu_action add_outbound; pause;;
+      3) run_menu_action delete_outbound; pause;;
+      0) return;;
+      *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+# ---- certificate menu (from cloudflare.sh — adds Cloudflare credentials option) ----
+certificate_menu() {
+  local choice
+  while true; do
+    clear_screen; heading "TLS 证书"
+    printf '托管证书: %s\n\n' "$(managed_certificate_count)"
+    printf "1) Let's Encrypt 签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n5) Cloudflare DNS 凭据\n6) 立即检查/续期自动证书\n0) 返回\n"
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action issue_certificate; pause;;
+      2) run_menu_action import_certificate; pause;;
+      3) run_menu_action list_certificates; pause;;
+      4) run_menu_action delete_certificate; pause;;
+      5) cloudflare_credentials_menu;;
+      6) run_menu_action renew_managed_certificates; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+toggle_service_running() {
+  if service_is_active; then service_action stop; else service_action start; fi
+}
+
+toggle_service_startup() {
+  if service_is_enabled; then service_disable; info "开机自启已关闭；当前运行状态未改变。"; else service_enable; info "开机自启已开启。"; fi
+}
+
+service_menu() {
+  local choice svc_summary boot_summary ver_summary
+  while true; do
+    clear_screen; heading "服务管理"
+    # Single _service_summary_all call, parse with read — no repeated awk/systemctl
+    read -r svc_summary boot_summary ver_summary <<< "$(_service_summary_all)"
+    printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$svc_summary" "$boot_summary" "$ver_summary"
+    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装/更新/修复 sing-box\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action toggle_service_running; pause;;
+      2) run_menu_action service_action restart; pause;;
+      3) run_menu_action toggle_service_startup; pause;;
+      4) run_menu_action service_logs 100; pause;;
+      5) run_menu_action install_or_update_sing_box; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+system_menu() {
+  local choice
+  while true; do
+    clear_screen; heading "系统工具"
+    printf 'BBR: %s\n\n' "$(bbr_state_summary)"
+    printf '1) BBR 开启/关闭\n2) 系统诊断\n3) 修复快捷命令\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action toggle_bbr; pause;;
+      2) run_menu_action system_diagnostics; pause;;
+      3) run_menu_action repair_quick_command; pause;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+# ---- uninstall menu (from enhancements.sh — three-level model) ----
+uninstall_menu() {
+  local choice
+  while true; do
+    clear_screen; heading "卸载"
+    printf '1) 卸载程序 — 仅删除 sing-box 核心，保留配置/证书/sbctl\n'
+    printf '2) 完全卸载 — 删除 sing-box/sbctl/配置/证书，保留备份\n'
+    printf '3) 彻底删除 — 清除全部 sbctl 数据和备份\n'
+    printf '0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action uninstall_sing_box 0; pause;;
+      2) run_menu_action uninstall_sing_box 1; return;;
+      3) run_menu_action uninstall_sing_box 2; return;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+show_main_inbounds() {
+  heading "当前入站"
+  list_inbounds
+  printf '\n'
+}
+
+main_menu() {
+  ensure_config 2>/dev/null || true
+  local choice
+  while true; do
+    clear_screen
+    printf '%ssbctl · sing-box Linux 管理器%s  v%s\n' "$C_BOLD$C_BLUE" "$C_RESET" "$SBCTL_VERSION"
+    node_summary
+    show_main_inbounds
+    printf '1) 入站管理\n2) 出站管理\n3) TLS 证书\n4) 服务管理\n5) 系统工具\n6) 卸载\n0) 退出\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) inbound_menu;; 2) outbound_menu;; 3) certificate_menu;; 4) service_menu;;
+      5) system_menu;; 6) uninstall_menu;;
+      0) return;; *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
+# ---- canonical show_help (merged from all modules) ----
+show_help() {
+  cat <<'EOF_HELP'
+sbctl - sing-box Linux 管理器
+
+用法:
+  sbctl                              打开交互菜单
+  sbctl install [版本]               安装/更新 sing-box
+  sbctl uninstall                    仅卸载 sing-box 核心，保留配置
+  sbctl uninstall --purge            完全卸载，保留备份
+  sbctl uninstall --erase            彻底删除全部 sbctl 数据和备份
+  sbctl status                       查看状态
+  sbctl start|stop|restart           服务控制
+  sbctl enable|disable               开关开机自启
+  sbctl logs [行数]                  查看日志
+
+  sbctl inbound list                 列出入站
+  sbctl inbound add                  新增入站
+  sbctl inbound show <标签>          查看入站 JSON
+  sbctl inbound rename <旧标签> <新标签>
+  sbctl inbound modify [标签]        修改监听地址/端口
+  sbctl inbound security [标签]      修改 TLS/REALITY
+  sbctl inbound delete [标签] [--yes]
+
+  sbctl outbound list
+  sbctl outbound add
+  sbctl outbound assign [入站] [出站标签|direct]
+  sbctl outbound delete [出站标签]
+
+  sbctl client list [标签]
+  sbctl client add [标签]
+  sbctl client rename [标签] [旧名称] [新名称]
+  sbctl client rotate [标签] [用户]
+  sbctl client delete [标签] [用户]
+
+  sbctl link [标签] [用户]           输出分享信息/客户端 JSON
+  sbctl config check|show|edit
+  sbctl cert list
+  sbctl cert issue [域名/IP] [邮箱]
+  sbctl cert import [标识] [证书] [私钥]
+  sbctl cert delete [标识] [--yes]
+  sbctl cert renew [标识]
+  sbctl cert renew-auto              检查并续期所有自动证书
+  sbctl cert cloudflare              管理 Cloudflare DNS 邮箱 / Global API Key
+  sbctl backup [文件.tar.gz]
+  sbctl restore [文件.tar.gz]
+  sbctl bbr                           BBR 开启/关闭
+  sbctl diagnose
+  sbctl version
+
+证书说明:
+  - 域名支持 Cloudflare DNS 自动验证/续期、HTTP 自动验证/续期、DNS 手动 TXT 验证。
+  - Cloudflare 使用账号邮箱 + Global API Key，凭据文件权限为 600。
+  - DNS 手动验证证书不会被标记为自动续期。
+  - 公网 IP 证书使用 Certbot 5.4+ short-lived profile + HTTP 验证。
+  - Certbot 使用 /opt/sbctl/certbot 独立环境，不污染系统 Certbot。
+
+支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP
+出站: SOCKS5/HTTP 代理、本地出口
+EOF_HELP
+}
+
+# ---- canonical dispatch (merged from all modules) ----
+dispatch() {
+  local cmd=${1:-menu}; shift || true
+  case $cmd in
+    menu) main_menu;;
+    help|-h|--help) show_help;;
+    version|-v|--version) printf 'sbctl %s\n' "$SBCTL_VERSION";;
+    install|update|upgrade) install_or_update_sing_box "${1-}";;
+    uninstall)
+      case ${1-} in
+        "") uninstall_sing_box 0;;
+        --purge) uninstall_sing_box 1;;
+        --erase) uninstall_sing_box 2;;
+        *) die "未知卸载选项：${1}";;
+      esac
+      ;;
+    status) show_status;;
+    start|stop|restart|enable|disable) service_action "$cmd";;
+    logs) service_logs "${1:-100}";;
+    inbound)
+      case ${1:-list} in
+        list) ensure_config; list_inbounds;;
+        add) add_inbound;;
+        show) ensure_config; show_inbound "${2:?请提供标签}";;
+        rename) rename_inbound "${2-}" "${3-}";;
+        modify|edit) modify_inbound_basic "${2-}";;
+        security|tls) modify_inbound_security "${2-}";;
+        delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
+        *) die "未知 inbound 子命令：${1}";;
+      esac
+      ;;
+    outbound)
+      case ${1:-list} in
+        list) list_outbound_overview;;
+        add) add_outbound;;
+        assign|set) assign_outbound "${2-}" "${3-}";;
+        delete|remove) delete_outbound "${2-}";;
+        *) die "未知 outbound 子命令：${1}";;
+      esac
+      ;;
+    client)
+      case ${1:-list} in
+        list) list_clients "${2-}";;
+        add) add_client "${2-}";;
+        rename) rename_client "${2-}" "${3-}" "${4-}";;
+        rotate|reset) rotate_client_credential "${2-}" "${3-}";;
+        delete|remove) delete_client "${2-}" "${3-}";;
+        *) die "未知 client 子命令：${1}";;
+      esac
+      ;;
+    link|share) print_share "${1-}" "${2-}";;
+    config)
+      case ${1:-check} in
+        check|test) check_config;;
+        show) ensure_config; jq . "$CONFIG_FILE";;
+        edit) edit_config;;
+        *) die "未知 config 子命令。";;
+      esac
+      ;;
+    cert)
+      case ${1:-list} in
+        list) list_certificates;;
+        issue) issue_certificate "${2-}" "${3-}";;
+        import) import_certificate "${2-}" "${3-}" "${4-}";;
+        delete|remove) delete_certificate "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
+        renew-auto) renew_managed_certificates;;
+        renew) renew_certificate_command "${2-}";;
+        cloudflare) cloudflare_credentials_menu;;
+        *) die "未知 cert 子命令。";;
+      esac
+      ;;
+    backup) backup_all "${1-}";;
+    restore) restore_backup "${1-}";;
+    bbr) toggle_bbr;;
+    diagnose|doctor) system_diagnostics;;
+    quick-command) repair_quick_command;;
+    internal-hy2-hop-restore) internal_hy2_hop_restore;;
+    internal-hy2-hop-clear) internal_hy2_hop_clear;;
+    *) error "未知命令：$cmd"; show_help; return 2;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then dispatch "$@"; fi
