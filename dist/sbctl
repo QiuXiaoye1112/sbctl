@@ -60,8 +60,17 @@ else
 fi
 
 info()    { printf '%s[信息]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-warn()    { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-error()   { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+mark_action_diagnostic() {
+  SBCTL_DIAGNOSTIC_SEQ=$(( ${SBCTL_DIAGNOSTIC_SEQ:-0} + 1 ))
+  [[ -n ${SBCTL_ACTION_DIAGNOSTIC_FILE:-} ]] || return 0
+  printf '1' >"$SBCTL_ACTION_DIAGNOSTIC_FILE" 2>/dev/null || true
+}
+warn()    { mark_action_diagnostic; printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error()   { mark_action_diagnostic; printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+warn_if_no_diagnostic() {
+  local before=${1:-0}; shift
+  (( ${SBCTL_DIAGNOSTIC_SEQ:-0} != before )) || warn "$*"
+}
 die()     { error "$*"; exit 1; }
 heading() { printf '\n%s%s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
 clear_screen() { clear 2>/dev/null || true; }
@@ -170,7 +179,8 @@ choose() {
 }
 
 run_menu_action() {
-  local status
+  local status diagnostic_file=""
+  diagnostic_file=$(mktemp "${TMPDIR:-/tmp}/sbctl-action.XXXXXX" 2>/dev/null) || true
   # ERR traps still fire when `errexit` is disabled. Temporarily remove the
   # outer session trap so a failed action can be captured instead of exiting
   # the whole interactive program. The action itself keeps strict -e behavior.
@@ -178,6 +188,7 @@ run_menu_action() {
   set +e
   (
     set -Eeuo pipefail
+    [[ -z $diagnostic_file ]] || export SBCTL_ACTION_DIAGNOSTIC_FILE="$diagnostic_file"
     trap - ERR
     trap cleanup_action_on_exit EXIT
     "$@"
@@ -185,7 +196,10 @@ run_menu_action() {
   status=$?
   set -e
   trap on_error ERR
-  ((status == 0)) || warn "操作未完成，脚本仍在运行。"
+  if ((status != 0)) && { [[ -z $diagnostic_file ]] || [[ ! -s $diagnostic_file ]]; }; then
+    warn "操作未完成，脚本仍在运行。"
+  fi
+  [[ -z $diagnostic_file ]] || rm -f "$diagnostic_file"
   return 0
 }
 
@@ -1091,11 +1105,34 @@ reality_public_key() {
 # Builders for ordinary inbound protocols. Interaction and persistence belong
 # to inbound.sh; these functions only construct sing-box JSON objects.
 
+protocol_list() {
+  printf '%s\n' anytls vless hysteria2 trojan socks http
+}
+
+protocol_display_name() {
+  case ${1-} in
+    anytls) printf 'AnyTLS' ;;
+    vless) printf 'VLESS' ;;
+    hysteria2) printf 'Hysteria2' ;;
+    trojan) printf 'Trojan' ;;
+    socks) printf 'SOCKS5' ;;
+    http) printf 'HTTP' ;;
+    *) return 1 ;;
+  esac
+}
+
 protocol_capability() {
-  local type=$1 capability=$2
+  local type=${1-} capability=${2-}
   case "$type:$capability" in
-    vless:tls|vless:reality|vless:users|anytls:tls|anytls:reality|anytls:users|trojan:tls|trojan:reality|trojan:users|socks:users|http:users) return 0;;
-    *) return 1;;
+    anytls:users|anytls:tls|anytls:reality|anytls:certificate|anytls:tcp|anytls:share|\
+    vless:users|vless:tls|vless:reality|vless:certificate|vless:transport|vless:tcp|vless:share|\
+    hysteria2:users|hysteria2:tls|hysteria2:certificate|hysteria2:udp|hysteria2:share|hysteria2:port_hopping|\
+    trojan:users|trojan:tls|trojan:reality|trojan:certificate|trojan:transport|trojan:tcp|trojan:share|\
+    socks:users|socks:tcp|socks:share|\
+    http:users|http:tcp|http:share)
+      return 0
+      ;;
+    *) return 1 ;;
   esac
 }
 
@@ -1533,7 +1570,7 @@ build_inbound() {
       esac
       prompt_port port
       # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
-      if [[ $choice != 1 ]]; then
+      if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
@@ -1562,7 +1599,7 @@ build_inbound() {
       fi
       prompt_port port
       # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
-      if [[ $choice != 1 ]]; then
+      if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
@@ -1582,7 +1619,6 @@ build_inbound() {
           warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
         done
         if ! hy2_hop_check_conflicts "$selected_hop_range" "$tag"; then
-          warn "端口跳跃范围冲突，请重新设置。"
           return 1
         fi
         prompt_hy2_internal_port port "$selected_hop_range" || return 1
@@ -1768,23 +1804,25 @@ modify_inbound_basic() {
 
 modify_inbound_security() {
   ensure_dependencies inbound-security; require_supported_core; ensure_config
-  local tag=${1-} type choice tls="" public="" tmp meta_tmp host rc=0
+  local tag=${1-} type choice tls="" public="" tmp meta_tmp host="" rc=0
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   case $type in
     anytls|vless|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-      if [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls; fi
+      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls host; fi
       ;;
     hysteria2)
       info "Hysteria2 必须使用证书 TLS。"
-      build_certificate_tls tls
+      build_certificate_tls tls host
       ;;
     *) die "${type} 入站没有 sbctl 可管理的 TLS/REALITY 安全层。";;
   esac
-  host=$(public_host_for_tag "$tag" || true)
-  [[ -n $host ]] || prompt_public_host host
+  if [[ -z $host ]]; then
+    host=$(public_host_for_tag "$tag" || true)
+    [[ -n $host ]] || prompt_public_host host
+  fi
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
     (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
@@ -1960,7 +1998,8 @@ rotate_client_credential() {
 
 client_json_for_anytls() {
   local tag=$1 name=$2 host port password sni public sid
-  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"; port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  host=$(public_host_for_tag "$tag") || return 1
+  port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   password=$(jq -r --arg tag "$tag" --arg name "$name" '.inbounds[]|select(.tag==$tag)|.users[]|select(.name==$name)|.password' "$CONFIG_FILE")
   sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
   jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"; return 0; }
@@ -2256,6 +2295,21 @@ print_share_entry() {
   printf '用户: %s\n%s: %s\n' "$label" "$field" "$value"
 }
 
+share_transport_query() {
+  local tag=$1 security=$2 sni=$3 transport_type transport_path transport_host query
+  transport_type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.type // "tcp"' "$CONFIG_FILE")
+  query="type=$(url_encode "$transport_type")"
+  if [[ $security != none ]]; then
+    query+="&security=$(url_encode "$security")&sni=$(url_encode "$sni")"
+  fi
+  if [[ $transport_type == ws ]]; then
+    transport_path=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.path // empty' "$CONFIG_FILE")
+    transport_host=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.headers.Host // empty' "$CONFIG_FILE")
+    query+="&host=$(url_encode "$transport_host")&path=$(url_encode "$transport_path")"
+  fi
+  printf '%s' "$query"
+}
+
 print_share() {
   # Does NOT call ensure_config — caller validates config once at entry.
   [[ -f $CONFIG_FILE ]] || { warn "配置不存在。"; return 1; }
@@ -2263,7 +2317,8 @@ print_share() {
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"
+  protocol_capability "$type" share || { warn "该入站协议不提供 sbctl 分享信息：${type}"; return 0; }
+  host=$(public_host_for_tag "$tag") || return 1
   uri_host=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   heading "${tag} 分享信息"
@@ -2287,9 +2342,9 @@ print_share() {
           link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
           [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         elif [[ $security == tls ]]; then
-          link="vless://${value}@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+          link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
         else
-          link="vless://${value}@${uri_host}:${port}?type=tcp"
+          link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" none "")"
         fi
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"
@@ -2313,7 +2368,7 @@ print_share() {
         if [[ $security == reality ]]; then
           link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
         else
-          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+          link="trojan://$(url_encode "$value")@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
         fi
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"
@@ -2366,9 +2421,6 @@ print_share() {
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
       ;;
-    *)
-      warn "该入站协议不提供 sbctl 分享信息：${type}"; return 0
-      ;;
   esac
   share_separator
 }
@@ -2378,7 +2430,7 @@ print_all_share() {
   local tag
   if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then info "还没有入站。"; return 0; fi
   while IFS= read -r tag; do
-    print_share "$tag" "" || warn "${tag} 分享信息生成失败。"
+    print_share "$tag" "" || true
   done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
 }
 
@@ -2718,21 +2770,42 @@ issue_certificate() {
     force=1
   fi
 
+  local diagnostic_seq
   if [[ $mode == ip ]]; then
     validation=http-standalone; auto_renew=true
-    _issue_ip_certificate "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_ip_certificate "$subject" "$email" "$force"; then
+      warn_if_no_diagnostic "$diagnostic_seq" "证书签发失败。"
+      return 1
+    fi
   elif [[ $verify_method == dns-cloudflare ]]; then
     validation=dns-cloudflare; auto_renew=true
-    _issue_domain_cloudflare "$subject" "$email" "$force" || { warn "Cloudflare DNS 证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_domain_cloudflare "$subject" "$email" "$force"; then
+      warn_if_no_diagnostic "$diagnostic_seq" "Cloudflare DNS 证书签发失败。"
+      return 1
+    fi
   elif [[ $verify_method == dns-manual ]]; then
     validation=dns-manual; auto_renew=false
-    _issue_domain_manual_dns "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_domain_manual_dns "$subject" "$email" "$force"; then
+      warn_if_no_diagnostic "$diagnostic_seq" "证书签发失败。"
+      return 1
+    fi
   else
-    _issue_domain_http "$subject" "$email" "$force" validation || { warn "证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_domain_http "$subject" "$email" "$force" validation; then
+      warn_if_no_diagnostic "$diagnostic_seq" "证书签发失败。"
+      return 1
+    fi
     auto_renew=true
   fi
 
-  sync_managed_certificate "$identifier" "$cert_name" changed || { warn "证书已签发，但同步到 sbctl 托管目录失败。"; return 1; }
+  diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+  if ! sync_managed_certificate "$identifier" "$cert_name" changed; then
+    warn_if_no_diagnostic "$diagnostic_seq" "证书已签发，但同步到 sbctl 托管目录失败。"
+    return 1
+  fi
   meta_cert_set "$identifier" "$subject" "$cert_name" letsencrypt "$validation" "$auto_renew"
   [[ $auto_renew == true ]] && setup_certbot_renewal_timer
   restart_sing_box_if_certificate_changed "$changed" || return 1

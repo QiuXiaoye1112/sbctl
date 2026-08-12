@@ -10,6 +10,21 @@ print_share_entry() {
   printf '用户: %s\n%s: %s\n' "$label" "$field" "$value"
 }
 
+share_transport_query() {
+  local tag=$1 security=$2 sni=$3 transport_type transport_path transport_host query
+  transport_type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.type // "tcp"' "$CONFIG_FILE")
+  query="type=$(url_encode "$transport_type")"
+  if [[ $security != none ]]; then
+    query+="&security=$(url_encode "$security")&sni=$(url_encode "$sni")"
+  fi
+  if [[ $transport_type == ws ]]; then
+    transport_path=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.path // empty' "$CONFIG_FILE")
+    transport_host=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.headers.Host // empty' "$CONFIG_FILE")
+    query+="&host=$(url_encode "$transport_host")&path=$(url_encode "$transport_path")"
+  fi
+  printf '%s' "$query"
+}
+
 print_share() {
   # Does NOT call ensure_config — caller validates config once at entry.
   [[ -f $CONFIG_FILE ]] || { warn "配置不存在。"; return 1; }
@@ -17,7 +32,8 @@ print_share() {
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"
+  protocol_capability "$type" share || { warn "该入站协议不提供 sbctl 分享信息：${type}"; return 0; }
+  host=$(public_host_for_tag "$tag") || return 1
   uri_host=$(uri_host "$host")
   port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   heading "${tag} 分享信息"
@@ -41,9 +57,9 @@ print_share() {
           link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
           [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         elif [[ $security == tls ]]; then
-          link="vless://${value}@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+          link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
         else
-          link="vless://${value}@${uri_host}:${port}?type=tcp"
+          link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" none "")"
         fi
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"
@@ -67,7 +83,7 @@ print_share() {
         if [[ $security == reality ]]; then
           link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
         else
-          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=tls&sni=$(url_encode "$sni")"
+          link="trojan://$(url_encode "$value")@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
         fi
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"
@@ -120,9 +136,6 @@ print_share() {
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
       ;;
-    *)
-      warn "该入站协议不提供 sbctl 分享信息：${type}"; return 0
-      ;;
   esac
   share_separator
 }
@@ -132,6 +145,6 @@ print_all_share() {
   local tag
   if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then info "还没有入站。"; return 0; fi
   while IFS= read -r tag; do
-    print_share "$tag" "" || warn "${tag} 分享信息生成失败。"
+    print_share "$tag" "" || true
   done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
 }

@@ -124,7 +124,8 @@ rotate_client_credential() {
 
 client_json_for_anytls() {
   local tag=$1 name=$2 host port password sni public sid
-  host=$(public_host_for_tag "$tag") || warn "无法确定入站 ${tag} 的客户端连接地址。"; port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  host=$(public_host_for_tag "$tag") || return 1
+  port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   password=$(jq -r --arg tag "$tag" --arg name "$name" '.inbounds[]|select(.tag==$tag)|.users[]|select(.name==$name)|.password' "$CONFIG_FILE")
   sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
   jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"; return 0; }

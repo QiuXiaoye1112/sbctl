@@ -334,21 +334,42 @@ issue_certificate() {
     force=1
   fi
 
+  local diagnostic_seq
   if [[ $mode == ip ]]; then
     validation=http-standalone; auto_renew=true
-    _issue_ip_certificate "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_ip_certificate "$subject" "$email" "$force"; then
+      warn_if_no_diagnostic "$diagnostic_seq" "证书签发失败。"
+      return 1
+    fi
   elif [[ $verify_method == dns-cloudflare ]]; then
     validation=dns-cloudflare; auto_renew=true
-    _issue_domain_cloudflare "$subject" "$email" "$force" || { warn "Cloudflare DNS 证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_domain_cloudflare "$subject" "$email" "$force"; then
+      warn_if_no_diagnostic "$diagnostic_seq" "Cloudflare DNS 证书签发失败。"
+      return 1
+    fi
   elif [[ $verify_method == dns-manual ]]; then
     validation=dns-manual; auto_renew=false
-    _issue_domain_manual_dns "$subject" "$email" "$force" || { warn "证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_domain_manual_dns "$subject" "$email" "$force"; then
+      warn_if_no_diagnostic "$diagnostic_seq" "证书签发失败。"
+      return 1
+    fi
   else
-    _issue_domain_http "$subject" "$email" "$force" validation || { warn "证书签发失败。"; return 1; }
+    diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+    if ! _issue_domain_http "$subject" "$email" "$force" validation; then
+      warn_if_no_diagnostic "$diagnostic_seq" "证书签发失败。"
+      return 1
+    fi
     auto_renew=true
   fi
 
-  sync_managed_certificate "$identifier" "$cert_name" changed || { warn "证书已签发，但同步到 sbctl 托管目录失败。"; return 1; }
+  diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
+  if ! sync_managed_certificate "$identifier" "$cert_name" changed; then
+    warn_if_no_diagnostic "$diagnostic_seq" "证书已签发，但同步到 sbctl 托管目录失败。"
+    return 1
+  fi
   meta_cert_set "$identifier" "$subject" "$cert_name" letsencrypt "$validation" "$auto_renew"
   [[ $auto_renew == true ]] && setup_certbot_renewal_timer
   restart_sing_box_if_certificate_changed "$changed" || return 1

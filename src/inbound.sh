@@ -76,7 +76,7 @@ build_inbound() {
       esac
       prompt_port port
       # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
-      if [[ $choice != 1 ]]; then
+      if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
@@ -105,7 +105,7 @@ build_inbound() {
       fi
       prompt_port port
       # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
-      if [[ $choice != 1 ]]; then
+      if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
         choose tp_choice "传输方式" "tcp" "ws"
         if [[ $tp_choice == 2 ]]; then
@@ -125,7 +125,6 @@ build_inbound() {
           warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
         done
         if ! hy2_hop_check_conflicts "$selected_hop_range" "$tag"; then
-          warn "端口跳跃范围冲突，请重新设置。"
           return 1
         fi
         prompt_hy2_internal_port port "$selected_hop_range" || return 1
@@ -311,23 +310,25 @@ modify_inbound_basic() {
 
 modify_inbound_security() {
   ensure_dependencies inbound-security; require_supported_core; ensure_config
-  local tag=${1-} type choice tls="" public="" tmp meta_tmp host rc=0
+  local tag=${1-} type choice tls="" public="" tmp meta_tmp host="" rc=0
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   case $type in
     anytls|vless|trojan)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-      if [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls; fi
+      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls host; fi
       ;;
     hysteria2)
       info "Hysteria2 必须使用证书 TLS。"
-      build_certificate_tls tls
+      build_certificate_tls tls host
       ;;
     *) die "${type} 入站没有 sbctl 可管理的 TLS/REALITY 安全层。";;
   esac
-  host=$(public_host_for_tag "$tag" || true)
-  [[ -n $host ]] || prompt_public_host host
+  if [[ -z $host ]]; then
+    host=$(public_host_for_tag "$tag" || true)
+    [[ -n $host ]] || prompt_public_host host
+  fi
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
     (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
