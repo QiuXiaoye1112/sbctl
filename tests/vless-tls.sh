@@ -31,6 +31,7 @@ bash -c '
     local __var=$1 prompt=$2
     case $prompt in
       "选择入站协议") printf -v "$__var" "%s" 2 ;; "选择 TLS 安全层") printf -v "$__var" "%s" 2 ;;
+      "传输方式") printf -v "$__var" "%s" 1 ;;
     esac
   }
   prompt_tag() { printf -v "$1" "%s" vless-tls; }
@@ -83,6 +84,7 @@ bash -c '
     local __var=$1 prompt=$2
     case $prompt in
       "选择入站协议") printf -v "$__var" "%s" 4 ;; "选择 TLS 安全层") printf -v "$__var" "%s" 2 ;;
+      "传输方式") printf -v "$__var" "%s" 1 ;;
     esac
   }
   prompt_tag() { printf -v "$1" "%s" trojan-cert; }
@@ -230,6 +232,29 @@ bash -c '
   [[ $host == example.com ]]
   [[ $hop == 30000-50000 ]]
   [[ $prompt_public_host_called == 0 ]]
+'
+
+# ============================================================
+# Test 8: modifying to cert TLS updates the client host to the certificate SNI
+# ============================================================
+SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t8/cfg" SBCTL_CONFIG_FILE="$TMP/t8/cfg/config.json" \
+  SBCTL_META_FILE="$TMP/t8/meta.json" SBCTL_CERT_DIR="$TMP/t8/cfg/certs" SBCTL_LOCK_FILE="$TMP/t8/lock" \
+bash -c '
+  set -Eeuo pipefail; source ./sbctl.sh; write_default_config
+  jq '\''.inbounds += [{type:"vless",tag:"vless-existing",listen:"0.0.0.0",listen_port:443,users:[{name:"u",uuid:"00000000-0000-0000-0000-000000000001"}],tls:{enabled:true,server_name:"old.example.com"}}]'\'' "$CONFIG_FILE" >"$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  ensure_dependencies() { :; }; require_supported_core() { :; }
+  choose() { printf -v "$1" "%s" 2; }
+  build_certificate_tls() {
+    printf -v "$1" "%s" "{\"enabled\":true,\"server_name\":\"cert.example.com\",\"certificate_path\":\"/tmp/c.crt\",\"key_path\":\"/tmp/c.key\"}"
+    printf -v "$2" "%s" cert.example.com
+  }
+  public_host_for_tag() { printf "%s" old.example.com; }
+  build_inbound_meta_candidate() { seen_host=$2; printf "{}" >"$5"; }
+  apply_candidate_with_meta() { :; }
+  seen_host=""
+  modify_inbound_security vless-existing
+  [[ $seen_host == cert.example.com ]]
 '
 
 echo "cert TLS host tests passed."

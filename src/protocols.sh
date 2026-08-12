@@ -2,11 +2,34 @@
 # Builders for ordinary inbound protocols. Interaction and persistence belong
 # to inbound.sh; these functions only construct sing-box JSON objects.
 
+protocol_list() {
+  printf '%s\n' anytls vless hysteria2 trojan socks http
+}
+
+protocol_display_name() {
+  case ${1-} in
+    anytls) printf 'AnyTLS' ;;
+    vless) printf 'VLESS' ;;
+    hysteria2) printf 'Hysteria2' ;;
+    trojan) printf 'Trojan' ;;
+    socks) printf 'SOCKS5' ;;
+    http) printf 'HTTP' ;;
+    *) return 1 ;;
+  esac
+}
+
 protocol_capability() {
-  local type=$1 capability=$2
+  local type=${1-} capability=${2-}
   case "$type:$capability" in
-    vless:tls|vless:reality|vless:users|anytls:tls|anytls:reality|anytls:users|trojan:tls|trojan:reality|trojan:users|socks:users|http:users) return 0;;
-    *) return 1;;
+    anytls:users|anytls:tls|anytls:reality|anytls:certificate|anytls:tcp|anytls:share|\
+    vless:users|vless:tls|vless:reality|vless:certificate|vless:transport|vless:tcp|vless:share|\
+    hysteria2:users|hysteria2:tls|hysteria2:certificate|hysteria2:udp|hysteria2:share|hysteria2:port_hopping|\
+    trojan:users|trojan:tls|trojan:reality|trojan:certificate|trojan:transport|trojan:tcp|trojan:share|\
+    socks:users|socks:tcp|socks:share|\
+    http:users|http:tcp|http:share)
+      return 0
+      ;;
+    *) return 1 ;;
   esac
 }
 

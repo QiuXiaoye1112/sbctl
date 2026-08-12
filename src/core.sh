@@ -10,8 +10,17 @@ else
 fi
 
 info()    { printf '%s[信息]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-warn()    { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-error()   { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+mark_action_diagnostic() {
+  SBCTL_DIAGNOSTIC_SEQ=$(( ${SBCTL_DIAGNOSTIC_SEQ:-0} + 1 ))
+  [[ -n ${SBCTL_ACTION_DIAGNOSTIC_FILE:-} ]] || return 0
+  printf '1' >"$SBCTL_ACTION_DIAGNOSTIC_FILE" 2>/dev/null || true
+}
+warn()    { mark_action_diagnostic; printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error()   { mark_action_diagnostic; printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+warn_if_no_diagnostic() {
+  local before=${1:-0}; shift
+  (( ${SBCTL_DIAGNOSTIC_SEQ:-0} != before )) || warn "$*"
+}
 die()     { error "$*"; exit 1; }
 heading() { printf '\n%s%s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
 clear_screen() { clear 2>/dev/null || true; }
@@ -120,7 +129,8 @@ choose() {
 }
 
 run_menu_action() {
-  local status
+  local status diagnostic_file=""
+  diagnostic_file=$(mktemp "${TMPDIR:-/tmp}/sbctl-action.XXXXXX" 2>/dev/null) || true
   # ERR traps still fire when `errexit` is disabled. Temporarily remove the
   # outer session trap so a failed action can be captured instead of exiting
   # the whole interactive program. The action itself keeps strict -e behavior.
@@ -128,6 +138,7 @@ run_menu_action() {
   set +e
   (
     set -Eeuo pipefail
+    [[ -z $diagnostic_file ]] || export SBCTL_ACTION_DIAGNOSTIC_FILE="$diagnostic_file"
     trap - ERR
     trap cleanup_action_on_exit EXIT
     "$@"
@@ -135,7 +146,10 @@ run_menu_action() {
   status=$?
   set -e
   trap on_error ERR
-  ((status == 0)) || warn "操作未完成，脚本仍在运行。"
+  if ((status != 0)) && { [[ -z $diagnostic_file ]] || [[ ! -s $diagnostic_file ]]; }; then
+    warn "操作未完成，脚本仍在运行。"
+  fi
+  [[ -z $diagnostic_file ]] || rm -f "$diagnostic_file"
   return 0
 }
 
