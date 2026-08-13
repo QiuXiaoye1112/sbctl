@@ -54,7 +54,7 @@ _ensure_local_outbound() {
   jq --arg tag "$tag" --arg ip "$ip" --arg field "$bind_field" \
     '.outbounds += [{type:"direct",tag:$tag} + {($field):$ip}]' \
     "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp" >&2; then
+  if apply_candidate "$tmp" >/dev/null; then
     printf '%s' "$tag"
   else
     rm -f "$tmp"
@@ -152,8 +152,7 @@ def sbctl_domain_insert_index($rules; $inbound; $match; $domain):
 def sbctl_insert_rule($rules; $index; $new_rule):
   if $index == null then $rules + [$new_rule]
   else
-    [range(0; ($rules | length)) as $i |
-      if $i == $index then $new_rule, $rules[$i] else $rules[$i] end]
+    $rules[:$index] + [$new_rule] + $rules[$index:]
   end;
 JQ
 }

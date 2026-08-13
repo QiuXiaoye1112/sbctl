@@ -34,7 +34,9 @@ write_default_config
     {type:\"socks\",tag:\"in-test\",listen:\"127.0.0.1\",listen_port:18080,users:[]},
     {type:\"socks\",tag:\"plain-test\",listen:\"127.0.0.1\",listen_port:18081,users:[]},
     {type:\"socks\",tag:\"order-test\",listen:\"127.0.0.1\",listen_port:18082,users:[]},
-    {type:\"socks\",tag:\"preserve-test\",listen:\"127.0.0.1\",listen_port:18083,users:[]}
+    {type:\"socks\",tag:\"preserve-test\",listen:\"127.0.0.1\",listen_port:18083,users:[]},
+    {type:\"socks\",tag:\"tail-test\",listen:\"127.0.0.1\",listen_port:18084,users:[]},
+    {type:\"socks\",tag:\"tail-test-2\",listen:\"127.0.0.1\",listen_port:18085,users:[]}
   ] | .outbounds += [
     {type:\"socks\",tag:\"socks-A\",server:\"127.0.0.1\",server_port:1080,version:\"5\"},
     {type:\"socks\",tag:\"socks-B\",server:\"127.0.0.1\",server_port:1081,version:\"5\"}
@@ -94,6 +96,19 @@ jq -e '
   ([$rules[] | .domain_keyword==["order-custom-y"]] | index(true)) as $custom_y |
   ($exact < $custom_x and $custom_x < $specific and $specific < $broad and
     $broad < $custom_y and $custom_y < $default)
+' "$CONFIG_FILE" >/dev/null
+
+# A suffix appended after the only existing managed rule must not be dropped
+# when the calculated insertion index equals the current rule-list length.
+add_domain_rule tail-test exact tail.example.com socks-A
+add_domain_rule tail-test suffix example.com socks-B
+add_domain_rule tail-test-2 exact tail.example.com socks-A
+add_domain_rule tail-test-2 suffix example.com socks-B
+jq -e '
+  .route.rules |
+  any(.[]; .inbound==["tail-test"] and .domain==["tail.example.com"] and .outbound=="socks-A") and
+  any(.[]; .inbound==["tail-test"] and .domain_suffix==["example.com"] and .outbound=="socks-B") and
+  any(.[]; .inbound==["tail-test-2"] and .domain_suffix==["example.com"] and .outbound=="socks-B")
 ' "$CONFIG_FILE" >/dev/null
 
 add_domain_rule in-test suffix OPENAI.COM socks-A
