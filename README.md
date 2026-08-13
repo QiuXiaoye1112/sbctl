@@ -83,6 +83,9 @@ sbctl outbound list
 sbctl outbound add
 sbctl outbound assign TAG OUTBOUND
 sbctl outbound delete OUTBOUND
+sbctl outbound rule list [TAG]
+sbctl outbound rule add TAG suffix openai.com OUTBOUND
+sbctl outbound rule delete [TAG]
 
 sbctl client list TAG
 sbctl client add TAG
