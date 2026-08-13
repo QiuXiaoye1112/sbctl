@@ -30,14 +30,37 @@ source ./sbctl.sh
 trap - ERR
 write_default_config
   tmp=$(temp_file)
-jq ".inbounds += [
+  jq ".inbounds += [
     {type:\"socks\",tag:\"in-test\",listen:\"127.0.0.1\",listen_port:18080,users:[]},
-    {type:\"socks\",tag:\"plain-test\",listen:\"127.0.0.1\",listen_port:18081,users:[]}
+    {type:\"socks\",tag:\"plain-test\",listen:\"127.0.0.1\",listen_port:18081,users:[]},
+    {type:\"socks\",tag:\"order-test\",listen:\"127.0.0.1\",listen_port:18082,users:[]}
   ] | .outbounds += [
     {type:\"socks\",tag:\"socks-A\",server:\"127.0.0.1\",server_port:1080,version:\"5\"},
     {type:\"socks\",tag:\"socks-B\",server:\"127.0.0.1\",server_port:1081,version:\"5\"}
   ]" "$CONFIG_FILE" >"$tmp"
 mv "$tmp" "$CONFIG_FILE"
+
+tmp=$(temp_file)
+jq '.route.rules += [
+  {domain_keyword:["custom-first"],action:"route",outbound:"direct"},
+  {domain_keyword:["custom-second"],action:"route",outbound:"direct"}
+]' "$CONFIG_FILE" >"$tmp"
+mv "$tmp" "$CONFIG_FILE"
+
+add_domain_rule order-test suffix example.com socks-A
+add_domain_rule order-test exact example.com socks-B
+add_domain_rule order-test suffix api.example.com socks-A
+assign_outbound order-test socks-B
+jq -e '
+  .route.rules as $rules |
+  ([$rules[] | .inbound==["order-test"] and .domain==["example.com"]] | index(true)) as $exact |
+  ([$rules[] | .inbound==["order-test"] and .domain_suffix==["api.example.com"]] | index(true)) as $specific |
+  ([$rules[] | .inbound==["order-test"] and .domain_suffix==["example.com"]] | index(true)) as $broad |
+  ([$rules[] | .inbound==["order-test"] and .action=="route" and .outbound=="socks-B" and ((keys_unsorted|sort)==["action","inbound","outbound"])] | index(true)) as $default |
+  ([$rules[] | .domain_keyword==["custom-first"]] | index(true)) as $custom_first |
+  ([$rules[] | .domain_keyword==["custom-second"]] | index(true)) as $custom_second |
+  ($exact < $specific and $specific < $broad and $broad < $default and $custom_first < $custom_second)
+' "$CONFIG_FILE" >/dev/null
 
 add_domain_rule in-test suffix OPENAI.COM socks-A
   jq -e ".route.rules | any(.[]; .inbound==[\"in-test\"] and .domain_suffix==[\"openai.com\"] and .outbound==\"socks-A\")" "$CONFIG_FILE" >/dev/null
@@ -58,7 +81,7 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   jq -e '[.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["openai.com"])] | length == 1 and .[0].outbound == "socks-B"' "$CONFIG_FILE" >/dev/null
   jq -e '[.route.rules[] | select(.inbound==["in-test"] and .domain==["openai.com"])] | length == 1' "$CONFIG_FILE" >/dev/null
 
-  choose() { printf -v "$1" "%s" 1; }
+  choose() { printf -v "$1" "%s" 2; }
   delete_domain_rule in-test
   jq -e '.route.rules | all(.[]; .domain_suffix != ["openai.com"]) and any(.[]; .domain==["openai.com"])' "$CONFIG_FILE" >/dev/null
   delete_domain_rule in-test

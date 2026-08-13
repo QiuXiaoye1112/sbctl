@@ -2145,6 +2145,52 @@ def sbctl_canonical_default_rule:
 JQ
 }
 
+_sbctl_domain_rule_order_filter() {
+  cat <<'JQ'
+def sbctl_inbound_domain_rule($inbound):
+  sbctl_managed_domain_rule and .inbound==[$inbound];
+
+def sbctl_inbound_default_rule($inbound):
+  sbctl_canonical_default_rule and .inbound==[$inbound];
+
+def sbctl_ordered_inbound_domains($rules; $inbound):
+  [$rules | to_entries[] | select(.value | sbctl_inbound_domain_rule($inbound))]
+  | sort_by(
+      if (.value | has("domain")) then
+        [0, 0, 0, .key]
+      else
+        (.value.domain_suffix[0]) as $domain |
+        [1, (0 - ($domain | split(".") | length)), (0 - ($domain | length)), .key]
+      end
+    )
+  | map(.value);
+
+def sbctl_reorder_inbound_domains($rules; $inbound):
+  ([$rules | to_entries[] |
+    select(.value | sbctl_inbound_default_rule($inbound)) | .key][0] // null) as $default_index |
+  ([$rules | to_entries[] |
+    select(.value | sbctl_inbound_domain_rule($inbound)) | .key][0] // null) as $domain_index |
+  ($rules | sbctl_ordered_inbound_domains($rules; $inbound)) as $domains |
+  if ($domains | length) == 0 then $rules
+  elif $default_index != null then
+    [range(0; ($rules | length)) as $i |
+      if $i == $default_index then
+        $domains[], $rules[$i]
+      elif ($rules[$i] | sbctl_inbound_domain_rule($inbound)) then empty
+      else $rules[$i]
+      end]
+  elif $domain_index != null then
+    [range(0; ($rules | length)) as $i |
+      if $i == $domain_index then
+        $domains[]
+      elif ($rules[$i] | sbctl_inbound_domain_rule($inbound)) then empty
+      else $rules[$i]
+      end]
+  else $rules
+  end;
+JQ
+}
+
 _outbound_display_name() {
   local tag=$1 ip
   [[ $tag == direct ]] && { printf 'direct'; return; }
@@ -2332,13 +2378,16 @@ assign_outbound() {
   [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
 
   tmp=$(temp_file)
-  jq --arg inbound "$inbound" --arg outbound "$outbound" '
+  jq --arg inbound "$inbound" --arg outbound "$outbound" "$(_sbctl_managed_domain_rule_filter)
+    $(_sbctl_canonical_default_rule_filter)
+    $(_sbctl_domain_rule_order_filter)
     .route = (.route // {}) |
     .route.rules = ((.route.rules // []) | map(
-      select(.action!="route" or (.inbound // [])!=[$inbound] or
-        ((keys_unsorted | sort) != (["action","inbound","outbound"] | sort))))) |
-    if $outbound=="direct" then .
-    else .route.rules += [{inbound:[$inbound],action:"route",outbound:$outbound}] end' \
+      select(.action!=\"route\" or (.inbound // [])!=[\$inbound] or
+        ((keys_unsorted | sort) != ([\"action\",\"inbound\",\"outbound\"] | sort))))) |
+    if \$outbound==\"direct\" then .
+    else .route.rules += [{inbound:[\$inbound],action:\"route\",outbound:\$outbound}] end |
+    .route.rules = sbctl_reorder_inbound_domains(.route.rules; \$inbound)" \
     "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then info "入站 ${inbound} 已设置为出站 ${outbound}。"; fi
   rm -f "$tmp"
@@ -2379,6 +2428,7 @@ add_domain_rule() {
   jq --arg inbound "$inbound" --arg match "$match" --arg domain "$domain" --arg outbound "$outbound" \
     --argjson new_rule "$new_rule" "$(_sbctl_managed_domain_rule_filter)
     $(_sbctl_canonical_default_rule_filter)
+    $(_sbctl_domain_rule_order_filter)
     def sbctl_current_domain_rule:
       sbctl_managed_domain_rule and .inbound==[\$inbound];
     def sbctl_current_default_rule:
@@ -2411,7 +2461,8 @@ add_domain_rule() {
         elif (\$rules[\$i] | sbctl_current_domain_rule) then empty
         else \$rules[\$i]
         end]
-    end" "$CONFIG_FILE" >"$tmp"
+    end |
+    .route.rules = sbctl_reorder_inbound_domains(.route.rules; \$inbound)" "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then info "已添加/更新域名规则：${inbound} ${match} ${domain} -> ${outbound}。"; fi
   rm -f "$tmp"
 }
