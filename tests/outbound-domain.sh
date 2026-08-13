@@ -33,7 +33,8 @@ write_default_config
   jq ".inbounds += [
     {type:\"socks\",tag:\"in-test\",listen:\"127.0.0.1\",listen_port:18080,users:[]},
     {type:\"socks\",tag:\"plain-test\",listen:\"127.0.0.1\",listen_port:18081,users:[]},
-    {type:\"socks\",tag:\"order-test\",listen:\"127.0.0.1\",listen_port:18082,users:[]}
+    {type:\"socks\",tag:\"order-test\",listen:\"127.0.0.1\",listen_port:18082,users:[]},
+    {type:\"socks\",tag:\"preserve-test\",listen:\"127.0.0.1\",listen_port:18083,users:[]}
   ] | .outbounds += [
     {type:\"socks\",tag:\"socks-A\",server:\"127.0.0.1\",server_port:1080,version:\"5\"},
     {type:\"socks\",tag:\"socks-B\",server:\"127.0.0.1\",server_port:1081,version:\"5\"}
@@ -42,10 +43,42 @@ mv "$tmp" "$CONFIG_FILE"
 
 tmp=$(temp_file)
 jq '.route.rules += [
-  {domain_keyword:["custom-first"],action:"route",outbound:"direct"},
-  {domain_keyword:["custom-second"],action:"route",outbound:"direct"}
+  {inbound:["order-test"],domain:["example.com"],action:"route",outbound:"socks-A"},
+  {domain_keyword:["order-custom-x"],action:"route",outbound:"direct"},
+  {inbound:["order-test"],domain_suffix:["example.com"],action:"route",outbound:"socks-A"},
+  {domain_keyword:["order-custom-y"],action:"route",outbound:"direct"},
+  {inbound:["order-test"],action:"route",outbound:"socks-A"}
 ]' "$CONFIG_FILE" >"$tmp"
 mv "$tmp" "$CONFIG_FILE"
+
+tmp=$(temp_file)
+jq '.route.rules += [
+  {inbound:["preserve-test"],domain:["a.example.com"],action:"route",outbound:"socks-A"},
+  {inbound:["preserve-test"],domain:["a.example.com"],action:"route",outbound:"socks-A"},
+  {domain_keyword:["preserve-custom-x"],action:"route",outbound:"direct"},
+  {inbound:["preserve-test"],domain_suffix:["example.com"],action:"route",outbound:"socks-A"},
+  {domain_keyword:["preserve-custom-y"],action:"route",outbound:"direct"},
+  {inbound:["preserve-test"],action:"route",outbound:"socks-A"}
+]' "$CONFIG_FILE" >"$tmp"
+mv "$tmp" "$CONFIG_FILE"
+
+add_domain_rule preserve-test exact a.example.com socks-B
+add_domain_rule preserve-test suffix example.com socks-B
+assign_outbound preserve-test socks-B
+jq -e '
+  .route.rules as $rules |
+  [$rules[] |
+    if .inbound==["preserve-test"] and .domain==["a.example.com"] then "A"
+    elif .domain_keyword==["preserve-custom-x"] then "X"
+    elif .inbound==["preserve-test"] and .domain_suffix==["example.com"] then "B"
+    elif .domain_keyword==["preserve-custom-y"] then "Y"
+    elif .inbound==["preserve-test"] and .action=="route" and .outbound=="socks-B" and
+      ((keys_unsorted|sort)==["action","inbound","outbound"]) then "D"
+    else empty
+    end] == ["A","X","B","Y","D"] and
+  ([$rules[] | select(.inbound==["preserve-test"] and .domain==["a.example.com"])] | length == 1) and
+  ([$rules[] | select(.inbound==["preserve-test"] and .domain_suffix==["example.com"])] | length == 1)
+' "$CONFIG_FILE" >/dev/null
 
 add_domain_rule order-test suffix example.com socks-A
 add_domain_rule order-test exact example.com socks-B
@@ -57,9 +90,10 @@ jq -e '
   ([$rules[] | .inbound==["order-test"] and .domain_suffix==["api.example.com"]] | index(true)) as $specific |
   ([$rules[] | .inbound==["order-test"] and .domain_suffix==["example.com"]] | index(true)) as $broad |
   ([$rules[] | .inbound==["order-test"] and .action=="route" and .outbound=="socks-B" and ((keys_unsorted|sort)==["action","inbound","outbound"])] | index(true)) as $default |
-  ([$rules[] | .domain_keyword==["custom-first"]] | index(true)) as $custom_first |
-  ([$rules[] | .domain_keyword==["custom-second"]] | index(true)) as $custom_second |
-  ($exact < $specific and $specific < $broad and $broad < $default and $custom_first < $custom_second)
+  ([$rules[] | .domain_keyword==["order-custom-x"]] | index(true)) as $custom_x |
+  ([$rules[] | .domain_keyword==["order-custom-y"]] | index(true)) as $custom_y |
+  ($exact < $custom_x and $custom_x < $specific and $specific < $broad and
+    $broad < $custom_y and $custom_y < $default)
 ' "$CONFIG_FILE" >/dev/null
 
 add_domain_rule in-test suffix OPENAI.COM socks-A
