@@ -113,6 +113,25 @@ client_menu() {
   done
 }
 
+domain_rule_menu() {
+  ensure_config  # once at entry
+  local choice
+  while true; do
+    clear_screen
+    heading "域名分流"
+    list_domain_rules
+    printf '\n1) 查看规则\n2) 添加规则\n3) 删除规则\n0) 返回\n'
+    read -r -p "请选择: " choice || { echo; return; }
+    case $choice in
+      1) run_menu_action list_domain_rules; pause;;
+      2) run_menu_action add_domain_rule; pause;;
+      3) run_menu_action delete_domain_rule; pause;;
+      0) return;;
+      *) warn "无效选项。"; pause;;
+    esac
+  done
+}
+
 outbound_menu() {
   ensure_config  # once at entry
   local choice
@@ -120,12 +139,13 @@ outbound_menu() {
     clear_screen
     heading "出站管理"
     list_outbound_overview
-    printf '\n1) 选择入站设置出站\n2) 添加 SOCKS5/HTTP 出站\n3) 删除出站\n0) 返回\n'
+    printf '\n1) 设置入站默认出站\n2) 域名分流\n3) 添加 SOCKS5/HTTP 出站\n4) 删除出站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action assign_outbound; pause;;
-      2) run_menu_action add_outbound; pause;;
-      3) run_menu_action delete_outbound; pause;;
+      2) domain_rule_menu;;
+      3) run_menu_action add_outbound; pause;;
+      4) run_menu_action delete_outbound; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac
@@ -267,6 +287,9 @@ sbctl - sing-box Linux 管理器
   sbctl outbound add
   sbctl outbound assign [入站] [出站标签|direct]
   sbctl outbound delete [出站标签]
+  sbctl outbound rule list [入站]
+  sbctl outbound rule add [入站] [suffix|exact] [域名] [出站]
+  sbctl outbound rule delete [入站]
 
   sbctl client list [标签]
   sbctl client add [标签]
@@ -338,6 +361,14 @@ dispatch() {
         add) add_outbound;;
         assign|set) assign_outbound "${2-}" "${3-}";;
         delete|remove) delete_outbound "${2-}";;
+        rule)
+          case ${2:-list} in
+            list) list_domain_rules "${3-}";;
+            add) add_domain_rule "${3-}" "${4-}" "${5-}" "${6-}";;
+            delete|remove) delete_domain_rule "${3-}";;
+            *) die "未知 outbound rule 子命令：${2}";;
+          esac
+          ;;
         *) die "未知 outbound 子命令：${1}";;
       esac
       ;;

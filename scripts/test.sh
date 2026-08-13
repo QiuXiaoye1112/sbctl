@@ -14,6 +14,8 @@ bash tests/unit/share.sh
 bash tests/unit/inbound-modify.sh
 bash tests/unit/clients.sh
 bash tests/integration/state-transaction.sh
+bash tests/outbound.sh
+bash tests/outbound-domain.sh
 bash tests/coexistence.sh
 bash tests/smoke/cli.sh
 bash tests/smoke/installer.sh
