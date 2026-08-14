@@ -242,7 +242,7 @@ print_table_cell() {
   local value=$1 target_width=$2 cell_width=0 padding
   display_width cell_width "$value"
   padding=$((target_width-cell_width))
-  ((padding > 0)) || padding=1
+  ((padding > 0)) || padding=0
   printf '%s%*s' "$value" "$padding" ''
 }
 

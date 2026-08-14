@@ -257,18 +257,18 @@ list_domain_rules() {
   heading "域名分流规则"
   [[ -n $row ]] || { info "还没有域名分流规则。"; return 0; }
   print_table_cell "序号" 6; printf '| '
-  print_table_cell_clipped "入站" 14; printf '| '
+  print_table_cell_clipped "入站" 12; printf '| '
   print_table_cell "匹配" 6; printf '| '
-  print_table_cell_clipped "域名" 18; printf '| 出站\n'
+  print_table_cell_clipped "域名" 16; printf '| 出站\n'
   while IFS=$'\t' read -r inbound match domain outbound; do
     [[ -n $inbound ]] || continue
     ((number+=1))
     display=$(_outbound_display_name "$outbound")
     [[ $match == suffix ]] && match="子域名" || match="精确"
     print_table_cell "$number" 6; printf '| '
-    print_table_cell_clipped "$inbound" 14; printf '| '
+    print_table_cell_clipped "$inbound" 12; printf '| '
     print_table_cell "$match" 6; printf '| '
-    print_table_cell_clipped "$domain" 18; printf '| %s\n' "$display"
+    print_table_cell_clipped "$domain" 16; printf '| %s\n' "$display"
   done <<<"$row"
 }
 

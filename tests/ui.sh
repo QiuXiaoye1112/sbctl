@@ -28,6 +28,9 @@ display_width width "vless-test"
 out=$(print_table_cell "标签" 8)
 [[ $out == "标签    " ]]
 
+out=$(print_table_cell "子域名" 6)
+[[ $out == "子域名" ]]
+
 out=$(print_table_cell_clipped "abcdefghijkl" 8)
 [[ $out == "abcd... " ]]
 
