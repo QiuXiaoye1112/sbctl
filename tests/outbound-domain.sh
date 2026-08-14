@@ -139,6 +139,22 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   add_domain_rule in-test exact api.test.com direct
   jq -e '.route.rules | any(.[]; .inbound==["in-test"] and .domain==["api.test.com"] and .outbound=="direct")' "$CONFIG_FILE" >/dev/null
 
+  add_domain_rule in-test suffix "batch-one.test, BATCH-TWO.TEST ,batch-three.test" socks-A
+  jq -e '
+    [.route.rules[] | select(.inbound==["in-test"] and
+      (.domain_suffix[0] | IN("batch-one.test", "batch-two.test", "batch-three.test")))] |
+    map(.domain_suffix[0]) | sort == ["batch-one.test", "batch-three.test", "batch-two.test"]
+  ' "$CONFIG_FILE" >/dev/null
+
+  add_domain_rule in-test suffix batch-one.test,batch-four.test socks-B
+  jq -e '
+    [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-one.test"])] |
+    length == 1 and .[0].outbound == "socks-B"
+  ' "$CONFIG_FILE" >/dev/null
+  jq -e '
+    [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-four.test"])] | length == 1 and .[0].outbound == "socks-B"
+  ' "$CONFIG_FILE" >/dev/null
+
   local_tag=$(_ensure_local_outbound 2001:db8::1234)
   add_domain_rule in-test suffix ipv6.test.com "$local_tag"
   jq -e --arg tag "$local_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet6_bind_address=="2001:db8::1234" and .domain_resolver=={"server":"sbctl-local-dns","strategy":"ipv6_only"})' "$CONFIG_FILE" >/dev/null

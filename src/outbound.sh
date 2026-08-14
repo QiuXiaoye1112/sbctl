@@ -223,6 +223,24 @@ _normalize_domain_input() {
   printf -v "$__var" '%s' "$candidate"
 }
 
+_normalize_domain_list() {
+  local raw=$1 item normalized
+  local -a items=()
+  [[ $raw != ,* && $raw != *, && $raw != *,,* ]] || {
+    warn "域名列表中不能有空项，请使用英文逗号分隔域名。"
+    return 1
+  }
+  IFS=',' read -r -a items <<<"$raw"
+  ((${#items[@]})) || { warn "至少请输入一个域名。"; return 1; }
+  for item in "${items[@]}"; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [[ -n $item ]] || { warn "域名列表中不能有空项，请使用英文逗号分隔域名。"; return 1; }
+    _normalize_domain_input normalized "$item" || return 1
+    printf '%s\n' "$normalized"
+  done
+}
+
 # Pure display — only sbctl's strict canonical domain rules are shown.
 list_domain_rules() {
   ensure_dependencies outbound-rule-list; ensure_config
@@ -406,7 +424,8 @@ assign_outbound() {
 
 add_domain_rule() {
   ensure_dependencies outbound-rule-add; require_supported_core; ensure_config
-  local inbound=${1-} match=${2-} domain=${3-} outbound=${4-} choice tmp new_rule normalized_domain
+  local inbound=${1-} match=${2-} domain=${3-} outbound=${4-} choice tmp
+  local normalized_domains normalized_domains_json domain_summary domain_count
   local interactive=0
   [[ -n $inbound || -n $match || -n $domain || -n $outbound ]] && interactive=1
   if ((interactive)); then
@@ -417,51 +436,61 @@ add_domain_rule() {
       suffix|exact) ;;
       *) die "匹配方式只能是 suffix 或 exact。";;
     esac
-    _normalize_domain_input normalized_domain "$domain" || die "域名格式无效。"
-    domain=$normalized_domain
     [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
   else
     select_inbound inbound || return 0
     choose choice "匹配方式" "域名及所有子域名" "仅精确域名" || return 0
     [[ $choice == 1 ]] && match=suffix || match=exact
     while true; do
-      prompt_value domain "域名" || return 0
-      if _normalize_domain_input normalized_domain "$domain"; then domain=$normalized_domain; break; fi
+      prompt_value domain "域名（多个用英文逗号分隔）" || return 0
+      if normalized_domains=$(_normalize_domain_list "$domain"); then break; fi
     done
     select_outbound outbound 1 || return 0
   fi
 
-  new_rule=$(jq -n --arg inbound "$inbound" --arg match "$match" --arg domain "$domain" --arg outbound "$outbound" '
-    {inbound:[$inbound]} +
-    (if $match=="suffix" then {domain_suffix:[$domain]} else {domain:[$domain]} end) +
-    {action:"route",outbound:$outbound}')
+  if ((interactive)); then
+    normalized_domains=$(_normalize_domain_list "$domain") || die "域名列表无效。"
+  fi
+  normalized_domains_json=$(printf '%s\n' "$normalized_domains" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  domain_summary=${normalized_domains//$'\n'/,}
+  domain_count=$(jq -r 'length' <<<"$normalized_domains_json")
   tmp=$(temp_file)
-  jq --arg inbound "$inbound" --arg match "$match" --arg domain "$domain" --arg outbound "$outbound" \
-    --argjson new_rule "$new_rule" "$(_sbctl_managed_domain_rule_filter)
+  jq --arg inbound "$inbound" --arg match "$match" --arg outbound "$outbound" \
+    --argjson domains "$normalized_domains_json" "$(_sbctl_managed_domain_rule_filter)
     $(_sbctl_canonical_default_rule_filter)
     $(_sbctl_domain_rule_insert_filter)
-    def sbctl_current_domain_rule:
-      sbctl_managed_domain_rule and .inbound==[\$inbound];
-    def sbctl_target_domain_rule:
-      sbctl_current_domain_rule and
+    def sbctl_target_domain_rule(\$domain):
+      sbctl_managed_domain_rule and .inbound==[\$inbound] and
       ((if \$match==\"suffix\" then .domain_suffix else .domain end)==[\$domain]);
+    def sbctl_upsert_domain_rule(\$rules; \$domain):
+      (reduce \$rules[] as \$rule
+        ({items:[],replaced:false};
+         if (\$rule | sbctl_target_domain_rule(\$domain)) then
+           if .replaced then .
+           else .items += [\$rule | .outbound=\$outbound] | .replaced=true
+           end
+         else .items += [\$rule]
+         end)) as \$updated |
+      if \$updated.replaced then
+        \$updated.items
+      else
+        (\$rules | sbctl_domain_insert_index(\$rules; \$inbound; \$match; \$domain)) as \$index |
+        sbctl_insert_rule(\$rules; \$index;
+          ({inbound:[\$inbound]} +
+           (if \$match==\"suffix\" then {domain_suffix:[\$domain]} else {domain:[\$domain]} end) +
+           {action:\"route\",outbound:\$outbound}))
+      end;
     .route=(.route // {}) |
     (.route.rules // []) as \$rules |
-    (reduce \$rules[] as \$rule
-      ({items:[],replaced:false};
-       if (\$rule | sbctl_target_domain_rule) then
-         if .replaced then .
-         else .items += [\$rule | .outbound=\$outbound] | .replaced=true
-         end
-       else .items += [\$rule]
-       end)) as \$updated |
-    if \$updated.replaced then
-      .route.rules=\$updated.items
+    .route.rules=(reduce \$domains[] as \$domain (\$rules; sbctl_upsert_domain_rule(.; \$domain)))" \
+    "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then
+    if ((domain_count == 1)); then
+      info "已添加/更新域名规则：${inbound} ${match} ${domain_summary} -> ${outbound}。"
     else
-      (\$rules | sbctl_domain_insert_index(\$rules; \$inbound; \$match; \$domain)) as \$index |
-      .route.rules=sbctl_insert_rule(\$rules; \$index; \$new_rule)
-    end" "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "已添加/更新域名规则：${inbound} ${match} ${domain} -> ${outbound}。"; fi
+      info "已批量添加/更新 ${domain_count} 条域名规则：${inbound} ${match} ${domain_summary} -> ${outbound}。"
+    fi
+  fi
   rm -f "$tmp"
 }
 
