@@ -224,10 +224,16 @@ timestamp() { date '+%Y%m%d-%H%M%S'; }
 # ---- terminal table helpers ----
 display_width() {
   local __var=$1 value=$2 char code computed_width=0 i
+  local LC_ALL=C
   for ((i=0; i<${#value}; i++)); do
     char=${value:i:1}
     printf -v code '%d' "'$char"
-    if ((code < 0 || code > 127)); then ((computed_width+=2)); else ((computed_width+=1)); fi
+    ((code < 0)) && ((code+=256))
+    if ((code < 128)); then
+      ((computed_width+=1))
+    elif (( (code & 0xC0) != 0x80 )); then
+      ((computed_width+=2))
+    fi
   done
   printf -v "$__var" '%s' "$computed_width"
 }
