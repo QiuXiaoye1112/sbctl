@@ -141,11 +141,21 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
 
   local_tag=$(_ensure_local_outbound 2001:db8::1234)
   add_domain_rule in-test suffix ipv6.test.com "$local_tag"
-  jq -e --arg tag "$local_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet6_bind_address=="2001:db8::1234")' "$CONFIG_FILE" >/dev/null
+  jq -e --arg tag "$local_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet6_bind_address=="2001:db8::1234" and .domain_resolver=={"server":"sbctl-local-dns","strategy":"ipv6_only"})' "$CONFIG_FILE" >/dev/null
+  jq -e '.dns.servers | any(.[]; .tag=="sbctl-local-dns" and .type=="local")' "$CONFIG_FILE" >/dev/null
   jq -e --arg tag "$local_tag" '.route.rules | any(.[]; .domain_suffix==["ipv6.test.com"] and .outbound==$tag)' "$CONFIG_FILE" >/dev/null
   listing=$(list_domain_rules in-test)
   grep -Fq 'ipv6.test.com' <<<"$listing"
   grep -Fq '2001:db8::1234' <<<"$listing"
+
+  local_v4_tag=$(_ensure_local_outbound 192.0.2.123)
+  jq -e --arg tag "$local_v4_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet4_bind_address=="192.0.2.123" and .domain_resolver=={"server":"sbctl-local-dns","strategy":"ipv4_only"})' "$CONFIG_FILE" >/dev/null
+
+  tmp=$(temp_file)
+  jq --arg tag "$local_tag" '(.outbounds[] | select(.tag==$tag)).domain_resolver = null' "$CONFIG_FILE" >"$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  [[ $(_ensure_local_outbound 2001:db8::1234) == "$local_tag" ]]
+  jq -e --arg tag "$local_tag" '.outbounds | any(.[]; .tag==$tag and .domain_resolver=={"server":"sbctl-local-dns","strategy":"ipv6_only"})' "$CONFIG_FILE" >/dev/null
 
   add_domain_rule in-test suffix managed-delete.test socks-A
   confirm() { return 0; }
