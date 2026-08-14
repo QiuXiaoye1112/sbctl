@@ -244,30 +244,36 @@ _normalize_domain_list() {
 # Pure display — only sbctl's strict canonical domain rules are shown.
 list_domain_rules() {
   ensure_dependencies outbound-rule-list; ensure_config
-  local inbound=${1-} row number=0 match domain outbound display
+  local inbound=${1-} row group_inbound="" number=0 match domain outbound display
   [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
   row=$(jq -r --arg inbound "$inbound" "$(_sbctl_managed_domain_rule_filter)
-    [.route.rules[]? |
+    ([.route.rules[]? |
       select(sbctl_managed_domain_rule) |
-      select(\$inbound==\"\" or .inbound==[\$inbound]) |
       .inbound[0] as \$rule_inbound |
       (if has(\"domain_suffix\") then \"suffix\" else \"exact\" end) as \$match |
       (if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end) as \$domain |
-      [\$rule_inbound,\$match,\$domain,.outbound] | @tsv] | .[]" "$CONFIG_FILE")
+      [\$rule_inbound,\$match,\$domain,.outbound]] ) as \$rows |
+    [.inbounds[].tag] as \$inbound_order |
+    \$inbound_order[] as \$group |
+    select(\$inbound==\"\" or \$group==\$inbound) |
+    (\$rows[] | select(.[0]==\$group)) | @tsv" "$CONFIG_FILE")
   heading "域名分流规则"
   [[ -n $row ]] || { info "还没有域名分流规则。"; return 0; }
-  print_table_cell "序号" 6; printf '| '
-  print_table_cell_clipped "入站" 12; printf '| '
-  print_table_cell "匹配" 6; printf '| '
-  print_table_cell_clipped "域名" 16; printf '| 出站\n'
   while IFS=$'\t' read -r inbound match domain outbound; do
     [[ -n $inbound ]] || continue
+    if [[ $inbound != "$group_inbound" ]]; then
+      group_inbound=$inbound
+      number=0
+      printf '\n入站：%s\n' "$group_inbound"
+      print_table_cell "序号" 6; printf '| '
+      print_table_cell "匹配" 7; printf '| '
+      print_table_cell_clipped "域名" 16; printf '| 出站\n'
+    fi
     ((number+=1))
     display=$(_outbound_display_name "$outbound")
     [[ $match == suffix ]] && match="子域名" || match="精确"
     print_table_cell "$number" 6; printf '| '
-    print_table_cell_clipped "$inbound" 12; printf '| '
-    print_table_cell "$match" 6; printf '| '
+    print_table_cell "$match" 7; printf '| '
     print_table_cell_clipped "$domain" 16; printf '| %s\n' "$display"
   done <<<"$row"
 }
@@ -452,6 +458,23 @@ add_domain_rule() {
     normalized_domains=$(_normalize_domain_list "$domain") || die "域名列表无效。"
   fi
   normalized_domains_json=$(printf '%s\n' "$normalized_domains" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  if ! jq -e 'length == (unique | length)' <<<"$normalized_domains_json" >/dev/null; then
+    warn "域名列表中不能重复添加同一个域名。"
+    return 0
+  fi
+  local existing_domains
+  existing_domains=$(jq -r --arg inbound "$inbound" --arg match "$match" --argjson domains "$normalized_domains_json" "$(_sbctl_managed_domain_rule_filter)
+    def sbctl_rule_domain(\$rule):
+      (\$rule | if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end);
+    [.route.rules[]? |
+      select(sbctl_managed_domain_rule and .inbound==[\$inbound]) |
+      (.) as \$rule |
+      select(any(\$domains[]; . == sbctl_rule_domain(\$rule))) |
+      sbctl_rule_domain(\$rule)] | unique | join(\",\")" "$CONFIG_FILE")
+  if [[ -n $existing_domains ]]; then
+    warn "已有此域名规则：${inbound} ${match} ${existing_domains}！"
+    return 0
+  fi
   domain_summary=${normalized_domains//$'\n'/,}
   domain_count=$(jq -r 'length' <<<"$normalized_domains_json")
   tmp=$(temp_file)
@@ -459,36 +482,21 @@ add_domain_rule() {
     --argjson domains "$normalized_domains_json" "$(_sbctl_managed_domain_rule_filter)
     $(_sbctl_canonical_default_rule_filter)
     $(_sbctl_domain_rule_insert_filter)
-    def sbctl_target_domain_rule(\$domain):
-      sbctl_managed_domain_rule and .inbound==[\$inbound] and
-      ((if \$match==\"suffix\" then .domain_suffix else .domain end)==[\$domain]);
-    def sbctl_upsert_domain_rule(\$rules; \$domain):
-      (reduce \$rules[] as \$rule
-        ({items:[],replaced:false};
-         if (\$rule | sbctl_target_domain_rule(\$domain)) then
-           if .replaced then .
-           else .items += [\$rule | .outbound=\$outbound] | .replaced=true
-           end
-         else .items += [\$rule]
-         end)) as \$updated |
-      if \$updated.replaced then
-        \$updated.items
-      else
-        (\$rules | sbctl_domain_insert_index(\$rules; \$inbound; \$match; \$domain)) as \$index |
-        sbctl_insert_rule(\$rules; \$index;
-          ({inbound:[\$inbound]} +
-           (if \$match==\"suffix\" then {domain_suffix:[\$domain]} else {domain:[\$domain]} end) +
-           {action:\"route\",outbound:\$outbound}))
-      end;
+    def sbctl_insert_domain_rule(\$rules; \$domain):
+      (\$rules | sbctl_domain_insert_index(\$rules; \$inbound; \$match; \$domain)) as \$index |
+      sbctl_insert_rule(\$rules; \$index;
+        ({inbound:[\$inbound]} +
+         (if \$match==\"suffix\" then {domain_suffix:[\$domain]} else {domain:[\$domain]} end) +
+         {action:\"route\",outbound:\$outbound}));
     .route=(.route // {}) |
     (.route.rules // []) as \$rules |
-    .route.rules=(reduce \$domains[] as \$domain (\$rules; sbctl_upsert_domain_rule(.; \$domain)))" \
+    .route.rules=(reduce \$domains[] as \$domain (\$rules; sbctl_insert_domain_rule(.; \$domain)))" \
     "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then
     if ((domain_count == 1)); then
-      info "已添加/更新域名规则：${inbound} ${match} ${domain_summary} -> ${outbound}。"
+      info "已添加域名规则：${inbound} ${match} ${domain_summary} -> ${outbound}。"
     else
-      info "已批量添加/更新 ${domain_count} 条域名规则：${inbound} ${match} ${domain_summary} -> ${outbound}。"
+      info "已批量添加 ${domain_count} 条域名规则：${inbound} ${match} ${domain_summary} -> ${outbound}。"
     fi
   fi
   rm -f "$tmp"
@@ -496,43 +504,106 @@ add_domain_rule() {
 
 delete_domain_rule() {
   ensure_dependencies outbound-rule-delete; require_supported_core; ensure_config
-  local inbound=${1-} row choice selected_inbound selected_match selected_domain selected_outbound tmp
-  local -a rule_inbounds=() rule_matches=() rule_domains=() rule_outbounds=() labels=()
+  local inbound=${1-} row choice selected_inbound tmp selection token idx
+  local inbound_row inbound_tag inbound_count
+  local -a inbound_tags=() inbound_labels=()
+  local -a rule_matches=() rule_domains=() rule_outbounds=() requested=()
   [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
-  row=$(jq -r --arg inbound "$inbound" "$(_sbctl_managed_domain_rule_filter)
+
+  if [[ -z $inbound ]]; then
+    inbound_row=$(jq -r "$(_sbctl_managed_domain_rule_filter)
+      ([.route.rules[]? | select(sbctl_managed_domain_rule)] ) as \$managed |
+      [.inbounds[].tag] as \$inbound_order |
+      \$inbound_order[] as \$tag |
+      [\$managed[] | select(.inbound==[\$tag])] | length as \$count |
+      select(\$count > 0) | [\$tag, \$count] | @tsv" "$CONFIG_FILE")
+    while IFS=$'\t' read -r inbound_tag inbound_count; do
+      [[ -n $inbound_tag ]] || continue
+      inbound_tags+=("$inbound_tag")
+      inbound_labels+=("${inbound_tag}（${inbound_count} 条）")
+    done <<<"$inbound_row"
+    ((${#inbound_tags[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
+    if ((${#inbound_tags[@]} == 1)); then
+      selected_inbound=${inbound_tags[0]}
+    else
+      choose choice "选择入站" "${inbound_labels[@]}" || return 0
+      selected_inbound=${inbound_tags[$((choice-1))]}
+    fi
+  else
+    selected_inbound=$inbound
+  fi
+
+  row=$(jq -r --arg inbound "$selected_inbound" "$(_sbctl_managed_domain_rule_filter)
     [.route.rules[]? |
       select(sbctl_managed_domain_rule) |
-      select(\$inbound==\"\" or .inbound==[\$inbound]) |
-      .inbound[0] as \$rule_inbound |
+      select(.inbound==[\$inbound]) |
       (if has(\"domain_suffix\") then \"suffix\" else \"exact\" end) as \$match |
       (if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end) as \$domain |
-      [\$rule_inbound,\$match,\$domain,.outbound] | @tsv] | .[]" "$CONFIG_FILE")
+      [\$match,\$domain,.outbound] | @tsv] | .[]" "$CONFIG_FILE")
   [[ -n $row ]] || { warn "没有可删除的域名分流规则。"; return 0; }
-  while IFS=$'\t' read -r selected_inbound selected_match selected_domain selected_outbound; do
-    [[ -n $selected_inbound ]] || continue
-    rule_inbounds+=("$selected_inbound")
+  while IFS=$'\t' read -r selected_match selected_domain selected_outbound; do
+    [[ -n $selected_domain ]] || continue
     rule_matches+=("$selected_match")
     rule_domains+=("$selected_domain")
     rule_outbounds+=("$selected_outbound")
-    labels+=("${selected_inbound} · ${selected_match} · ${selected_domain} → $(_outbound_display_name "$selected_outbound")")
   done <<<"$row"
-  ((${#rule_inbounds[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
-  if ((${#rule_inbounds[@]} == 1)); then
-    choice=1
-  else
-    choose choice "选择要删除的域名规则" "${labels[@]}" || return 0
-  fi
-  selected_inbound=${rule_inbounds[$((choice-1))]}
-  selected_match=${rule_matches[$((choice-1))]}
-  selected_domain=${rule_domains[$((choice-1))]}
+  ((${#rule_domains[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
+
+  printf '\n入站：%s\n\n' "$selected_inbound"
+  for ((idx=0; idx<${#rule_domains[@]}; idx++)); do
+    printf '%d) %s\n' "$((idx+1))" "${rule_domains[$idx]}"
+  done
+  while true; do
+    read -r -p '请选择要删除的规则（支持 1,3,2）: ' selection || return 0
+    selection=$(printf '%s' "$selection" | tr -d '[:space:]')
+    requested=()
+    IFS=',' read -r -a tokens <<<"$selection"
+    local valid=1
+    for token in "${tokens[@]}"; do
+      if [[ ! $token =~ ^[0-9]+$ ]] || ((10#$token < 1 || 10#$token > ${#rule_domains[@]})); then
+        valid=0
+        break
+      fi
+      idx=$((10#$token))
+      if ((${#requested[@]})); then
+        for choice in "${requested[@]}"; do
+          if ((choice == idx)); then
+            valid=0
+            break 2
+          fi
+        done
+      fi
+      requested+=("$idx")
+    done
+    ((valid)) && ((${#requested[@]})) && break
+    warn "请输入有效且不重复的序号，例如 1,3,2。"
+  done
+
+  printf '\n将删除：\n'
+  local selected_json='[]' match_label display
+  for choice in "${requested[@]}"; do
+    idx=$((choice-1))
+    [[ ${rule_matches[$idx]} == suffix ]] && match_label=子域名 || match_label=精确
+    display=$(_outbound_display_name "${rule_outbounds[$idx]}")
+    printf -- '- %s（%s → %s）\n' "${rule_domains[$idx]}" "$match_label" "$display"
+    selected_json=$(jq -c --arg match "${rule_matches[$idx]}" --arg domain "${rule_domains[$idx]}" \
+      '. + [{match:$match,domain:$domain}]' <<<"$selected_json")
+  done
+  confirm "确认删除这些规则？" N || return 0
+
   tmp=$(temp_file)
-  jq --arg inbound "$selected_inbound" --arg match "$selected_match" --arg domain "$selected_domain" "$(_sbctl_managed_domain_rule_filter)
+  jq --arg inbound "$selected_inbound" --argjson selected "$selected_json" "$(_sbctl_managed_domain_rule_filter)
+    def sbctl_selected_domain_rule(\$rule; \$selected):
+      any(\$selected[]; . as \$target |
+        (\$rule | if \$target.match==\"suffix\" then .domain_suffix else .domain end)==[\$target.domain]);
     .route=(.route // {}) |
     .route.rules=[(.route.rules // [])[]? |
-      select((sbctl_managed_domain_rule and .inbound==[\$inbound] and
-        ((if \$match==\"suffix\" then .domain_suffix else .domain end)==[\$domain])) | not)]" \
+      (.) as \$rule |
+      select((\$rule | sbctl_managed_domain_rule) and
+        \$rule.inbound==[\$inbound] and
+        sbctl_selected_domain_rule(\$rule; \$selected) | not)]" \
     "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "已删除域名规则：${selected_inbound} ${selected_match} ${selected_domain}。"; fi
+  if apply_candidate "$tmp"; then info "已删除 ${#requested[@]} 条域名规则（入站：${selected_inbound}）。"; fi
   rm -f "$tmp"
 }
 
