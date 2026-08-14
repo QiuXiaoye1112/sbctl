@@ -164,7 +164,7 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   jq -e --arg tag "$local_tag" '.route.rules | any(.[]; .domain_suffix==["ipv6.test.com"] and .outbound==$tag)' "$CONFIG_FILE" >/dev/null
   listing=$(list_domain_rules in-test)
   grep -Fq '入站：in-test' <<<"$listing"
-  grep -Fq '序号  | 匹配   | 域名' <<<"$listing"
+  grep -Fq '序号  | 匹配   |  域名' <<<"$listing"
   grep -Fq 'ipv6.test.com' <<<"$listing"
   grep -Fq '2001:db8::1234' <<<"$listing"
 
