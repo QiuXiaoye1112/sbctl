@@ -15,6 +15,16 @@ width=""
 display_width width "vless-test"
 [[ $width == 10 ]]
 
+(
+  export LC_ALL=C
+  width=""
+  display_width width "匹配"
+  [[ $width == 4 ]]
+  width=""
+  display_width width "子域名"
+  [[ $width == 6 ]]
+)
+
 out=$(print_table_cell "标签" 8)
 [[ $out == "标签    " ]]
 
