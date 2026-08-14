@@ -267,16 +267,14 @@ list_domain_rules() {
       printf '\n入站：%s\n' "$group_inbound"
       print_table_cell "序号" 6; printf '| '
       print_table_cell "匹配" 7; printf '| '
-      printf ' '
-      print_table_cell_clipped "域名" 16; printf '| 出站\n'
+      print_table_cell_clipped "域名" 24; printf '| 出站\n'
     fi
     ((number+=1))
     display=$(_outbound_display_name "$outbound")
     [[ $match == suffix ]] && match="子域名" || match="精确"
     print_table_cell "$number" 6; printf '| '
     print_table_cell "$match" 7; printf '| '
-    printf ' '
-    print_table_cell_clipped "$domain" 16; printf '| %s\n' "$display"
+    print_table_cell_clipped "$domain" 24; printf '| %s\n' "$display"
   done <<<"$row"
 }
 
