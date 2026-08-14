@@ -2080,14 +2080,62 @@ _local_tag_for_ip() {
 }
 
 _ensure_local_outbound() {
-  local ip=$1 tag tmp bind_field
+  local ip=$1 tag tmp bind_field domain_strategy dns_tag=sbctl-local-dns
   tag=$(_local_tag_for_ip "$ip")
-  outbound_exists "$tag" && { printf '%s' "$tag"; return 0; }
-  # sing-box uses inet4_bind_address / inet6_bind_address
-  if [[ $ip == *:* ]]; then bind_field=inet6_bind_address; else bind_field=inet4_bind_address; fi
+  # sing-box uses inet4_bind_address / inet6_bind_address. Pair the bind
+  # address with a strict resolver strategy so the other address family is
+  # never used as a fallback.
+  if [[ $ip == *:* ]]; then
+    bind_field=inet6_bind_address
+    domain_strategy=ipv6_only
+  else
+    bind_field=inet4_bind_address
+    domain_strategy=ipv4_only
+  fi
+
+  if outbound_exists "$tag"; then
+    # Upgrade local direct outbounds created before strict address-family
+    # selection was added.
+    if jq -e --arg tag "$tag" --arg dns_tag "$dns_tag" --arg strategy "$domain_strategy" '
+      ([.dns.servers[]? | select(.tag==$dns_tag)] | length) == 0 or
+      any(.outbounds[]?;
+        .tag==$tag and .type=="direct" and
+        (.domain_resolver.server != $dns_tag or
+         .domain_resolver.strategy != $strategy or
+         has("domain_strategy")))
+    ' "$CONFIG_FILE" >/dev/null; then
+      tmp=$(temp_file)
+      jq --arg tag "$tag" --arg dns_tag "$dns_tag" --arg strategy "$domain_strategy" '
+        .dns = (.dns // {}) |
+        .dns.servers = (.dns.servers // []) |
+        if any(.dns.servers[]?; .tag==$dns_tag) then .
+        else .dns.servers += [{type:"local",tag:$dns_tag}]
+        end |
+        .outbounds |= map(
+          if .tag==$tag and .type=="direct" then
+            del(.domain_strategy) |
+            .domain_resolver={server:$dns_tag,strategy:$strategy}
+          else .
+          end
+        )' "$CONFIG_FILE" >"$tmp"
+      if ! apply_candidate "$tmp" >/dev/null; then
+        rm -f "$tmp"
+        return 1
+      fi
+      rm -f "$tmp"
+    fi
+    printf '%s' "$tag"
+    return 0
+  fi
+
   tmp=$(temp_file)
-  jq --arg tag "$tag" --arg ip "$ip" --arg field "$bind_field" \
-    '.outbounds += [{type:"direct",tag:$tag} + {($field):$ip}]' \
+  jq --arg tag "$tag" --arg ip "$ip" --arg field "$bind_field" --arg dns_tag "$dns_tag" --arg strategy "$domain_strategy" '
+    .dns = (.dns // {}) |
+    .dns.servers = (.dns.servers // []) |
+    if any(.dns.servers[]?; .tag==$dns_tag) then .
+    else .dns.servers += [{type:"local",tag:$dns_tag}]
+    end |
+    .outbounds += [{type:"direct",tag:$tag,domain_resolver:{server:$dns_tag,strategy:$strategy}} + {($field):$ip}]' \
     "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp" >/dev/null; then
     printf '%s' "$tag"
