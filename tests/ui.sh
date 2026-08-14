@@ -34,4 +34,7 @@ out=$(print_table_cell "子域名" 6)
 out=$(print_table_cell_clipped "abcdefghijkl" 8)
 [[ $out == "abcd... " ]]
 
+out=$(print_table_cell_clipped "abcdefghijklmnopqrstuvwx" 24)
+[[ $out == "abcdefghijklmnopqrstuvwx" ]]
+
 printf 'sbctl UI tests passed.\n'
