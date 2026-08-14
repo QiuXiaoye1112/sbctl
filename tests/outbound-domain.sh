@@ -77,13 +77,11 @@ jq -e '
     elif .inbound==["preserve-test"] and .action=="route" and .outbound=="socks-B" and
       ((keys_unsorted|sort)==["action","inbound","outbound"]) then "D"
     else empty
-    end] == ["A","X","B","Y","D"] and
-  ([$rules[] | select(.inbound==["preserve-test"] and .domain==["a.example.com"])] | length == 1) and
+    end] == ["A","A","X","B","Y","D"] and
+  ([$rules[] | select(.inbound==["preserve-test"] and .domain==["a.example.com"])] | length == 2) and
   ([$rules[] | select(.inbound==["preserve-test"] and .domain_suffix==["example.com"])] | length == 1)
 ' "$CONFIG_FILE" >/dev/null
 
-add_domain_rule order-test suffix example.com socks-A
-add_domain_rule order-test exact example.com socks-B
 add_domain_rule order-test suffix api.example.com socks-A
 assign_outbound order-test socks-B
 jq -e '
@@ -126,15 +124,16 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   assign_outbound in-test socks-B
   jq -e '.route.rules | any(.[]; .inbound==["in-test"] and .domain_suffix==["openai.com"] and .outbound=="socks-A") and any(.[]; .inbound==["in-test"] and .action=="route" and .outbound=="socks-B" and ((keys_unsorted|sort)==["action","inbound","outbound"]))' "$CONFIG_FILE" >/dev/null
 
+  before=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
   add_domain_rule in-test suffix openai.com socks-B
-  jq -e '[.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["openai.com"])] | length == 1 and .[0].outbound == "socks-B"' "$CONFIG_FILE" >/dev/null
+  after=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
+  [[ $before == "$after" ]]
+  jq -e '[.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["openai.com"])] | length == 1 and .[0].outbound == "socks-A"' "$CONFIG_FILE" >/dev/null
   jq -e '[.route.rules[] | select(.inbound==["in-test"] and .domain==["openai.com"])] | length == 1' "$CONFIG_FILE" >/dev/null
 
-  choose() { printf -v "$1" "%s" 2; }
-  delete_domain_rule in-test
-  jq -e '.route.rules | all(.[]; .domain_suffix != ["openai.com"]) and any(.[]; .domain==["openai.com"])' "$CONFIG_FILE" >/dev/null
-  delete_domain_rule in-test
-  jq -e '.route.rules | all(.[]; (.domain // []) != ["openai.com"]) and any(.[]; .action=="route" and .inbound==["in-test"] and .outbound=="socks-B")' "$CONFIG_FILE" >/dev/null
+  confirm() { return 0; }
+  delete_domain_rule in-test <<< '1,2'
+  jq -e '.route.rules | all(.[]; (.domain // []) != ["openai.com"] and (.domain_suffix // []) != ["openai.com"]) and any(.[]; .action=="route" and .inbound==["in-test"] and .outbound=="socks-B")' "$CONFIG_FILE" >/dev/null
 
   add_domain_rule in-test exact api.test.com direct
   jq -e '.route.rules | any(.[]; .inbound==["in-test"] and .domain==["api.test.com"] and .outbound=="direct")' "$CONFIG_FILE" >/dev/null
@@ -146,13 +145,16 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
     map(.domain_suffix[0]) | sort == ["batch-one.test", "batch-three.test", "batch-two.test"]
   ' "$CONFIG_FILE" >/dev/null
 
+  before=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
   add_domain_rule in-test suffix batch-one.test,batch-four.test socks-B
+  after=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
+  [[ $before == "$after" ]]
   jq -e '
     [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-one.test"])] |
-    length == 1 and .[0].outbound == "socks-B"
+    length == 1 and .[0].outbound == "socks-A"
   ' "$CONFIG_FILE" >/dev/null
   jq -e '
-    [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-four.test"])] | length == 1 and .[0].outbound == "socks-B"
+    [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-four.test"])] | length == 0
   ' "$CONFIG_FILE" >/dev/null
 
   local_tag=$(_ensure_local_outbound 2001:db8::1234)
@@ -161,6 +163,8 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   jq -e '.dns.servers | any(.[]; .tag=="sbctl-local-dns" and .type=="local")' "$CONFIG_FILE" >/dev/null
   jq -e --arg tag "$local_tag" '.route.rules | any(.[]; .domain_suffix==["ipv6.test.com"] and .outbound==$tag)' "$CONFIG_FILE" >/dev/null
   listing=$(list_domain_rules in-test)
+  grep -Fq '入站：in-test' <<<"$listing"
+  grep -Fq '序号  | 匹配   | 域名' <<<"$listing"
   grep -Fq 'ipv6.test.com' <<<"$listing"
   grep -Fq '2001:db8::1234' <<<"$listing"
 
