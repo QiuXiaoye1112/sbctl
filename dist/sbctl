@@ -2385,6 +2385,15 @@ _outbound_display_name() {
   fi
 }
 
+_outbound_endpoint_display() {
+  local server=$1 port=$2
+  if [[ $server == *:* && $server != \[*\] ]]; then
+    printf '[%s]:%s' "$(_short_ipv6 "$server")" "$port"
+  else
+    printf '%s:%s' "$(uri_host "$server")" "$port"
+  fi
+}
+
 _normalize_domain_input() {
   local __var=$1 candidate
   candidate=$(printf '%s' "${2-}" | tr '[:upper:]' '[:lower:]')
@@ -2472,16 +2481,16 @@ list_outbound_overview() {
     info "还没有代理出站。"
     return 0
   fi
-  print_table_cell "序号" 6; printf '| '
-  print_table_cell_clipped "标签" 22; printf '| '
-  print_table_cell "协议" 8; printf '| '
-  print_table_cell_clipped "地址" 26; printf '| 用户\n'
+  print_table_cell "序号" 4; printf '| '
+  print_table_cell_clipped "标签" 16; printf '| '
+  print_table_cell "协议" 7; printf '| '
+  print_table_cell_clipped "地址" 22; printf '| 用户\n'
   while IFS=$'\t' read -r outbound type server port user; do
     ((number+=1))
-    print_table_cell "$number" 6; printf '| '
-    print_table_cell_clipped "$outbound" 22; printf '| '
-    print_table_cell "$type" 8; printf '| '
-    print_table_cell_clipped "$(uri_host "$server"):${port}" 26; printf '| %s\n' "${user:-无}"
+    print_table_cell "$number" 4; printf '| '
+    print_table_cell_clipped "$outbound" 16; printf '| '
+    print_table_cell "$type" 7; printf '| '
+    print_table_cell_clipped "$(_outbound_endpoint_display "$server" "$port")" 22; printf '| %s\n' "${user:-无}"
   done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|[.tag,.type,.server,(.server_port|tostring),(.username//"")]|@tsv' "$CONFIG_FILE")
 }
 
