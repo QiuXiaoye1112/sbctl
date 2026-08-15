@@ -251,7 +251,7 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   dual_tag=$choice_outbound
   [[ $dual_tag == local-prefer6-* ]]
   jq -e --arg tag "$dual_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet6_bind_address=="2001:db8::1234" and .inet4_bind_address=="192.0.2.123" and .domain_resolver=={"server":"sbctl-local-dns","strategy":"prefer_ipv6"} and .fallback_delay=="300ms" and (.domain_strategy|not))' "$CONFIG_FILE" >/dev/null
-  [[ $(_outbound_display_name "$dual_tag") == '2001:db8::1234 (IPv6 → 192.0.2.123 fallback)' ]]
+  [[ $(_outbound_display_name "$dual_tag") == '2001:...:1234 → 192.0.2.123' ]]
   [[ $(_ensure_prefer_ipv6_outbound 2001:db8::1234 192.0.2.123) == "$dual_tag" ]]
   [[ $(jq '[.outbounds[] | select(.tag|startswith("local-prefer6-"))] | length' "$CONFIG_FILE") == 1 ]]
 

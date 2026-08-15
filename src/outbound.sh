@@ -309,19 +309,39 @@ def sbctl_insert_rule($rules; $index; $new_rule):
 JQ
 }
 
+_short_ipv6() {
+  local ip=$1 first last
+  [[ $ip == *:* ]] || { printf '%s' "$ip"; return; }
+  first=${ip%%:*}
+  last=${ip##*:}
+  [[ -n $first ]] || first=:
+  [[ -n $last ]] || last=:
+  printf '%s:...:%s' "$first" "$last"
+}
+
 _outbound_display_name() {
-  local tag=$1 display
+  local tag=$1 record inet4 inet6 strategy
   [[ $tag == direct ]] && { printf 'direct'; return; }
-  display=$(jq -r --arg tag "$tag" '
+  record=$(jq -r --arg tag "$tag" '
     [.outbounds[]? | select(.tag==$tag)][0] |
-    if . == null then $tag
-    elif (.inet6_bind_address? and .inet4_bind_address? and
-          ((.domain_resolver.strategy? // .domain_strategy? // "") == "prefer_ipv6")) then
-      "\(.inet6_bind_address) (IPv6 → \(.inet4_bind_address) fallback)"
-    elif .inet4_bind_address? then .inet4_bind_address
-    elif .inet6_bind_address? then .inet6_bind_address
-    else $tag end' "$CONFIG_FILE" 2>/dev/null || true)
-  printf '%s' "${display:-$tag}"
+    if . == null then ""
+    else [(.inet4_bind_address // ""), (.inet6_bind_address // ""),
+      (.domain_resolver.strategy // .domain_strategy // "")] | @tsv
+    end' "$CONFIG_FILE" 2>/dev/null || true)
+  if [[ -z $record ]]; then
+    printf '%s' "$tag"
+    return
+  fi
+  IFS=$'\t' read -r inet4 inet6 strategy <<<"$record"
+  if [[ -n $inet6 && -n $inet4 && $strategy == prefer_ipv6 ]]; then
+    printf '%s → %s' "$(_short_ipv6 "$inet6")" "$inet4"
+  elif [[ -n $inet4 ]]; then
+    printf '%s' "$inet4"
+  elif [[ -n $inet6 ]]; then
+    _short_ipv6 "$inet6"
+  else
+    printf '%s' "$tag"
+  fi
 }
 
 _normalize_domain_input() {
