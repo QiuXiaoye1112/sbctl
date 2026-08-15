@@ -41,6 +41,11 @@ alice
 secret
 EOF2
   jq -e ".outbounds[]|select(.tag==\"socks-out-test\" and .type==\"socks\" and .server_port==1080)" "$CONFIG_FILE" >/dev/null
+  details=$(show_outbound_details socks-out-test)
+  grep -Fq "\"server\": \"127.0.0.1\"" <<<"$details"
+  grep -Fq "\"server_port\": 1080" <<<"$details"
+  grep -Fq "\"username\": \"alice\"" <<<"$details"
+  grep -Fq "\"password\": \"secret\"" <<<"$details"
   assign_outbound in-test socks-out-test
   jq -e ".route.rules[]|select(.inbound==[\"in-test\"] and .action==\"route\" and .outbound==\"socks-out-test\")" "$CONFIG_FILE" >/dev/null
   [[ $(current_outbound_for_inbound in-test) == socks-out-test ]]

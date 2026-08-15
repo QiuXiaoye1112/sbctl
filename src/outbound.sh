@@ -453,6 +453,32 @@ list_outbound_overview() {
   done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|[.tag,.type,.server,(.server_port|tostring),(.username//"")]|@tsv' "$CONFIG_FILE")
 }
 
+show_outbound_details() {
+  ensure_config
+  local tag=${1-} answer item
+  local -a tags=()
+  while IFS= read -r item; do
+    [[ -n $item ]] && tags+=("$item")
+  done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|.tag' "$CONFIG_FILE")
+  ((${#tags[@]})) || { info "还没有手动添加的代理出站。"; return 0; }
+
+  if [[ -z $tag ]]; then
+    if ((${#tags[@]} == 1)); then
+      tag=${tags[0]}
+    else
+      choose answer "选择要查看的代理出站" "${tags[@]}" || return 0
+      tag=${tags[$((answer-1))]}
+    fi
+  fi
+  [[ $tag != direct ]] || { warn "这里只显示手动添加的 SOCKS5/HTTP 出站。"; return 0; }
+  jq -e --arg tag "$tag" '.outbounds[]?|select((.type=="socks" or .type=="http") and .tag==$tag)' "$CONFIG_FILE" >/dev/null \
+    || die "找不到手动添加的代理出站：$tag"
+
+  heading "出站详情"
+  printf '出站：%s\n\n' "$tag"
+  jq --arg tag "$tag" '.outbounds[]|select((.type=="socks" or .type=="http") and .tag==$tag)' "$CONFIG_FILE"
+}
+
 prompt_outbound_tag() {
   local __var=$1 default=$2 candidate
   while true; do
