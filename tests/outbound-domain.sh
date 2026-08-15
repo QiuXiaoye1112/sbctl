@@ -36,10 +36,13 @@ write_default_config
     {type:\"socks\",tag:\"order-test\",listen:\"127.0.0.1\",listen_port:18082,users:[]},
     {type:\"socks\",tag:\"preserve-test\",listen:\"127.0.0.1\",listen_port:18083,users:[]},
     {type:\"socks\",tag:\"tail-test\",listen:\"127.0.0.1\",listen_port:18084,users:[]},
-    {type:\"socks\",tag:\"tail-test-2\",listen:\"127.0.0.1\",listen_port:18085,users:[]}
+    {type:\"socks\",tag:\"tail-test-2\",listen:\"127.0.0.1\",listen_port:18085,users:[]},
+    {type:\"socks\",tag:\"dual-test\",listen:\"127.0.0.1\",listen_port:18086,users:[]},
+    {type:\"socks\",tag:\"dual-test-2\",listen:\"127.0.0.1\",listen_port:18087,users:[]}
   ] | .outbounds += [
     {type:\"socks\",tag:\"socks-A\",server:\"127.0.0.1\",server_port:1080,version:\"5\"},
-    {type:\"socks\",tag:\"socks-B\",server:\"127.0.0.1\",server_port:1081,version:\"5\"}
+    {type:\"socks\",tag:\"socks-B\",server:\"127.0.0.1\",server_port:1081,version:\"5\"},
+    {type:\"http\",tag:\"http-A\",server:\"127.0.0.1\",server_port:8080}
   ]" "$CONFIG_FILE" >"$tmp"
 mv "$tmp" "$CONFIG_FILE"
 
@@ -176,6 +179,133 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   mv "$tmp" "$CONFIG_FILE"
   [[ $(_ensure_local_outbound 2001:db8::1234) == "$local_tag" ]]
   jq -e --arg tag "$local_tag" '.outbounds | any(.[]; .tag==$tag and .domain_resolver=={"server":"sbctl-local-dns","strategy":"ipv6_only"})' "$CONFIG_FILE" >/dev/null
+
+  # IPv6 selection alone remains a pure IPv6 outbound; only an explicit
+  # fallback choice creates a dual-stack outbound.
+  detect_local_ips() {
+    printf '%s\t%s\t%s\n' '192.0.2.123 (IPv4)' 192.0.2.123 eth0
+    printf '%s\t%s\t%s\n' '198.51.100.9 (IPv4)' 198.51.100.9 eth1
+    printf '%s\t%s\t%s\n' '2001:db8::1234 (IPv6)' 2001:db8::1234 eth0
+  }
+  original_choose=$(declare -f choose)
+  original_sing_box_version=$(declare -f sing_box_version)
+  choose_prompts=()
+  desired_top=''
+  desired_fallback=1
+  choose() {
+    local __var=$1 prompt=$2; shift 2
+    local -a options=("$@")
+    choose_prompts+=("$prompt")
+    if [[ $prompt == '选择出站' ]]; then
+      local i
+      for ((i=0; i<${#options[@]}; i++)); do
+        [[ ${options[$i]} == "$desired_top" ]] || continue
+        printf -v "$__var" '%s' "$((i+1))"
+        return 0
+      done
+      return 1
+    fi
+    if [[ $prompt == 'IPv4 回退' ]]; then
+      printf -v "$__var" '%s' "$desired_fallback"
+      return 0
+    fi
+    return 1
+  }
+
+  desired_top=direct
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  [[ $choice_outbound == direct ]]
+  ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
+
+  desired_top='192.0.2.123 (IPv4)'
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  [[ $choice_outbound == local-192-0-2-123 ]]
+  ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
+  jq -e --arg tag "$choice_outbound" '.outbounds | any(.[]; .tag==$tag and has("inet4_bind_address") and (.inet6_bind_address|not) and (.domain_strategy|not) and (.fallback_delay|not))' "$CONFIG_FILE" >/dev/null
+
+  desired_top='socks-A (socks · 127.0.0.1:1080)'
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  [[ $choice_outbound == socks-A ]]
+  ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
+
+  desired_top='http-A (http · 127.0.0.1:8080)'
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  [[ $choice_outbound == http-A ]]
+  ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
+
+  desired_top='2001:db8::1234 (IPv6)'
+  desired_fallback=1
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  [[ $choice_outbound == local-2001-db8--1234 ]]
+  grep -Fxq 'IPv4 回退' <<<"${choose_prompts[*]}"
+  jq -e --arg tag "$choice_outbound" '.outbounds | any(.[]; .tag==$tag and has("inet6_bind_address") and (.inet4_bind_address|not) and (.domain_strategy|not) and (.fallback_delay|not))' "$CONFIG_FILE" >/dev/null
+
+  desired_fallback=2
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  dual_tag=$choice_outbound
+  [[ $dual_tag == local-prefer6-* ]]
+  jq -e --arg tag "$dual_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet6_bind_address=="2001:db8::1234" and .inet4_bind_address=="192.0.2.123" and .domain_resolver=={"server":"sbctl-local-dns","strategy":"prefer_ipv6"} and .fallback_delay=="300ms" and (.domain_strategy|not))' "$CONFIG_FILE" >/dev/null
+  [[ $(_outbound_display_name "$dual_tag") == '2001:db8::1234 (IPv6 → 192.0.2.123 fallback)' ]]
+  [[ $(_ensure_prefer_ipv6_outbound 2001:db8::1234 192.0.2.123) == "$dual_tag" ]]
+  [[ $(jq '[.outbounds[] | select(.tag|startswith("local-prefer6-"))] | length' "$CONFIG_FILE") == 1 ]]
+
+  pair_b_tag=$(_ensure_prefer_ipv6_outbound 2001:db8::1234 198.51.100.9)
+  [[ $pair_b_tag != "$dual_tag" ]]
+  [[ $(_ensure_prefer_ipv6_outbound 2001:db8::1234 198.51.100.9) == "$pair_b_tag" ]]
+  [[ $(jq '[.outbounds[] | select(.tag|startswith("local-prefer6-"))] | length' "$CONFIG_FILE") == 2 ]]
+
+  add_domain_rule dual-test exact fallback.example.com "$dual_tag"
+  add_domain_rule dual-test-2 exact fallback.example.com "$pair_b_tag"
+  assign_outbound dual-test "$dual_tag"
+  jq -e --arg tag "$dual_tag" '
+    .route.rules | any(.[]; .inbound==["dual-test"] and .domain==["fallback.example.com"] and .outbound==$tag) and
+    any(.[]; .inbound==["dual-test"] and .action=="route" and .outbound==$tag and ((keys_unsorted|sort)==["action","inbound","outbound"]))
+  ' "$CONFIG_FILE" >/dev/null
+  jq -e --arg tag "$pair_b_tag" '.route.rules | any(.[]; .inbound==["dual-test-2"] and .domain==["fallback.example.com"] and .outbound==$tag)' "$CONFIG_FILE" >/dev/null
+
+  preserve_before_dual=$(jq -c '
+    [.route.rules[] |
+      if .inbound==["preserve-test"] and .domain==["a.example.com"] then "A"
+      elif .domain_keyword==["preserve-custom-x"] then "X"
+      elif .inbound==["preserve-test"] and .domain_suffix==["example.com"] then "B"
+      elif .domain_keyword==["preserve-custom-y"] then "Y"
+      elif .inbound==["preserve-test"] and .action=="route" and ((keys_unsorted|sort)==["action","inbound","outbound"]) then "D"
+      else empty
+      end]' "$CONFIG_FILE")
+  assign_outbound preserve-test "$dual_tag"
+  [[ $preserve_before_dual == "$(jq -c '
+    [.route.rules[] |
+      if .inbound==["preserve-test"] and .domain==["a.example.com"] then "A"
+      elif .domain_keyword==["preserve-custom-x"] then "X"
+      elif .inbound==["preserve-test"] and .domain_suffix==["example.com"] then "B"
+      elif .domain_keyword==["preserve-custom-y"] then "Y"
+      elif .inbound==["preserve-test"] and .action=="route" and ((keys_unsorted|sort)==["action","inbound","outbound"]) then "D"
+      else empty
+      end]' "$CONFIG_FILE")" ]]
+
+  # The same canonical domain_resolver strategy is used for both supported
+  # versions; this also protects the 1.14 migration path.
+  sing_box_version() { printf '1.14.0'; }
+  modern_tag=$(_ensure_prefer_ipv6_outbound 2001:db8::5678 192.0.2.123)
+  jq -e --arg tag "$modern_tag" '.outbounds | any(.[]; .tag==$tag and .domain_resolver=={"server":"sbctl-local-dns","strategy":"prefer_ipv6"} and .fallback_delay=="300ms" and (.domain_strategy|not))' "$CONFIG_FILE" >/dev/null
+
+  detect_local_ips() {
+    printf '%s\t%s\t%s\n' '2001:db8::1234 (IPv6)' 2001:db8::1234 eth0
+  }
+  desired_top='2001:db8::1234 (IPv6)'
+  choose_prompts=()
+  select_outbound choice_outbound 1
+  [[ $choice_outbound == local-2001-db8--1234 ]]
+  ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
+
+  eval "$original_sing_box_version"
+  eval "$original_choose"
 
   add_domain_rule in-test suffix managed-delete.test socks-A
   confirm() { return 0; }
