@@ -2163,6 +2163,9 @@ _build_prefer_ipv6_outbound_json() {
   version=$(sing_box_version)
   [[ -n $version ]] || { warn "无法识别 sing-box 版本，不能创建 IPv6 fallback 出站。"; return 1; }
 
+  # This is TCP Happy Eyeballs for domain destinations: IPv6 starts first and
+  # IPv4 starts after fallback_delay when IPv6 is still pending. UDP has no
+  # equivalent connection race and is not guaranteed to escape a black hole.
   # The repository already has a tagged local DNS resolver. Use the
   # domain_resolver path for every supported sing-box version: 1.13 rejects
   # legacy domain_strategy by default, and 1.14 removes that legacy field.

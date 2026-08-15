@@ -5,6 +5,39 @@ on:
   pull_request:
 
 jobs:
+  fallback-real-1-13:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fallback test dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq openssl iproute2 python3
+      - name: Download verified sing-box 1.13.18
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version=1.13.18
+          case "$(uname -m)" in
+            x86_64) arch=amd64; expected=d34d987ed6ae39ca3760269264fb502b867e5477db45518c829b07776245c495 ;;
+            aarch64) arch=arm64; expected=a894f6152cade4a2c9d062762d54dea0c1aee673ab4759e0829e19cace932719 ;;
+            *) printf 'unsupported runner architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/sing-box-$version-linux-$arch.tar.gz"
+          install_dir="$RUNNER_TEMP/sing-box-$version"
+          curl -fsSL --connect-timeout 10 --max-time 120 \
+            "https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-$arch.tar.gz" \
+            -o "$archive"
+          printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" -C "$install_dir" --strip-components=1
+          real_bin="$install_dir/sing-box"
+          "$real_bin" version | grep -F "sing-box version $version"
+          printf 'SBCTL_REAL_SING_BOX_BIN=%s\n' "$real_bin" >>"$GITHUB_ENV"
+          printf 'SBCTL_EXPECT_SING_BOX_SERIES=1.13\n' >>"$GITHUB_ENV"
+      - name: Real 1.13 fallback config check
+        run: bash tests/outbound-domain.sh
+      - name: Real 1.13 TCP Happy Eyeballs fallback
+        run: sudo --preserve-env=SBCTL_REAL_SING_BOX_BIN,SBCTL_EXPECT_SING_BOX_SERIES bash tests/outbound-fallback-tcp.sh
+
   smoke:
     runs-on: ubuntu-latest
     steps:

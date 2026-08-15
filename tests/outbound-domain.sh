@@ -289,8 +289,9 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
       else empty
       end]' "$CONFIG_FILE")" ]]
 
-  # The same canonical domain_resolver strategy is used for both supported
-  # versions; this also protects the 1.14 migration path.
+  # Schema-generation guard only: a mocked version string is not evidence of
+  # sing-box 1.14 compatibility. A real 1.14 binary must be added to CI before
+  # support is claimed.
   sing_box_version() { printf '1.14.0'; }
   modern_tag=$(_ensure_prefer_ipv6_outbound 2001:db8::5678 192.0.2.123)
   jq -e --arg tag "$modern_tag" '.outbounds | any(.[]; .tag==$tag and .domain_resolver=={"server":"sbctl-local-dns","strategy":"prefer_ipv6"} and .fallback_delay=="300ms" and (.domain_strategy|not))' "$CONFIG_FILE" >/dev/null
@@ -337,4 +338,26 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   assign_outbound plain-test direct
   [[ $(current_outbound_for_inbound plain-test) == direct ]]
 ! jq -e '.route.rules[]? | select(.inbound==["plain-test"])' "$CONFIG_FILE" >/dev/null
+
+if [[ -n ${SBCTL_REAL_SING_BOX_BIN:-} ]]; then
+  [[ -x $SBCTL_REAL_SING_BOX_BIN ]] || { printf 'SBCTL_REAL_SING_BOX_BIN is not executable\n' >&2; exit 1; }
+  expected_series=${SBCTL_EXPECT_SING_BOX_SERIES:-1.13}
+  real_version=$($SBCTL_REAL_SING_BOX_BIN version | sed -nE '1s/^sing-box version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+  [[ $real_version == "$expected_series".* ]] || {
+    printf 'expected real sing-box %s.x, got %s\n' "$expected_series" "${real_version:-unknown}" >&2
+    exit 1
+  }
+  real_config="$MOCK/real-fallback-check.json"
+  jq -n --argjson outbound "$(jq -c --arg tag "$dual_tag" '.outbounds[] | select(.tag==$tag)' "$CONFIG_FILE")" '
+    {
+      log:{level:"warn"},
+      dns:{servers:[{type:"local",tag:"sbctl-local-dns"}]},
+      inbounds:[{type:"socks",tag:"check-in",listen:"127.0.0.1",listen_port:19080}],
+      outbounds:[$outbound],
+      route:{final:$outbound.tag}
+    }
+  ' >"$real_config"
+  "$SBCTL_REAL_SING_BOX_BIN" check -c "$real_config"
+  printf 'real sing-box %s fallback config check passed.\n' "$real_version"
+fi
 printf 'sbctl outbound domain tests passed.\n'

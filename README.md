@@ -34,6 +34,12 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 - 三级卸载：仅核心、完全卸载、彻底删除
 - 系统诊断、残留扫描和资源归属保护
 
+### 本机 IPv6 出站回退边界
+
+本机 IPv6 出站可以选择一个本机 IPv4 作为 fallback。该机制面向“域名 + TCP”的 Happy Eyeballs：域名同时解析出 AAAA 与 A 时优先启动 IPv6，IPv6 仍未建立连接则约 300ms 后并发启动 IPv4，先成功的连接胜出。纯 IP 目标不会触发域名地址族竞速；UDP 也不保证在 IPv6 黑洞场景下自动切换到 IPv4。
+
+CI 使用真实 sing-box `1.13.18` 校验 fallback 配置并执行 TCP 黑洞回退测试。测试中的 `1.14` mock 只保护 JSON 生成分支，不能作为兼容性依据；未来声明支持 sing-box `1.14` 前，必须增加真实 `1.14.x` binary 的 CI 检查与集成测试。
+
 ## 安装
 
 ### systemd Linux
@@ -348,6 +354,7 @@ GitHub Actions 会：
 - 对主脚本、模块、安装器和测试执行 Bash/POSIX shell 语法检查；
 - 运行 ShellCheck 和 `git diff --check`；
 - 安装当前稳定 sing-box，以真实 `sing-box check` 执行协议回归；
+- 固定下载并校验 sing-box `1.13.18`，对本机 IPv6 fallback 执行真实配置检查和 TCP Happy Eyeballs 黑洞回退测试；
 - 测试证书、Cloudflare、备份/恢复、路由、事务回滚、Certbot 多账户、卸载和 BBR 安全边界；
 - 在 Alpine 容器再次运行生命周期/Cloudflare/成熟度测试，覆盖 musl/OpenRC 兼容面。
 
