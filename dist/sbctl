@@ -2385,6 +2385,15 @@ _outbound_display_name() {
   fi
 }
 
+_outbound_endpoint_display() {
+  local server=$1 port=$2
+  if [[ $server == *:* && $server != \[*\] ]]; then
+    printf '[%s]:%s' "$(_short_ipv6 "$server")" "$port"
+  else
+    printf '%s:%s' "$(uri_host "$server")" "$port"
+  fi
+}
+
 _normalize_domain_input() {
   local __var=$1 candidate
   candidate=$(printf '%s' "${2-}" | tr '[:upper:]' '[:lower:]')
@@ -2481,7 +2490,7 @@ list_outbound_overview() {
     print_table_cell "$number" 4; printf '| '
     print_table_cell_clipped "$outbound" 16; printf '| '
     print_table_cell "$type" 7; printf '| '
-    print_table_cell_clipped "$(uri_host "$server"):${port}" 22; printf '| %s\n' "${user:-无}"
+    print_table_cell_clipped "$(_outbound_endpoint_display "$server" "$port")" 22; printf '| %s\n' "${user:-无}"
   done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|[.tag,.type,.server,(.server_port|tostring),(.username//"")]|@tsv' "$CONFIG_FILE")
 }
 
