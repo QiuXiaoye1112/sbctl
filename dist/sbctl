@@ -2152,6 +2152,107 @@ _ensure_local_outbound() {
   rm -f "$tmp"
 }
 
+_local_prefer6_tag_for_pair() {
+  local ipv6=$1 ipv4=$2 digest
+  digest=$(printf 'prefer_ipv6\0%s\0%s' "$ipv6" "$ipv4" | openssl dgst -sha256 -r | awk '{print $1}')
+  printf 'local-prefer6-%s' "${digest:0:16}"
+}
+
+_build_prefer_ipv6_outbound_json() {
+  local __var=$1 tag=$2 ipv6=$3 ipv4=$4 version strategy_fields json
+  version=$(sing_box_version)
+  [[ -n $version ]] || { warn "无法识别 sing-box 版本，不能创建 IPv6 fallback 出站。"; return 1; }
+
+  # The repository already has a tagged local DNS resolver. Use the
+  # domain_resolver path for every supported sing-box version: 1.13 rejects
+  # legacy domain_strategy by default, and 1.14 removes that legacy field.
+  version_ge "$version" 1.12.0 || {
+    warn "IPv6 fallback 需要 sing-box >= 1.12.0。"
+    return 1
+  }
+  strategy_fields=$(jq -nc '{domain_resolver:{server:"sbctl-local-dns",strategy:"prefer_ipv6"}}')
+  json=$(jq -nc --arg tag "$tag" --arg ipv6 "$ipv6" --arg ipv4 "$ipv4" \
+    --argjson strategy_fields "$strategy_fields" '
+    {type:"direct",tag:$tag,inet6_bind_address:$ipv6,inet4_bind_address:$ipv4,
+     fallback_delay:"300ms"} + $strategy_fields')
+  printf -v "$__var" '%s' "$json"
+}
+
+_ensure_prefer_ipv6_outbound() {
+  local ipv6=$1 ipv4=$2 tag outbound tmp dns_tag=sbctl-local-dns
+  [[ $ipv6 == *:* ]] || { warn "IPv6 fallback 出站需要 IPv6 地址。"; return 1; }
+  validate_ip_literal "$ipv6" || { warn "IPv6 地址无效。"; return 1; }
+  validate_ipv4 "$ipv4" || { warn "IPv4 fallback 地址无效。"; return 1; }
+  tag=$(_local_prefer6_tag_for_pair "$ipv6" "$ipv4")
+  _build_prefer_ipv6_outbound_json outbound "$tag" "$ipv6" "$ipv4" || return 1
+
+  if jq -e --arg tag "$tag" --arg ipv6 "$ipv6" --arg ipv4 "$ipv4" '
+    any(.outbounds[]?; .tag==$tag and
+      (.type!="direct" or .inet6_bind_address!=$ipv6 or .inet4_bind_address!=$ipv4))
+  ' "$CONFIG_FILE" >/dev/null; then
+    warn "检测到 IPv6 fallback 出站标签冲突：${tag}。"
+    return 1
+  fi
+
+  if jq -e --arg tag "$tag" --arg dns_tag "$dns_tag" --argjson outbound "$outbound" '
+    any(.outbounds[]?; .tag==$tag and .==$outbound) and
+    (($outbound.domain_resolver.server // "") != $dns_tag or
+      any(.dns.servers[]?; .tag==$dns_tag))
+  ' "$CONFIG_FILE" >/dev/null; then
+    printf '%s' "$tag"
+    return 0
+  fi
+
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --arg dns_tag "$dns_tag" --argjson outbound "$outbound" '
+    if (($outbound.domain_resolver.server // "") == $dns_tag) then
+      .dns=(.dns // {}) |
+      .dns.servers=(.dns.servers // []) |
+      if any(.dns.servers[]?; .tag==$dns_tag) then .
+      else .dns.servers += [{type:"local",tag:$dns_tag}]
+      end
+    else . end |
+    if any(.outbounds[]?; .tag==$tag) then
+      .outbounds |= map(if .tag==$tag then $outbound else . end)
+    else
+      .outbounds += [$outbound]
+    end' "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp" >/dev/null; then
+    printf '%s' "$tag"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+_select_ipv4_fallback() {
+  local __var=$1 label ipv4 iface choice item
+  local -a ipv4s=()
+  while IFS=$'\t' read -r label ipv4 iface; do
+    [[ $label == *'(IPv4)' ]] || continue
+    local duplicate=0
+    if ((${#ipv4s[@]})); then
+      for item in "${ipv4s[@]}"; do
+        [[ $item == "$ipv4" ]] && { duplicate=1; break; }
+      done
+    fi
+    ((duplicate)) || ipv4s+=("$ipv4")
+  done < <(detect_local_ips 2>/dev/null)
+
+  if ((${#ipv4s[@]} == 0)); then
+    warn "主机没有可用 IPv4 fallback，将继续使用纯 IPv6 出站。"
+    printf -v "$__var" '%s' ''
+    return 0
+  fi
+  choose choice "IPv4 回退" "不回退" "${ipv4s[@]}" || return 1
+  if [[ $choice == 1 ]]; then
+    printf -v "$__var" '%s' ''
+  else
+    printf -v "$__var" '%s' "${ipv4s[$((choice-2))]}"
+  fi
+}
+
 current_outbound_for_inbound() {
   local inbound=$1 selected
   selected=$(jq -r --arg inbound "$inbound" '
@@ -2247,10 +2348,18 @@ JQ
 }
 
 _outbound_display_name() {
-  local tag=$1 ip
+  local tag=$1 display
   [[ $tag == direct ]] && { printf 'direct'; return; }
-  ip=$(jq -r --arg tag "$tag" '.outbounds[]?|select(.tag==$tag)|(.inet4_bind_address // .inet6_bind_address // empty)' "$CONFIG_FILE" 2>/dev/null || true)
-  printf '%s' "${ip:-$tag}"
+  display=$(jq -r --arg tag "$tag" '
+    [.outbounds[]? | select(.tag==$tag)][0] |
+    if . == null then $tag
+    elif (.inet6_bind_address? and .inet4_bind_address? and
+          ((.domain_resolver.strategy? // .domain_strategy? // "") == "prefer_ipv6")) then
+      "\(.inet6_bind_address) (IPv6 → \(.inet4_bind_address) fallback)"
+    elif .inet4_bind_address? then .inet4_bind_address
+    elif .inet6_bind_address? then .inet6_bind_address
+    else $tag end' "$CONFIG_FILE" 2>/dev/null || true)
+  printf '%s' "${display:-$tag}"
 }
 
 _normalize_domain_input() {
@@ -2330,11 +2439,7 @@ list_outbound_overview() {
     print_table_cell_clipped "入站" 26; printf '| 出站\n'
     while IFS= read -r inbound; do
       outbound=$(current_outbound_for_inbound "$inbound")
-      local display="$outbound"
-      if [[ $outbound =~ ^local- ]]; then
-        local ip; ip=$(jq -r --arg tag "$outbound" '.outbounds[]?|select(.tag==$tag)|(.inet4_bind_address // .inet6_bind_address // empty)' "$CONFIG_FILE" 2>/dev/null || true)
-        display="${ip:-$outbound}"
-      fi
+      local display; display=$(_outbound_display_name "$outbound")
       print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$display"
     done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
   fi
@@ -2443,7 +2548,20 @@ select_outbound() {
       done
     fi
     [[ -n $ip ]] || { error "无法解析本地 IP。"; return 1; }
-    selected=$(_ensure_local_outbound "$ip") || { error "无法创建本地出口。"; return 1; }
+    if [[ $ip == *:* ]]; then
+      local fallback_ipv4=""
+      _select_ipv4_fallback fallback_ipv4 || return 1
+      if [[ -n $fallback_ipv4 ]]; then
+        selected=$(_ensure_prefer_ipv6_outbound "$ip" "$fallback_ipv4") || {
+          error "无法创建 IPv6 fallback 出站。"
+          return 1
+        }
+      else
+        selected=$(_ensure_local_outbound "$ip") || { error "无法创建本地出口。"; return 1; }
+      fi
+    else
+      selected=$(_ensure_local_outbound "$ip") || { error "无法创建本地出口。"; return 1; }
+    fi
   fi
   printf -v "$__var" '%s' "$selected"
 }
