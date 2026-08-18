@@ -722,7 +722,12 @@ delete_domain_rule() {
       select(.inbound==[\$inbound]) |
       (if has(\"domain_suffix\") then \"suffix\" else \"exact\" end) as \$match |
       (if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end) as \$domain |
-      [\$match,\$domain,.outbound] | @tsv] | .[]" "$CONFIG_FILE")
+      [\$match,\$domain,.outbound]] as \$rules |
+    (\$rules |
+      sort_by([(if .[0]==\"suffix\" then 0 else 1 end), .[2]]) |
+      group_by([.[0], .[2]])[] |
+      sort_by([(.[1] | ascii_downcase), .[1]])[]
+    ) | @tsv" "$CONFIG_FILE")
   [[ -n $row ]] || { warn "没有可删除的域名分流规则。"; return 0; }
   while IFS=$'\t' read -r selected_match selected_domain selected_outbound; do
     [[ -n $selected_domain ]] || continue
