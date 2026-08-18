@@ -195,6 +195,13 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   legend_middle_line=$(grep -nF 'middle-legend.test' <<<"$legend_listing" | cut -d: -f1)
   legend_zeta_line=$(grep -nF 'zeta-legend.test' <<<"$legend_listing" | cut -d: -f1)
   ((legend_alpha_line < legend_middle_line && legend_middle_line < legend_zeta_line))
+  delete_domain_rule legend-test <<< '1'
+  jq -e '
+    [.route.rules[] | select(.inbound==["legend-test"])] |
+    all(.[]; (.domain_suffix // []) != ["alpha-legend.test"]) and
+    any(.[]; .domain_suffix==["middle-legend.test"]) and
+    any(.[]; .domain_suffix==["zeta-legend.test"])
+  ' "$CONFIG_FILE" >/dev/null
 
   add_domain_rule in-test suffix zeta-sort.test socks-A >/dev/null
   add_domain_rule in-test suffix alpha-sort.test socks-A >/dev/null
