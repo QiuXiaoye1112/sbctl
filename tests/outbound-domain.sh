@@ -175,9 +175,11 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
 
   add_domain_rule compact-test suffix zeta-compact.test socks-A >/dev/null
   add_domain_rule compact-test suffix alpha-compact.test socks-A >/dev/null
+  add_domain_rule compact-test suffix very-long-domain-name-for-display.test socks-A >/dev/null
   compact_listing=$(list_domain_rules compact-test)
   grep -Fq '入站：compact-test' <<<"$compact_listing"
   grep -Fq '子域名 → socks-A' <<<"$compact_listing"
+  grep -Fq 'very-long-domain-name-for-display.test' <<<"$compact_listing"
   compact_menu_listing=$(list_domain_rules compact-test --menu)
   ! grep -Fq '入站：compact-test' <<<"$compact_menu_listing"
   grep -Fq '子域名 → socks-A' <<<"$compact_menu_listing"
