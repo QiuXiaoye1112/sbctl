@@ -178,6 +178,9 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   compact_listing=$(list_domain_rules compact-test)
   grep -Fq '入站：compact-test' <<<"$compact_listing"
   grep -Fq '子域名 → socks-A' <<<"$compact_listing"
+  compact_menu_listing=$(list_domain_rules compact-test --menu)
+  ! grep -Fq '入站：compact-test' <<<"$compact_menu_listing"
+  grep -Fq '子域名 → socks-A' <<<"$compact_menu_listing"
   [[ $(grep -Fc '子域名' <<<"$compact_listing") == 1 ]]
   [[ $(grep -Fc 'socks-A' <<<"$compact_listing") == 1 ]]
   compact_alpha_line=$(grep -nF 'alpha-compact.test' <<<"$compact_listing" | cut -d: -f1)

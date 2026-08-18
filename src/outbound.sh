@@ -385,7 +385,7 @@ _normalize_domain_list() {
 # Pure display — only sbctl's strict canonical domain rules are shown.
 list_domain_rules() {
   ensure_dependencies outbound-rule-list; ensure_config
-  local inbound=${1-} row group_inbound="" number=0 match domain outbound group_start display match_label
+  local inbound=${1-} context=${2-} row group_inbound="" number=0 match domain outbound group_start display match_label
   [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
   row=$(jq -r --arg inbound "$inbound" "$(_sbctl_managed_domain_rule_filter)
     ([.route.rules[]? |
@@ -412,7 +412,7 @@ list_domain_rules() {
     if [[ $inbound != "$group_inbound" ]]; then
       group_inbound=$inbound
       number=0
-      printf '\n%s入站：%s%s\n' "$C_BOLD$C_CYAN" "$group_inbound" "$C_RESET"
+      [[ $context == --menu ]] || printf '\n%s入站：%s%s\n' "$C_BOLD$C_CYAN" "$group_inbound" "$C_RESET"
     fi
     if [[ $group_start == first ]]; then
       [[ $match == suffix ]] && match_label="子域名" || match_label="精确"
