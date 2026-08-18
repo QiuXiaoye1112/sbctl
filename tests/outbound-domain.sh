@@ -171,6 +171,31 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   grep -Fq 'ipv6.test.com' <<<"$listing"
   grep -Fq '2001:db8::1234' <<<"$listing"
 
+  add_domain_rule in-test suffix zeta-sort.test socks-A >/dev/null
+  add_domain_rule in-test suffix alpha-sort.test socks-A >/dev/null
+  add_domain_rule in-test suffix middle-sort.test socks-A >/dev/null
+  route_order_before=$(jq -c '
+    [.route.rules[] |
+      select(.inbound==["in-test"] and
+        (.domain_suffix[0] | IN("zeta-sort.test", "alpha-sort.test", "middle-sort.test"))) |
+      .domain_suffix[0]]
+  ' "$CONFIG_FILE")
+  before=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
+  listing=$(list_domain_rules in-test)
+  after=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
+  [[ $before == "$after" ]]
+  route_order_after=$(jq -c '
+    [.route.rules[] |
+      select(.inbound==["in-test"] and
+        (.domain_suffix[0] | IN("zeta-sort.test", "alpha-sort.test", "middle-sort.test"))) |
+      .domain_suffix[0]]
+  ' "$CONFIG_FILE")
+  [[ $route_order_before == "$route_order_after" ]]
+  alpha_line=$(grep -nF 'alpha-sort.test' <<<"$listing" | cut -d: -f1)
+  middle_line=$(grep -nF 'middle-sort.test' <<<"$listing" | cut -d: -f1)
+  zeta_line=$(grep -nF 'zeta-sort.test' <<<"$listing" | cut -d: -f1)
+  ((alpha_line < middle_line && middle_line < zeta_line))
+
   local_v4_tag=$(_ensure_local_outbound 192.0.2.123)
   jq -e --arg tag "$local_v4_tag" '.outbounds | any(.[]; .tag==$tag and .type=="direct" and .inet4_bind_address=="192.0.2.123" and .domain_resolver=={"server":"sbctl-local-dns","strategy":"ipv4_only"})' "$CONFIG_FILE" >/dev/null
 
