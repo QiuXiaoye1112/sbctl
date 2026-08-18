@@ -385,8 +385,7 @@ _normalize_domain_list() {
 # Pure display — only sbctl's strict canonical domain rules are shown.
 list_domain_rules() {
   ensure_dependencies outbound-rule-list; ensure_config
-  local inbound=${1-} row group_inbound="" number=0 match domain outbound display match_label
-  local match_count outbound_count show_match show_outbound
+  local inbound=${1-} row group_inbound="" number=0 match domain outbound group_start display match_label
   [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
   row=$(jq -r --arg inbound "$inbound" "$(_sbctl_managed_domain_rule_filter)
     ([.route.rules[]? |
@@ -400,40 +399,29 @@ list_domain_rules() {
     select(\$inbound==\"\" or \$group==\$inbound) |
     (\$rows |
       map(select(.[0]==\$group)) |
-      sort_by([(.[2] | ascii_downcase), .[2], (if .[1]==\"exact\" then 0 else 1 end)])
-    ) as \$group_rows |
-    (\$group_rows | map(.[1]) | unique | length) as \$match_count |
-    (\$group_rows | map(.[3]) | unique | length) as \$outbound_count |
-    \$group_rows[] + [\$match_count,\$outbound_count] | @tsv" "$CONFIG_FILE")
+      sort_by([(if .[1]==\"suffix\" then 0 else 1 end), .[3]]) |
+      group_by([.[1], .[3]])[] |
+      sort_by([(.[2] | ascii_downcase), .[2]]) |
+      to_entries[] |
+      .value + [(if .key==0 then \"first\" else \"\" end)]
+    ) | @tsv" "$CONFIG_FILE")
   heading "域名分流规则"
   [[ -n $row ]] || { info "还没有域名分流规则。"; return 0; }
-  while IFS=$'\t' read -r inbound match domain outbound match_count outbound_count; do
+  while IFS=$'\t' read -r inbound match domain outbound group_start; do
     [[ -n $inbound ]] || continue
     if [[ $inbound != "$group_inbound" ]]; then
       group_inbound=$inbound
       number=0
       printf '\n入站：%s\n' "$group_inbound"
+    fi
+    if [[ $group_start == first ]]; then
       [[ $match == suffix ]] && match_label="子域名" || match_label="精确"
       display=$(_outbound_display_name "$outbound")
-      ((match_count == 1)) && show_match=0 || show_match=1
-      ((outbound_count == 1)) && show_outbound=0 || show_outbound=1
-      ((show_match)) || printf '匹配：%s\n' "$match_label"
-      ((show_outbound)) || printf '出站：%s\n' "$display"
-      print_table_cell "序号" 6; printf '| '
-      if ((show_match)); then print_table_cell "匹配" 7; printf '| '; fi
-      print_table_cell_clipped "域名" 24
-      if ((show_outbound)); then printf '| 出站'; fi
-      printf '\n'
+      printf '\n%s → %s\n' "$match_label" "$display"
     fi
     ((number+=1))
-    [[ $match == suffix ]] && match_label="子域名" || match_label="精确"
-    print_table_cell "$number" 6; printf '| '
-    if ((show_match)); then print_table_cell "$match_label" 7; printf '| '; fi
+    print_table_cell "$number" 4; printf '  '
     print_table_cell_clipped "$domain" 24
-    if ((show_outbound)); then
-      display=$(_outbound_display_name "$outbound")
-      printf '| %s' "$display"
-    fi
     printf '\n'
   done <<<"$row"
 }
