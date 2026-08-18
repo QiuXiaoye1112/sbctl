@@ -412,12 +412,14 @@ list_domain_rules() {
     if [[ $inbound != "$group_inbound" ]]; then
       group_inbound=$inbound
       number=0
-      printf '\n入站：%s\n' "$group_inbound"
+      printf '\n%s入站：%s%s\n' "$C_BOLD$C_CYAN" "$group_inbound" "$C_RESET"
     fi
     if [[ $group_start == first ]]; then
       [[ $match == suffix ]] && match_label="子域名" || match_label="精确"
       display=$(_outbound_display_name "$outbound")
-      printf '\n%s → %s\n' "$match_label" "$display"
+      printf '\n%s%s%s → %s%s%s\n' \
+        "$C_BOLD$C_CYAN" "$match_label" "$C_RESET" \
+        "$C_BOLD$C_GREEN" "$display" "$C_RESET"
     fi
     ((number+=1))
     print_table_cell "$number" 4; printf '  '
