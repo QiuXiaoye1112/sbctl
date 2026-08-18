@@ -120,7 +120,7 @@ domain_rule_menu() {
   while inbound_exists "$tag"; do
     clear_screen
     heading "域名分流 · ${tag}"
-    list_domain_rules "$tag"
+    list_domain_rules "$tag" --menu
     printf '\n1) 添加规则\n2) 删除规则\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
