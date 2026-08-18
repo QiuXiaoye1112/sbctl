@@ -2654,11 +2654,14 @@ assign_outbound() {
 
 add_domain_rule() {
   ensure_dependencies outbound-rule-add; require_supported_core; ensure_config
-  local inbound=${1-} match=${2-} domain=${3-} outbound=${4-} choice tmp
+  local inbound=${1-} match=${2-} domain=${3-} outbound=${4-} prompt_details=${5-} choice tmp
   local normalized_domains normalized_domains_json domain_summary domain_count
-  local interactive=0
-  [[ -n $inbound || -n $match || -n $domain || -n $outbound ]] && interactive=1
-  if ((interactive)); then
+  local cli=0
+  if [[ $prompt_details == --prompt ]]; then
+    [[ -n $inbound && -z $match && -z $domain && -z $outbound ]] || die "内部调用参数无效。"
+    inbound_exists "$inbound" || die "找不到入站：$inbound"
+  elif [[ -n $inbound || -n $match || -n $domain || -n $outbound ]]; then
+    cli=1
     [[ -n $inbound && -n $match && -n $domain && -n $outbound ]] || \
       die "用法：sbctl outbound rule add [入站] [suffix|exact] [域名] [出站]"
     inbound_exists "$inbound" || die "找不到入站：$inbound"
@@ -2669,6 +2672,8 @@ add_domain_rule() {
     [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
   else
     select_inbound inbound || return 0
+  fi
+  if ((cli == 0)); then
     choose choice "匹配方式" "域名及所有子域名" "仅精确域名" || return 0
     [[ $choice == 1 ]] && match=suffix || match=exact
     while true; do
@@ -2678,7 +2683,7 @@ add_domain_rule() {
     select_outbound outbound 1 || return 0
   fi
 
-  if ((interactive)); then
+  if ((cli)); then
     normalized_domains=$(_normalize_domain_list "$domain") || die "域名列表无效。"
   fi
   normalized_domains_json=$(printf '%s\n' "$normalized_domains" | jq -Rsc 'split("\n") | map(select(length > 0))')
@@ -4654,16 +4659,17 @@ client_menu() {
 
 domain_rule_menu() {
   ensure_config  # once at entry
-  local choice
-  while true; do
+  local tag choice
+  select_inbound tag || return 0
+  while inbound_exists "$tag"; do
     clear_screen
-    heading "域名分流"
-    list_domain_rules
+    heading "域名分流 · ${tag}"
+    list_domain_rules "$tag"
     printf '\n1) 添加规则\n2) 删除规则\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
-      1) run_menu_action add_domain_rule; pause;;
-      2) run_menu_action delete_domain_rule; pause;;
+      1) run_menu_action add_domain_rule "$tag" "" "" "" --prompt; pause;;
+      2) run_menu_action delete_domain_rule "$tag"; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac

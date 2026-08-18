@@ -184,6 +184,17 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   compact_zeta_line=$(grep -nF 'zeta-compact.test' <<<"$compact_listing" | cut -d: -f1)
   ((compact_alpha_line < compact_zeta_line))
 
+  # The domain-routing menu has already selected its inbound. Its add action
+  # must keep that scope rather than prompting for another inbound.
+  (
+    select_inbound() { return 1; }
+    choose() { printf -v "$1" '%s' 1; }
+    prompt_value() { printf -v "$1" '%s' menu-scoped.test; }
+    select_outbound() { printf -v "$1" '%s' direct; }
+    add_domain_rule compact-test "" "" "" --prompt
+  )
+  jq -e '.route.rules | any(.[]; .inbound==["compact-test"] and .domain_suffix==["menu-scoped.test"] and .outbound=="direct")' "$CONFIG_FILE" >/dev/null
+
   add_domain_rule legend-test suffix zeta-legend.test socks-A >/dev/null
   add_domain_rule legend-test suffix alpha-legend.test direct >/dev/null
   add_domain_rule legend-test suffix middle-legend.test socks-A >/dev/null
