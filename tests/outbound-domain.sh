@@ -38,7 +38,8 @@ write_default_config
     {type:\"socks\",tag:\"tail-test\",listen:\"127.0.0.1\",listen_port:18084,users:[]},
     {type:\"socks\",tag:\"tail-test-2\",listen:\"127.0.0.1\",listen_port:18085,users:[]},
     {type:\"socks\",tag:\"dual-test\",listen:\"127.0.0.1\",listen_port:18086,users:[]},
-    {type:\"socks\",tag:\"dual-test-2\",listen:\"127.0.0.1\",listen_port:18087,users:[]}
+    {type:\"socks\",tag:\"dual-test-2\",listen:\"127.0.0.1\",listen_port:18087,users:[]},
+    {type:\"socks\",tag:\"compact-test\",listen:\"127.0.0.1\",listen_port:18088,users:[]}
   ] | .outbounds += [
     {type:\"socks\",tag:\"socks-A\",server:\"127.0.0.1\",server_port:1080,version:\"5\"},
     {type:\"socks\",tag:\"socks-B\",server:\"127.0.0.1\",server_port:1081,version:\"5\"},
@@ -170,6 +171,19 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   grep -Fq '序号  | 匹配   | 域名' <<<"$listing"
   grep -Fq 'ipv6.test.com' <<<"$listing"
   grep -Fq '2001:db8::1234' <<<"$listing"
+
+  add_domain_rule compact-test suffix zeta-compact.test socks-A >/dev/null
+  add_domain_rule compact-test suffix alpha-compact.test socks-A >/dev/null
+  compact_listing=$(list_domain_rules compact-test)
+  grep -Fq '入站：compact-test' <<<"$compact_listing"
+  grep -Fq '匹配：子域名' <<<"$compact_listing"
+  grep -Fq '出站：socks-A' <<<"$compact_listing"
+  grep -Fq '序号  | 域名' <<<"$compact_listing"
+  [[ $(grep -Fc '子域名' <<<"$compact_listing") == 1 ]]
+  [[ $(grep -Fc 'socks-A' <<<"$compact_listing") == 1 ]]
+  compact_alpha_line=$(grep -nF 'alpha-compact.test' <<<"$compact_listing" | cut -d: -f1)
+  compact_zeta_line=$(grep -nF 'zeta-compact.test' <<<"$compact_listing" | cut -d: -f1)
+  ((compact_alpha_line < compact_zeta_line))
 
   add_domain_rule in-test suffix zeta-sort.test socks-A >/dev/null
   add_domain_rule in-test suffix alpha-sort.test socks-A >/dev/null
