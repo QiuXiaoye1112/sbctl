@@ -116,7 +116,7 @@ client_menu() {
 domain_rule_menu() {
   ensure_config  # once at entry
   local tag choice
-  select_inbound tag || return 0
+  select_inbound tag || { pause; return 0; }
   while inbound_exists "$tag"; do
     clear_screen
     heading "域名分流 · ${tag}"
