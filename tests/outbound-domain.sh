@@ -28,6 +28,22 @@ SBCTL_LOCK_FILE="$CASE/lock" \
 export PATH SBCTL_TESTING SBCTL_SING_BOX_BIN SBCTL_CONFIG_DIR SBCTL_CONFIG_FILE SBCTL_META_FILE SBCTL_CERT_DIR SBCTL_LOCK_FILE
 source ./sbctl.sh
 trap - ERR
+
+# Domain-routing entry must keep the empty-inbound warning visible instead of
+# immediately redrawing the parent menu over it.
+(
+  empty_config=$(temp_file)
+  pause_marker=$(temp_file)
+  jq -n '{inbounds:[],outbounds:[{type:"direct",tag:"direct"}],route:{rules:[],final:"direct"}}' >"$empty_config"
+  CONFIG_FILE=$empty_config
+  ensure_config() { :; }
+  pause() { : >"$pause_marker"; }
+  output=$(domain_rule_menu 2>&1)
+  grep -Fq '没有可选入站。' <<<"$output"
+  [[ -f $pause_marker ]]
+  rm -f "$empty_config" "$pause_marker"
+)
+
 write_default_config
   tmp=$(temp_file)
   jq ".inbounds += [
