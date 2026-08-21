@@ -79,4 +79,5 @@ jobs:
             bash tests/lifecycle.sh
             bash tests/cloudflare.sh
             bash tests/maturity.sh
+            bash tests/alpine-release-real.sh
           '
