@@ -113,6 +113,51 @@ if detect_sing_box_arch riscv64 >/dev/null 2>&1; then fail 'unsupported architec
   [[ -n $(jq -r '.managedResources.singBoxBinarySHA256' "$META_FILE") ]]
 )
 
+# If Alpine later gains the APK, a still-matching managed Release binary is
+# removed before switching metadata so it cannot shadow the package binary.
+(
+  case_dir="$TEST_ROOT/release-to-apk"
+  mkdir -p "$case_dir/bin"
+  META_FILE="$case_dir/meta.json"
+  CERT_DIR="$case_dir/certs"
+  managed_binary="$case_dir/bin/sing-box"
+  APK_LOG="$case_dir/apk.log"
+  CURL_LOG="$case_dir/curl.log"
+  APK_FAIL=0
+  : >"$APK_LOG"
+  : >"$CURL_LOG"
+  printf 'managed-release\n' >"$managed_binary"
+  managed_sha=$(_sing_box_binary_sha256 "$managed_binary")
+  _record_sing_box_install release "$managed_binary" "$managed_sha"
+  install_sing_box_alpine
+  [[ ! -e $managed_binary ]]
+  [[ $(jq -r '.managedResources.singBoxInstallSource' "$META_FILE") == apk ]]
+  [[ -z $(jq -r '.managedResources.singBoxBinaryPath // empty' "$META_FILE") ]]
+)
+
+# A user-modified Release binary is preserved instead of being silently
+# reclassified as APK-managed.
+(
+  case_dir="$TEST_ROOT/release-to-apk-preserve"
+  mkdir -p "$case_dir/bin"
+  META_FILE="$case_dir/meta.json"
+  CERT_DIR="$case_dir/certs"
+  managed_binary="$case_dir/bin/sing-box"
+  APK_LOG="$case_dir/apk.log"
+  CURL_LOG="$case_dir/curl.log"
+  APK_FAIL=0
+  : >"$APK_LOG"
+  : >"$CURL_LOG"
+  printf 'managed-release\n' >"$managed_binary"
+  managed_sha=$(_sing_box_binary_sha256 "$managed_binary")
+  _record_sing_box_install release "$managed_binary" "$managed_sha"
+  printf 'user-replacement\n' >"$managed_binary"
+  if install_sing_box_alpine >/dev/null 2>&1; then fail 'modified Release binary was reclassified as APK-managed'; fi
+  [[ $(<"$managed_binary") == user-replacement ]]
+  [[ $(jq -r '.managedResources.singBoxInstallSource' "$META_FILE") == apk ]]
+  [[ $(jq -r '.managedResources.singBoxBinaryPath' "$META_FILE") == "$managed_binary" ]]
+)
+
 # Explicit versions keep working through the Release fallback.
 (
   case_dir="$TEST_ROOT/release-version"
