@@ -58,8 +58,11 @@ SBCTL_LOCK_FILE="$INSTALL_CASE/lock" \
 bash -c '
   set -Eeuo pipefail
   source ./sbctl.sh
-  pkg_manager(){ printf apk; }
-  apk(){ :; }
+  install_sing_box_release(){
+    write_default_config
+    create_service_definition
+    install_quick_command
+  }
   install_or_update_sing_box
   [[ -x $QUICK_COMMAND ]]
   [[ -L $QUICK_SYMLINK ]]

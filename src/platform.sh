@@ -53,16 +53,15 @@ pkg_manager() {
   printf '%s' "$result"
 }
 
-# Cached sing-box binary path
+# The managed core always lives at the fixed release install path. A test-only
+# override is retained for the portable suite; production must never follow an
+# arbitrary `sing-box` found through PATH.
 refresh_binary_path() {
   if [[ -n ${SBCTL_SING_BOX_BIN:-} ]]; then
     SING_BOX_BIN=$SBCTL_SING_BOX_BIN
     return
   fi
-  local cached
-  cached=$(_sbc_cached _sbc_sing_box_bin) && { SING_BOX_BIN=$cached; return; }
-  SING_BOX_BIN=$(command -v sing-box 2>/dev/null || printf '%s' "$SING_BOX_BIN")
-  _sbc_cache _sbc_sing_box_bin "$SING_BOX_BIN"
+  SING_BOX_BIN=$SING_BOX_RELEASE_INSTALL_PATH
 }
 
 # Cached sing-box version — survives $(...) calls
@@ -79,8 +78,7 @@ sing_box_version() {
 
 sing_box_installed() {
   refresh_binary_path
-  [[ -x $SING_BOX_BIN ]] && return 0
-  [[ -z ${SBCTL_SING_BOX_BIN:-} ]] && command_exists sing-box
+  [[ -x $SING_BOX_BIN ]]
 }
 
 # ---- service state: single systemctl show, pure-bash parsing ----
@@ -305,6 +303,6 @@ install_packages() {
 ensure_dependencies() {
   require_root "$@"
   local missing=() c
-  for c in curl jq openssl; do command_exists "$c" || missing+=("$c"); done
+  for c in curl jq openssl tar gzip; do command_exists "$c" || missing+=("$c"); done
   ((${#missing[@]} == 0)) || install_packages "${missing[@]}"
 }

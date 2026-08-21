@@ -16,7 +16,18 @@ export SBCTL_CERT_DIR="$TEST_ROOT/config/certs"
 export SBCTL_SING_BOX_RELEASE_INSTALL_PATH="$TEST_ROOT/bin/sing-box"
 
 source ./sbctl.sh
-install_sing_box_release_binary "$version"
+SERVICE_ACTIVE=0
+find_external_sing_box() { :; }
+service_exists() { return 1; }
+service_is_active() { ((SERVICE_ACTIVE == 1)); }
+service_enable() { :; }
+service_start() { SERVICE_ACTIVE=1; }
+service_restart() { SERVICE_ACTIVE=1; }
+service_stop() { SERVICE_ACTIVE=0; }
+create_service_definition() { :; }
+install_quick_command() { :; }
+_remove_sbctl_service_definition() { :; }
+install_sing_box_release "$version"
 "$SBCTL_SING_BOX_RELEASE_INSTALL_PATH" version | grep -F "sing-box version ${version}"
 
 printf 'real Alpine sing-box %s release check passed.\n' "$version"

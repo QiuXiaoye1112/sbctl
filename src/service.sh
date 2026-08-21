@@ -168,23 +168,25 @@ _sing_box_binary_sha256() {
 detect_sing_box_arch() {
   local machine=${1:-$(uname -m)}
   case $machine in
-    x86_64) printf 'amd64' ;;
-    aarch64) printf 'arm64' ;;
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
     armv7l) printf 'armv7' ;;
-    i386|i686) printf '386' ;;
+    armv6l) printf 'armv6' ;;
+    i386|i486|i586|i686) printf '386' ;;
     s390x) printf 's390x' ;;
+    riscv64) printf 'riscv64' ;;
     *) error "不支持的 sing-box Release 架构：${machine}"; return 1 ;;
   esac
 }
 
 sing_box_release_platform() {
   local version=$1 arch=$2
-  # sing-box 1.13.3 introduced dedicated musl archives for these Alpine
-  # architectures. The generic 1.13.x archive can require libcronet.so, so
-  # installing only its binary makes even `sing-box version` fail on Alpine.
+  # Modern generic archives can depend on a companion libcronet.so. Prefer
+  # the official static musl build where it exists so the managed core remains
+  # a single, portable binary on every distribution.
   if version_ge "$version" 1.13.3; then
     case $arch in
-      amd64|arm64|armv7|386) printf 'linux-%s-musl' "$arch"; return 0 ;;
+      amd64|arm64|armv7|386|riscv64) printf 'linux-%s-musl' "$arch"; return 0 ;;
     esac
   fi
   printf 'linux-%s' "$arch"
@@ -211,154 +213,225 @@ resolve_sing_box_version() {
 }
 
 _record_sing_box_install() {
-  local source=$1 binary_path=${2-} binary_sha256=${3-} tmp
+  local version=$1 arch=$2 binary_sha256=$3 platform=${4-} tmp
   init_meta
   tmp=$(temp_file)
-  jq --arg source "$source" --arg path "$binary_path" --arg sha256 "$binary_sha256" '
-    .managedResources.singBoxInstallSource=$source |
-    if $source=="release" or $path!="" then
-      .managedResources.singBoxBinaryPath=$path |
-      .managedResources.singBoxBinarySHA256=$sha256
-    else
-      del(.managedResources.singBoxBinaryPath,.managedResources.singBoxBinarySHA256)
-    end
+  jq --arg version "$version" --arg arch "$arch" --arg binary "$SING_BOX_RELEASE_INSTALL_PATH" \
+    --arg sha256 "$binary_sha256" --arg platform "$platform" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
+    .singBox={
+      managed:true,
+      source:"official-release",
+      version:$version,
+      arch:$arch,
+      binary:$binary,
+      sha256:$sha256,
+      platform:$platform,
+      updatedAt:$now
+    } |
+    del(.managedResources.singBoxInstallSource,
+        .managedResources.singBoxBinaryPath,
+        .managedResources.singBoxBinarySHA256)
   ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
   install -m 600 "$tmp" "$META_FILE"
   rm -f "$tmp"
 }
 
-_remove_previous_managed_release_for_apk() {
-  local source path expected_sha256 actual_sha256
-  source=$(meta_resource_get singBoxInstallSource 2>/dev/null || true)
-  [[ $source == release ]] || return 0
-  path=$(meta_resource_get singBoxBinaryPath 2>/dev/null || true)
-  expected_sha256=$(meta_resource_get singBoxBinarySHA256 2>/dev/null || true)
-  [[ -n $path && $path == /* && ${path##*/} == sing-box ]] || {
-    error "旧 sing-box Release metadata 路径无效，不能安全切换到 APK。"
-    return 1
-  }
-  [[ -e $path || -L $path ]] || return 0
-  if [[ ! -f $path || -L $path || -z $expected_sha256 ]]; then
-    error "无法确认旧 Release binary 归 sbctl 管理，不能安全切换到 APK：${path}"
-    return 1
-  fi
-  actual_sha256=$(_sing_box_binary_sha256 "$path") || true
-  if [[ -z $actual_sha256 || $actual_sha256 != "$expected_sha256" ]]; then
-    error "旧 Release binary 已被修改，已保留且未切换安装来源：${path}"
-    return 1
-  fi
-  rm -f -- "$path"
+_sing_box_meta_get() {
+  local field=$1
+  [[ -f $META_FILE ]] || return 0
+  jq -r --arg field "$field" '.singBox[$field] // empty' "$META_FILE" 2>/dev/null
 }
 
-install_sing_box_release_binary() {
-  local requested=${1-} version arch platform archive_name archive_url work_dir archive member candidate
-  local candidate_output candidate_status=0 candidate_version candidate_sha256 target target_dir staged=""
-
-  version=$(resolve_sing_box_version "$requested") || return 1
+_migrate_legacy_release_metadata() {
+  [[ -f $META_FILE ]] || return 1
+  [[ $(_sing_box_meta_get managed) == true ]] && return 0
+  local source path expected_sha256 actual_sha256 version arch
+  source=$(jq -r '.managedResources.singBoxInstallSource // empty' "$META_FILE" 2>/dev/null)
+  path=$(jq -r '.managedResources.singBoxBinaryPath // empty' "$META_FILE" 2>/dev/null)
+  expected_sha256=$(jq -r '.managedResources.singBoxBinarySHA256 // empty' "$META_FILE" 2>/dev/null)
+  [[ $source == release && $path == "$SING_BOX_RELEASE_INSTALL_PATH" && -f $path && ! -L $path && -n $expected_sha256 ]] || return 1
+  actual_sha256=$(_sing_box_binary_sha256 "$path") || return 1
+  [[ $actual_sha256 == "$expected_sha256" ]] || return 1
+  version=$(_sing_box_binary_version "$path") || return 1
   arch=$(detect_sing_box_arch) || return 1
-  platform=$(sing_box_release_platform "$version" "$arch")
-  target=$SING_BOX_RELEASE_INSTALL_PATH
-  [[ $target == /* && ${target##*/} == sing-box && ! -d $target ]] || {
-    error "不安全的 sing-box Release 安装路径：${target}"
-    return 1
-  }
-  command_exists tar || { error "缺少 tar，无法解压 sing-box Release。"; return 1; }
+  _record_sing_box_install "$version" "$arch" "$actual_sha256" legacy-release
+}
 
-  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-sing-box.XXXXXX") || {
-    error "无法创建 sing-box Release 临时目录。"
+_sing_box_target_is_managed() {
+  [[ $(_sing_box_meta_get managed) == true ]] || _migrate_legacy_release_metadata || return 1
+  [[ $(_sing_box_meta_get source) == official-release ]] || return 1
+  [[ $(_sing_box_meta_get binary) == "$SING_BOX_RELEASE_INSTALL_PATH" ]] || return 1
+}
+
+find_external_sing_box() {
+  command -v sing-box 2>/dev/null || true
+}
+
+ensure_sing_box_install_target_safe() {
+  local target=$SING_BOX_RELEASE_INSTALL_PATH expected actual external
+  [[ $target == /usr/local/bin/sing-box || ${SBCTL_TESTING:-0} == 1 ]] || {
+    error "sing-box 受管安装路径必须是 /usr/local/bin/sing-box。"
     return 1
   }
+  [[ ! -d $target && ! -L $target ]] || { error "拒绝覆盖非普通文件：${target}"; return 1; }
+  if [[ -e $target ]]; then
+    _sing_box_target_is_managed || {
+      error "${target} 已存在，但 metadata 无法确认由 sbctl 管理；拒绝覆盖。"
+      return 1
+    }
+    expected=$(_sing_box_meta_get sha256)
+    actual=$(_sing_box_binary_sha256 "$target") || true
+    [[ -n $expected && $actual == "$expected" ]] || {
+      error "${target} 已被修改，与 sbctl metadata 不一致；拒绝覆盖。"
+      return 1
+    }
+    return 0
+  fi
+  external=$(find_external_sing_box)
+  if [[ -n $external && $external != "$target" ]]; then
+    error "检测到外部 sing-box：${external}；请先明确迁移或移除后再由 sbctl 管理。"
+    return 1
+  fi
+}
+
+download_sing_box_release() {
+  local version=$1 arch=$2 work_dir=$3 platform archive_name archive_url archive member
+  platform=$(sing_box_release_platform "$version" "$arch")
   archive_name="sing-box-${version}-${platform}.tar.gz"
   archive_url="${SING_BOX_RELEASE_DOWNLOAD_BASE}/v${version}/${archive_name}"
   archive="${work_dir}/${archive_name}"
   member="sing-box-${version}-${platform}/sing-box"
-
   if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
     --connect-timeout 10 --max-time 120 "$archive_url" -o "$archive"; then
-    rm -rf -- "$work_dir"
-    error "sing-box 官方 Release 下载失败：${archive_url}"
+    error "sing-box 官方 Release 不存在或下载失败：${archive_url}"
     return 1
   fi
-  if ! tar -xzf "$archive" -C "$work_dir" "$member"; then
-    rm -rf -- "$work_dir"
-    error "sing-box 官方 Release 解压失败。"
+  if ! tar -tzf "$archive" "$member" >/dev/null 2>&1 || ! tar -xzf "$archive" -C "$work_dir" "$member"; then
+    error "sing-box 官方 Release 压缩包损坏或缺少 binary。"
     return 1
   fi
-  candidate="${work_dir}/${member}"
-  if [[ ! -f $candidate || -L $candidate ]]; then
-    rm -rf -- "$work_dir"
-    error "sing-box 官方 Release 缺少有效 binary。"
-    return 1
-  fi
-  chmod 755 "$candidate"
-  if candidate_output=$("$candidate" version 2>&1); then
-    candidate_version=$(printf '%s\n' "$candidate_output" \
-      | sed -n 's/^sing-box version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
-      | head -n 1)
-  else
-    candidate_status=$?
-    candidate_version=""
-  fi
-  if [[ -z $candidate_version || $candidate_version != "$version" ]]; then
-    rm -rf -- "$work_dir"
-    error "sing-box Release binary 版本校验失败（期望 ${version}，实际 ${candidate_version:-无法识别}）。"
-    if ((candidate_status != 0)); then
-      error "候选 binary 无法运行（退出码 ${candidate_status}）：$(printf '%s' "$candidate_output" | head -n 1)"
-    elif [[ -n $candidate_output ]]; then
-      error "候选 binary 输出：$(printf '%s' "$candidate_output" | head -n 1)"
-    fi
-    return 1
-  fi
-  if ! version_ge "$candidate_version" "$SING_BOX_MIN_VERSION"; then
-    rm -rf -- "$work_dir"
-    error "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}，Release ${candidate_version} 不受支持。"
-    return 1
-  fi
-  candidate_sha256=$(_sing_box_binary_sha256 "$candidate") || {
-    rm -rf -- "$work_dir"
-    error "无法计算 sing-box Release binary 校验值。"
-    return 1
-  }
-
-  target_dir=${target%/*}
-  mkdir -p "$target_dir" || { rm -rf -- "$work_dir"; error "无法创建 ${target_dir}。"; return 1; }
-  staged=$(mktemp "${target_dir}/.sing-box.sbctl.XXXXXX") || {
-    rm -rf -- "$work_dir"
-    error "无法在 ${target_dir} 创建安装临时文件。"
-    return 1
-  }
-  if ! install -m 755 "$candidate" "$staged" || ! mv -f -- "$staged" "$target"; then
-    rm -f -- "$staged"
-    rm -rf -- "$work_dir"
-    error "sing-box Release binary 安装失败，原有核心未被替换。"
-    return 1
-  fi
-  rm -rf -- "$work_dir"
-  hash -r 2>/dev/null || true
-  SBCTL_SING_BOX_BIN=$target
-  SING_BOX_BIN=$target
-  _record_sing_box_install release "$target" "$candidate_sha256" || {
-    error "sing-box 已安装，但安装来源 metadata 写入失败。"
-    return 1
-  }
-  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（${platform}）。"
+  SING_BOX_DOWNLOADED_BINARY="${work_dir}/${member}"
+  SING_BOX_DOWNLOADED_PLATFORM=$platform
 }
 
-install_sing_box_alpine() {
-  local version=${1-} previous_path previous_sha256
-  if run_bounded 180 apk add --no-cache --upgrade sing-box; then
-    if ! _remove_previous_managed_release_for_apk; then
-      previous_path=$(meta_resource_get singBoxBinaryPath 2>/dev/null || true)
-      previous_sha256=$(meta_resource_get singBoxBinarySHA256 2>/dev/null || true)
-      _record_sing_box_install apk "$previous_path" "$previous_sha256" || true
-      return 1
-    fi
-    _record_sing_box_install apk
-    info "已通过 Alpine APK 安装/更新 sing-box。"
-    return 0
+verify_sing_box_binary() {
+  local candidate=$1 expected_version=$2 output status=0 actual_version
+  [[ -f $candidate && ! -L $candidate ]] || { error "sing-box Release 候选 binary 无效。"; return 1; }
+  chmod 755 "$candidate" || return 1
+  if output=$("$candidate" version 2>&1); then :; else status=$?; fi
+  actual_version=$(printf '%s\n' "$output" \
+    | sed -n 's/^sing-box version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+    | head -n 1)
+  if ((status != 0)) || [[ -z $actual_version || $actual_version != "$expected_version" ]]; then
+    error "sing-box Release binary 校验失败（期望 ${expected_version}，实际 ${actual_version:-无法识别}，退出码 ${status}）。"
+    [[ -z $output ]] || error "候选 binary 输出：$(printf '%s' "$output" | head -n 1)"
+    return 1
   fi
-  info "Alpine 当前软件源未提供 sing-box，自动使用 SagerNet 官方兼容版本。"
-  install_sing_box_release_binary "$version"
+  version_ge "$actual_version" "$SING_BOX_MIN_VERSION" || {
+    error "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}，当前候选版本为 ${actual_version}。"
+    return 1
+  }
+  SING_BOX_VERIFIED_VERSION=$actual_version
+  SING_BOX_VERIFIED_SHA256=$(_sing_box_binary_sha256 "$candidate") || return 1
+}
+
+rollback_sing_box_binary() {
+  local target=$1 backup=${2-} had_old=${3:-0} staged
+  if ((had_old)); then
+    [[ -f $backup ]] || { error "旧 sing-box binary 备份丢失，无法回滚。"; return 1; }
+    staged=$(mktemp "${target%/*}/.sing-box.rollback.XXXXXX") || return 1
+    install -m 755 "$backup" "$staged" && mv -f -- "$staged" "$target" || { rm -f -- "$staged"; return 1; }
+  else
+    rm -f -- "$target"
+  fi
+  sbc_invalidate_install_cache
+  refresh_binary_path
+}
+
+wait_for_sing_box_service() {
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    service_is_active && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+install_sing_box_release() {
+  local requested=${1-} version arch work_dir target target_dir candidate staged backup="" meta_snapshot config_snapshot
+  local service_definition="" service_snapshot=""
+  local had_old=0 had_meta=0 had_config=0 old_service_exists=0 old_active=0 old_enabled=0 had_service_definition=0 failed=0
+
+  ensure_sing_box_install_target_safe || return 1
+  version=$(resolve_sing_box_version "$requested") || return 1
+  arch=$(detect_sing_box_arch) || return 1
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-sing-box.XXXXXX") || { error "无法创建 sing-box 临时目录。"; return 1; }
+  SING_BOX_DOWNLOADED_BINARY=""; SING_BOX_DOWNLOADED_PLATFORM=""
+  if ! download_sing_box_release "$version" "$arch" "$work_dir"; then rm -rf -- "$work_dir"; return 1; fi
+  candidate=$SING_BOX_DOWNLOADED_BINARY
+  if ! verify_sing_box_binary "$candidate" "$version"; then rm -rf -- "$work_dir"; return 1; fi
+  if [[ -f $CONFIG_FILE ]] && ! "$candidate" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    rm -rf -- "$work_dir"; error "新 sing-box 核心无法通过当前配置检查，未替换旧核心。"; return 1
+  fi
+
+  target=$SING_BOX_RELEASE_INSTALL_PATH; target_dir=${target%/*}
+  mkdir -p "$target_dir" || { rm -rf -- "$work_dir"; return 1; }
+  if [[ -f $target ]]; then
+    had_old=1; backup=$(mktemp "${target_dir}/.sing-box.backup.XXXXXX") || { rm -rf -- "$work_dir"; return 1; }
+    cp -p "$target" "$backup" || { rm -f -- "$backup"; rm -rf -- "$work_dir"; return 1; }
+  fi
+  meta_snapshot=$(temp_file)
+  if [[ -f $META_FILE ]]; then cp -p "$META_FILE" "$meta_snapshot"; had_meta=1; fi
+  config_snapshot=$(temp_file)
+  if [[ -f $CONFIG_FILE ]]; then cp -p "$CONFIG_FILE" "$config_snapshot"; had_config=1; fi
+  service_exists && old_service_exists=1
+  service_is_active && old_active=1
+  service_is_enabled && old_enabled=1
+  case $(init_system) in
+    systemd) service_definition="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" ;;
+    openrc) service_definition="${OPENRC_INIT_DIR}/${SERVICE_NAME}" ;;
+  esac
+  if [[ -n $service_definition && -f $service_definition ]]; then
+    service_snapshot=$(temp_file); cp -p "$service_definition" "$service_snapshot"; had_service_definition=1
+  fi
+
+  staged=$(mktemp "${target_dir}/.sing-box.install.XXXXXX") || failed=1
+  if ((failed == 0)); then install -m 755 "$candidate" "$staged" || failed=1; fi
+  if ((failed == 0)); then mv -f -- "$staged" "$target" || failed=1; fi
+  rm -f -- "$staged" 2>/dev/null || true
+  if ((failed == 0)); then
+    sbc_invalidate_install_cache; refresh_binary_path
+    if ((had_config)); then ensure_config; else write_default_config; fi
+    validate_candidate "$CONFIG_FILE" || failed=1
+  fi
+  if ((failed == 0)); then _record_sing_box_install "$version" "$arch" "$SING_BOX_VERIFIED_SHA256" "$SING_BOX_DOWNLOADED_PLATFORM" || failed=1; fi
+  if ((failed == 0)); then create_service_definition || failed=1; fi
+  if ((failed == 0)); then install_quick_command || failed=1; fi
+  if ((failed == 0)); then service_enable || failed=1; fi
+  if ((failed == 0)); then
+    if ((old_active)); then service_restart || failed=1; else service_start || failed=1; fi
+  fi
+  if ((failed == 0)) && ! wait_for_sing_box_service; then failed=1; fi
+
+  if ((failed)); then
+    error "新 sing-box 核心未能正常接管服务，正在回滚。"
+    rollback_sing_box_binary "$target" "$backup" "$had_old" || error "sing-box binary 自动回滚失败。"
+    if ((had_meta)); then install -m 600 "$meta_snapshot" "$META_FILE"; else rm -f "$META_FILE"; fi
+    if ((had_config)); then install -m 600 "$config_snapshot" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+    if ((had_service_definition)); then
+      cp -p "$service_snapshot" "$service_definition"
+      [[ $(init_system) != systemd ]] || systemctl daemon-reload >/dev/null 2>&1 || true
+    else
+      _remove_sbctl_service_definition
+    fi
+    if ((old_service_exists && old_active)); then service_restart >/dev/null 2>&1 || true; else service_stop >/dev/null 2>&1 || true; fi
+    if ((old_enabled)); then service_enable >/dev/null 2>&1 || true; else service_disable >/dev/null 2>&1 || true; fi
+    rm -f -- "$backup" "$meta_snapshot" "$config_snapshot" "$service_snapshot"; rm -rf -- "$work_dir"
+    return 1
+  fi
+
+  rm -f -- "$backup" "$meta_snapshot" "$config_snapshot" "$service_snapshot"; rm -rf -- "$work_dir"
+  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（${arch}）。"
 }
 
 require_sing_box() { refresh_binary_path; sing_box_installed || die "sing-box 尚未安装，请先运行 sbctl install。"; }
@@ -469,38 +542,7 @@ install_quick_command() {
 
 install_or_update_sing_box() {
   ensure_dependencies install
-  local version=${1-} installer manager had_config=0
-  [[ -f $CONFIG_FILE ]] && had_config=1
-  manager=$(pkg_manager)
-  if [[ $manager == apk ]]; then
-    install_sing_box_alpine "$version" || die "sing-box Alpine 安装与 Release fallback 均失败。"
-  else
-    installer=$(temp_file)
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 \
-      "$OFFICIAL_INSTALLER_URL" -o "$installer" || { rm -f "$installer"; die "sing-box 官方安装器下载失败或超时。"; }
-    chmod 700 "$installer"
-    if [[ -n $version ]]; then
-      TERM=${TERM:-xterm} run_bounded 180 bash "$installer" --version "${version#v}" || { rm -f "$installer"; die "sing-box 安装失败或超时。"; }
-    else
-      TERM=${TERM:-xterm} run_bounded 180 bash "$installer" || { rm -f "$installer"; die "sing-box 安装失败或超时。"; }
-    fi
-    rm -f "$installer"
-  fi
-  # Invalidate caches after install/update
-  sbc_invalidate_install_cache
-  refresh_binary_path
-  sing_box_installed || die "sing-box 安装失败。"
-  require_supported_core
-  if ((had_config)); then
-    ensure_config
-  else
-    write_default_config
-  fi
-  create_service_definition
-  install_quick_command
-  validate_candidate "$CONFIG_FILE"
-  service_enable
-  if ! service_is_active; then service_start; else service_restart; fi
+  install_sing_box_release "${1-}" || die "sing-box 官方 Release 安装/更新失败；原核心与服务已保留。"
   info "sing-box 已就绪：$($SING_BOX_BIN version | sed -n '1p')"
 }
 
