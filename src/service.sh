@@ -153,6 +153,159 @@ version_ge() {
   ((10#$h3 >= 10#$n3))
 }
 
+_sing_box_binary_version() {
+  local binary=$1
+  [[ -x $binary ]] || return 1
+  "$binary" version 2>/dev/null | sed -nE '1s/^sing-box version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p'
+}
+
+_sing_box_binary_sha256() {
+  local binary=$1
+  [[ -f $binary ]] || return 1
+  openssl dgst -sha256 "$binary" 2>/dev/null | awk '{print $NF}'
+}
+
+detect_sing_box_arch() {
+  local machine=${1:-$(uname -m)}
+  case $machine in
+    x86_64) printf 'amd64' ;;
+    aarch64) printf 'arm64' ;;
+    armv7l) printf 'armv7' ;;
+    i386|i686) printf '386' ;;
+    s390x) printf 's390x' ;;
+    *) error "不支持的 sing-box Release 架构：${machine}"; return 1 ;;
+  esac
+}
+
+resolve_sing_box_version() {
+  local requested=${1-} payload resolved
+  if [[ -n $requested ]]; then
+    resolved=${requested#v}
+  else
+    payload=$(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+      --connect-timeout 10 --max-time 60 "$SING_BOX_RELEASE_API") || {
+      error "无法获取 sing-box 最新 stable Release。"
+      return 1
+    }
+    resolved=$(jq -r 'select(.draft==false and .prerelease==false) | .tag_name // empty' <<<"$payload")
+    resolved=${resolved#v}
+  fi
+  [[ $resolved =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    error "无效或非 stable 的 sing-box 版本：${resolved:-未知}"
+    return 1
+  }
+  printf '%s' "$resolved"
+}
+
+_record_sing_box_install() {
+  local source=$1 binary_path=${2-} binary_sha256=${3-} tmp
+  init_meta
+  tmp=$(temp_file)
+  jq --arg source "$source" --arg path "$binary_path" --arg sha256 "$binary_sha256" '
+    .managedResources.singBoxInstallSource=$source |
+    if $source=="release" then
+      .managedResources.singBoxBinaryPath=$path |
+      .managedResources.singBoxBinarySHA256=$sha256
+    else
+      del(.managedResources.singBoxBinaryPath,.managedResources.singBoxBinarySHA256)
+    end
+  ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
+}
+
+install_sing_box_release_binary() {
+  local requested=${1-} version arch archive_name archive_url work_dir archive member candidate
+  local candidate_version candidate_sha256 target target_dir staged=""
+
+  version=$(resolve_sing_box_version "$requested") || return 1
+  arch=$(detect_sing_box_arch) || return 1
+  target=$SING_BOX_RELEASE_INSTALL_PATH
+  [[ $target == /* && ${target##*/} == sing-box && ! -d $target ]] || {
+    error "不安全的 sing-box Release 安装路径：${target}"
+    return 1
+  }
+  command_exists tar || { error "缺少 tar，无法解压 sing-box Release。"; return 1; }
+
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-sing-box.XXXXXX") || {
+    error "无法创建 sing-box Release 临时目录。"
+    return 1
+  }
+  archive_name="sing-box-${version}-linux-${arch}.tar.gz"
+  archive_url="${SING_BOX_RELEASE_DOWNLOAD_BASE}/v${version}/${archive_name}"
+  archive="${work_dir}/${archive_name}"
+  member="sing-box-${version}-linux-${arch}/sing-box"
+
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+    --connect-timeout 10 --max-time 120 "$archive_url" -o "$archive"; then
+    rm -rf -- "$work_dir"
+    error "sing-box 官方 Release 下载失败：${archive_url}"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$work_dir" "$member"; then
+    rm -rf -- "$work_dir"
+    error "sing-box 官方 Release 解压失败。"
+    return 1
+  fi
+  candidate="${work_dir}/${member}"
+  if [[ ! -f $candidate || -L $candidate ]]; then
+    rm -rf -- "$work_dir"
+    error "sing-box 官方 Release 缺少有效 binary。"
+    return 1
+  fi
+  chmod 755 "$candidate"
+  candidate_version=$(_sing_box_binary_version "$candidate") || true
+  if [[ -z $candidate_version || $candidate_version != "$version" ]]; then
+    rm -rf -- "$work_dir"
+    error "sing-box Release binary 版本校验失败（期望 ${version}，实际 ${candidate_version:-无法识别}）。"
+    return 1
+  fi
+  if ! version_ge "$candidate_version" "$SING_BOX_MIN_VERSION"; then
+    rm -rf -- "$work_dir"
+    error "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}，Release ${candidate_version} 不受支持。"
+    return 1
+  fi
+  candidate_sha256=$(_sing_box_binary_sha256 "$candidate") || {
+    rm -rf -- "$work_dir"
+    error "无法计算 sing-box Release binary 校验值。"
+    return 1
+  }
+
+  target_dir=${target%/*}
+  mkdir -p "$target_dir" || { rm -rf -- "$work_dir"; error "无法创建 ${target_dir}。"; return 1; }
+  staged=$(mktemp "${target_dir}/.sing-box.sbctl.XXXXXX") || {
+    rm -rf -- "$work_dir"
+    error "无法在 ${target_dir} 创建安装临时文件。"
+    return 1
+  }
+  if ! install -m 755 "$candidate" "$staged" || ! mv -f -- "$staged" "$target"; then
+    rm -f -- "$staged"
+    rm -rf -- "$work_dir"
+    error "sing-box Release binary 安装失败，原有核心未被替换。"
+    return 1
+  fi
+  rm -rf -- "$work_dir"
+  hash -r 2>/dev/null || true
+  SBCTL_SING_BOX_BIN=$target
+  SING_BOX_BIN=$target
+  _record_sing_box_install release "$target" "$candidate_sha256" || {
+    error "sing-box 已安装，但安装来源 metadata 写入失败。"
+    return 1
+  }
+  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（linux/${arch}）。"
+}
+
+install_sing_box_alpine() {
+  local version=${1-}
+  if run_bounded 180 apk add --no-cache --upgrade sing-box; then
+    _record_sing_box_install apk
+    info "已通过 Alpine APK 安装/更新 sing-box。"
+    return 0
+  fi
+  warn "Alpine 当前软件源无法安装 sing-box，改用 SagerNet 官方 GitHub Release。"
+  install_sing_box_release_binary "$version"
+}
+
 require_sing_box() { refresh_binary_path; sing_box_installed || die "sing-box 尚未安装，请先运行 sbctl install。"; }
 
 require_supported_core() {
@@ -160,7 +313,7 @@ require_supported_core() {
   require_sing_box
   version=$(sing_box_version)
   [[ -n $version ]] || die "无法识别 sing-box 版本。"
-  version_ge "$version" 1.12.0 || die "sbctl 需要 sing-box >= 1.12.0（AnyTLS 从 1.12.0 起支持），当前为 ${version}。"
+  version_ge "$version" "$SING_BOX_MIN_VERSION" || die "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}（AnyTLS 从 1.12.0 起支持），当前为 ${version}。"
 }
 
 restart_service_checked() {
@@ -265,7 +418,7 @@ install_or_update_sing_box() {
   [[ -f $CONFIG_FILE ]] && had_config=1
   manager=$(pkg_manager)
   if [[ $manager == apk ]]; then
-    run_bounded 180 apk add --no-cache --upgrade sing-box || die "sing-box 安装/更新失败或超时。"
+    install_sing_box_alpine "$version" || die "sing-box Alpine 安装与 Release fallback 均失败。"
   else
     installer=$(temp_file)
     curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 \

@@ -16,6 +16,42 @@ _snapshot_meta_cert_list() { jq -r '.certificates // {} | keys[]' "$SNAPSHOT_MET
 _snapshot_meta_cert_get_field() { jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] // empty' "$SNAPSHOT_META" 2>/dev/null; }
 _snapshot_meta_resource_get() { jq -r --arg key "$1" '.managedResources[$key] // empty' "$SNAPSHOT_META" 2>/dev/null; }
 
+_sing_box_install_resource_get() {
+  local key=$1 source_file=""
+  if [[ -n ${SNAPSHOT_META:-} && -f ${SNAPSHOT_META:-} ]]; then source_file=$SNAPSHOT_META
+  elif [[ -f $META_FILE ]]; then source_file=$META_FILE
+  else return 0; fi
+  jq -r --arg key "$key" '.managedResources[$key] // empty' "$source_file" 2>/dev/null
+}
+
+_clear_sing_box_install_metadata() {
+  [[ -f $META_FILE ]] || return 0
+  meta_resource_remove singBoxInstallSource
+  meta_resource_remove singBoxBinaryPath
+  meta_resource_remove singBoxBinarySHA256
+}
+
+_remove_managed_sing_box_release_binary() {
+  local path expected_sha256 actual_sha256
+  path=$(_sing_box_install_resource_get singBoxBinaryPath)
+  expected_sha256=$(_sing_box_install_resource_get singBoxBinarySHA256)
+  [[ -n $path && $path == /* && ${path##*/} == sing-box ]] || {
+    warn "sing-box Release metadata 路径无效，保留现有 binary。"
+    return 1
+  }
+  [[ -e $path || -L $path ]] || return 0
+  if [[ ! -f $path || -L $path || -z $expected_sha256 ]]; then
+    warn "无法确认 ${path} 仍是 sbctl 安装的 binary，已保留。"
+    return 1
+  fi
+  actual_sha256=$(_sing_box_binary_sha256 "$path") || true
+  if [[ -z $actual_sha256 || $actual_sha256 != "$expected_sha256" ]]; then
+    warn "${path} 已被修改，无法确认归 sbctl 管理，已保留。"
+    return 1
+  fi
+  rm -f -- "$path"
+}
+
 _safe_remove_sbctl_dir() {
   local path=$1 key=${2:-} recorded=""
   [[ -n $path && $path == /* ]] || return 1
@@ -90,17 +126,26 @@ _remove_sbctl_service_definition() {
 _remove_sing_box_core() {
   service_stop >/dev/null 2>&1 || true
   service_disable >/dev/null 2>&1 || true
-  local manager
-  manager=$(pkg_manager 2>/dev/null || true)
-  case $manager in
-    apk) apk del sing-box >/dev/null 2>&1 || true;;
-    apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1 || true;;
-    dnf) dnf remove -y sing-box >/dev/null 2>&1 || true;;
-    yum) yum remove -y sing-box >/dev/null 2>&1 || true;;
-    pacman) pacman -Rns --noconfirm sing-box >/dev/null 2>&1 || true;;
-    zypper) zypper --non-interactive remove sing-box >/dev/null 2>&1 || true;;
-  esac
+  local manager install_source rc=0
+  install_source=$(_sing_box_install_resource_get singBoxInstallSource)
+  if [[ $install_source == release ]]; then
+    _remove_managed_sing_box_release_binary || rc=1
+  elif [[ $install_source == apk ]]; then
+    apk del sing-box >/dev/null 2>&1 || true
+  else
+    manager=$(pkg_manager 2>/dev/null || true)
+    case $manager in
+      apk) apk del sing-box >/dev/null 2>&1 || true;;
+      apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1 || true;;
+      dnf) dnf remove -y sing-box >/dev/null 2>&1 || true;;
+      yum) yum remove -y sing-box >/dev/null 2>&1 || true;;
+      pacman) pacman -Rns --noconfirm sing-box >/dev/null 2>&1 || true;;
+      zypper) zypper --non-interactive remove sing-box >/dev/null 2>&1 || true;;
+    esac
+  fi
+  ((rc != 0)) || _clear_sing_box_install_metadata
   _remove_sbctl_service_definition
+  return "$rc"
 }
 
 _remove_quick_command_and_libs() {
@@ -168,7 +213,10 @@ _sbctl_uninstall_level_0() {
     local backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
     backup_all "$backup" >/dev/null 2>&1 && info "卸载前备份：$backup" || warn "卸载前备份失败，仍继续仅卸载核心。"
   fi
-  _remove_sing_box_core
+  if ! _remove_sing_box_core; then
+    warn "sing-box 核心未完全卸载；未确认归 sbctl 管理的 binary 已保留。"
+    return 1
+  fi
   info "sing-box 核心已卸载；配置、证书、sbctl、续期任务和备份已保留。"
   info "需要时运行 sbctl install 可重新安装。"
 }
