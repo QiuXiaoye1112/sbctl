@@ -16,27 +16,32 @@ _snapshot_meta_cert_list() { jq -r '.certificates // {} | keys[]' "$SNAPSHOT_MET
 _snapshot_meta_cert_get_field() { jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] // empty' "$SNAPSHOT_META" 2>/dev/null; }
 _snapshot_meta_resource_get() { jq -r --arg key "$1" '.managedResources[$key] // empty' "$SNAPSHOT_META" 2>/dev/null; }
 
-_sing_box_install_resource_get() {
-  local key=$1 source_file=""
-  if [[ -n ${SNAPSHOT_META:-} && -f ${SNAPSHOT_META:-} ]]; then source_file=$SNAPSHOT_META
-  elif [[ -f $META_FILE ]]; then source_file=$META_FILE
-  else return 0; fi
-  jq -r --arg key "$key" '.managedResources[$key] // empty' "$source_file" 2>/dev/null
-}
-
 _clear_sing_box_install_metadata() {
   [[ -f $META_FILE ]] || return 0
-  meta_resource_remove singBoxInstallSource
-  meta_resource_remove singBoxBinaryPath
-  meta_resource_remove singBoxBinarySHA256
+  local tmp
+  tmp=$(temp_file)
+  jq 'del(.singBox,
+          .managedResources.singBoxInstallSource,
+          .managedResources.singBoxBinaryPath,
+          .managedResources.singBoxBinarySHA256)' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
 }
 
 _remove_managed_sing_box_release_binary() {
   local path expected_sha256 actual_sha256
-  path=$(_sing_box_install_resource_get singBoxBinaryPath)
-  expected_sha256=$(_sing_box_install_resource_get singBoxBinarySHA256)
-  [[ -n $path && $path == /* && ${path##*/} == sing-box ]] || {
-    warn "sing-box Release metadata 路径无效，保留现有 binary。"
+  path=$(_sing_box_meta_get binary)
+  expected_sha256=$(_sing_box_meta_get sha256)
+  [[ $(_sing_box_meta_get managed) == true && $(_sing_box_meta_get source) == official-release ]] || {
+    warn "sing-box metadata 未确认核心归 sbctl 管理，保留现有 binary。"
+    return 1
+  }
+  [[ $path == "$SING_BOX_RELEASE_INSTALL_PATH" ]] || {
+    warn "sing-box metadata 路径无效，保留现有 binary。"
+    return 1
+  }
+  [[ $path == /usr/local/bin/sing-box || ${SBCTL_TESTING:-0} == 1 ]] || {
+    warn "sing-box metadata 使用了非标准路径，保留现有 binary。"
     return 1
   }
   [[ -e $path || -L $path ]] || return 0
@@ -123,28 +128,29 @@ _remove_sbctl_service_definition() {
   esac
 }
 
+_sbctl_service_definition_is_managed() {
+  local definition=""
+  case $(init_system) in
+    systemd) definition="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" ;;
+    openrc) definition="${OPENRC_INIT_DIR}/${SERVICE_NAME}" ;;
+  esac
+  [[ -f $definition ]] && grep -q 'managed by sbctl' "$definition" 2>/dev/null
+}
+
 _remove_sing_box_core() {
+  local rc=0
+  if ! _sing_box_target_is_managed; then
+    warn "未确认 sing-box 核心归 sbctl 管理；不会删除任何 sing-box binary 或系统软件包。"
+    if _sbctl_service_definition_is_managed; then
+      service_stop >/dev/null 2>&1 || true
+      service_disable >/dev/null 2>&1 || true
+      _remove_sbctl_service_definition
+    fi
+    return 0
+  fi
   service_stop >/dev/null 2>&1 || true
   service_disable >/dev/null 2>&1 || true
-  local manager install_source rc=0
-  install_source=$(_sing_box_install_resource_get singBoxInstallSource)
-  if [[ $install_source == release ]]; then
-    _remove_managed_sing_box_release_binary || rc=1
-  elif [[ $install_source == apk ]]; then
-    apk del sing-box >/dev/null 2>&1 || true
-    [[ -z $(_sing_box_install_resource_get singBoxBinaryPath) ]] || \
-      _remove_managed_sing_box_release_binary || rc=1
-  else
-    manager=$(pkg_manager 2>/dev/null || true)
-    case $manager in
-      apk) apk del sing-box >/dev/null 2>&1 || true;;
-      apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1 || true;;
-      dnf) dnf remove -y sing-box >/dev/null 2>&1 || true;;
-      yum) yum remove -y sing-box >/dev/null 2>&1 || true;;
-      pacman) pacman -Rns --noconfirm sing-box >/dev/null 2>&1 || true;;
-      zypper) zypper --non-interactive remove sing-box >/dev/null 2>&1 || true;;
-    esac
-  fi
+  _remove_managed_sing_box_release_binary || rc=1
   ((rc != 0)) || _clear_sing_box_install_metadata
   _remove_sbctl_service_definition
   return "$rc"
@@ -204,7 +210,6 @@ _scan_sbctl_residuals() {
     [[ ! -e $path && ! -L $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }
   done
   for path in "$CERTBOT_HOOK_DIR"/sbctl-*; do [[ ! -e $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }; done
-  pgrep -x sing-box >/dev/null 2>&1 && { printf '  ✗ 残留: sing-box 进程仍在运行\n'; ((count+=1)); }
   printf -v "$__count_var" '%s' "$count"
 }
 
