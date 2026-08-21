@@ -203,7 +203,7 @@ _record_sing_box_install() {
   tmp=$(temp_file)
   jq --arg source "$source" --arg path "$binary_path" --arg sha256 "$binary_sha256" '
     .managedResources.singBoxInstallSource=$source |
-    if $source=="release" then
+    if $source=="release" or $path!="" then
       .managedResources.singBoxBinaryPath=$path |
       .managedResources.singBoxBinarySHA256=$sha256
     else
@@ -212,6 +212,29 @@ _record_sing_box_install() {
   ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
   install -m 600 "$tmp" "$META_FILE"
   rm -f "$tmp"
+}
+
+_remove_previous_managed_release_for_apk() {
+  local source path expected_sha256 actual_sha256
+  source=$(meta_resource_get singBoxInstallSource 2>/dev/null || true)
+  [[ $source == release ]] || return 0
+  path=$(meta_resource_get singBoxBinaryPath 2>/dev/null || true)
+  expected_sha256=$(meta_resource_get singBoxBinarySHA256 2>/dev/null || true)
+  [[ -n $path && $path == /* && ${path##*/} == sing-box ]] || {
+    error "旧 sing-box Release metadata 路径无效，不能安全切换到 APK。"
+    return 1
+  }
+  [[ -e $path || -L $path ]] || return 0
+  if [[ ! -f $path || -L $path || -z $expected_sha256 ]]; then
+    error "无法确认旧 Release binary 归 sbctl 管理，不能安全切换到 APK：${path}"
+    return 1
+  fi
+  actual_sha256=$(_sing_box_binary_sha256 "$path") || true
+  if [[ -z $actual_sha256 || $actual_sha256 != "$expected_sha256" ]]; then
+    error "旧 Release binary 已被修改，已保留且未切换安装来源：${path}"
+    return 1
+  fi
+  rm -f -- "$path"
 }
 
 install_sing_box_release_binary() {
@@ -296,8 +319,14 @@ install_sing_box_release_binary() {
 }
 
 install_sing_box_alpine() {
-  local version=${1-}
+  local version=${1-} previous_path previous_sha256
   if run_bounded 180 apk add --no-cache --upgrade sing-box; then
+    if ! _remove_previous_managed_release_for_apk; then
+      previous_path=$(meta_resource_get singBoxBinaryPath 2>/dev/null || true)
+      previous_sha256=$(meta_resource_get singBoxBinarySHA256 2>/dev/null || true)
+      _record_sing_box_install apk "$previous_path" "$previous_sha256" || true
+      return 1
+    fi
     _record_sing_box_install apk
     info "已通过 Alpine APK 安装/更新 sing-box。"
     return 0

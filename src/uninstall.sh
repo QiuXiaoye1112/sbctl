@@ -132,6 +132,8 @@ _remove_sing_box_core() {
     _remove_managed_sing_box_release_binary || rc=1
   elif [[ $install_source == apk ]]; then
     apk del sing-box >/dev/null 2>&1 || true
+    [[ -z $(_sing_box_install_resource_get singBoxBinaryPath) ]] || \
+      _remove_managed_sing_box_release_binary || rc=1
   else
     manager=$(pkg_manager 2>/dev/null || true)
     case $manager in
