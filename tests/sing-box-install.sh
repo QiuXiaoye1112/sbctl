@@ -26,9 +26,9 @@ trap cleanup_test_root EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 make_release_archive() {
-  local archive=$1 version=$2 arch=$3 reported_version=$4 fixture member
+  local archive=$1 version=$2 platform=$3 reported_version=$4 fixture member
   fixture=$(mktemp -d "$TEST_ROOT/fixture.XXXXXX")
-  member="sing-box-${version}-linux-${arch}"
+  member="sing-box-${version}-${platform}"
   mkdir -p "$fixture/$member"
   printf '#!/usr/bin/env bash\nprintf '\''sing-box version %s\\n'\''\n' "$reported_version" >"$fixture/$member/sing-box"
   chmod 755 "$fixture/$member/sing-box"
@@ -71,6 +71,12 @@ uname() { printf '%s\n' "${MOCK_MACHINE:-x86_64}"; }
 [[ $(detect_sing_box_arch i686) == 386 ]]
 [[ $(detect_sing_box_arch s390x) == s390x ]]
 if detect_sing_box_arch riscv64 >/dev/null 2>&1; then fail 'unsupported architecture was accepted'; fi
+[[ $(sing_box_release_platform 1.13.19 amd64) == linux-amd64-musl ]]
+[[ $(sing_box_release_platform 1.13.19 arm64) == linux-arm64-musl ]]
+[[ $(sing_box_release_platform 1.13.19 armv7) == linux-armv7-musl ]]
+[[ $(sing_box_release_platform 1.13.19 386) == linux-386-musl ]]
+[[ $(sing_box_release_platform 1.13.19 s390x) == linux-s390x ]]
+[[ $(sing_box_release_platform 1.12.0 amd64) == linux-amd64 ]]
 
 # Alpine package available: no Release request and APK metadata is recorded.
 (
@@ -104,10 +110,10 @@ if detect_sing_box_arch riscv64 >/dev/null 2>&1; then fail 'unsupported architec
   DOWNLOAD_FAIL=0
   : >"$APK_LOG"
   : >"$CURL_LOG"
-  make_release_archive "$RELEASE_ARCHIVE" 1.13.19 amd64 1.13.19
+  make_release_archive "$RELEASE_ARCHIVE" 1.13.19 linux-amd64-musl 1.13.19
   install_sing_box_alpine
   [[ $($SING_BOX_RELEASE_INSTALL_PATH version) == 'sing-box version 1.13.19' ]]
-  grep -Fq '/v1.13.19/sing-box-1.13.19-linux-amd64.tar.gz' "$CURL_LOG"
+  grep -Fq '/v1.13.19/sing-box-1.13.19-linux-amd64-musl.tar.gz' "$CURL_LOG"
   [[ $(jq -r '.managedResources.singBoxInstallSource' "$META_FILE") == release ]]
   [[ $(jq -r '.managedResources.singBoxBinaryPath' "$META_FILE") == "$SING_BOX_RELEASE_INSTALL_PATH" ]]
   [[ -n $(jq -r '.managedResources.singBoxBinarySHA256' "$META_FILE") ]]
@@ -172,9 +178,9 @@ if detect_sing_box_arch riscv64 >/dev/null 2>&1; then fail 'unsupported architec
   DOWNLOAD_FAIL=0
   : >"$APK_LOG"
   : >"$CURL_LOG"
-  make_release_archive "$RELEASE_ARCHIVE" 1.13.18 amd64 1.13.18
+  make_release_archive "$RELEASE_ARCHIVE" 1.13.18 linux-amd64-musl 1.13.18
   install_sing_box_alpine v1.13.18
-  grep -Fq '/v1.13.18/sing-box-1.13.18-linux-amd64.tar.gz' "$CURL_LOG"
+  grep -Fq '/v1.13.18/sing-box-1.13.18-linux-amd64-musl.tar.gz' "$CURL_LOG"
   [[ $($SING_BOX_RELEASE_INSTALL_PATH version) == 'sing-box version 1.13.18' ]]
 )
 
@@ -211,7 +217,7 @@ if detect_sing_box_arch riscv64 >/dev/null 2>&1; then fail 'unsupported architec
   DOWNLOAD_FAIL=0
   printf 'old-core-validation\n' >"$SING_BOX_RELEASE_INSTALL_PATH"
   before=$(openssl dgst -sha256 "$SING_BOX_RELEASE_INSTALL_PATH" | awk '{print $NF}')
-  make_release_archive "$RELEASE_ARCHIVE" 1.13.18 amd64 1.11.0
+  make_release_archive "$RELEASE_ARCHIVE" 1.13.18 linux-amd64-musl 1.11.0
   if install_sing_box_alpine 1.13.18 >/dev/null 2>&1; then fail 'invalid binary unexpectedly succeeded'; fi
   after=$(openssl dgst -sha256 "$SING_BOX_RELEASE_INSTALL_PATH" | awk '{print $NF}')
   [[ $before == "$after" ]]

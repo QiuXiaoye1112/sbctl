@@ -79,4 +79,12 @@ jobs:
             bash tests/lifecycle.sh
             bash tests/cloudflare.sh
             bash tests/maturity.sh
+            export SBCTL_CONFIG_DIR=/tmp/sbctl-real-alpine/config
+            export SBCTL_CONFIG_FILE=/tmp/sbctl-real-alpine/config/config.json
+            export SBCTL_META_FILE=/tmp/sbctl-real-alpine/meta.json
+            export SBCTL_CERT_DIR=/tmp/sbctl-real-alpine/config/certs
+            export SBCTL_SING_BOX_RELEASE_INSTALL_PATH=/tmp/sbctl-real-alpine/bin/sing-box
+            source ./sbctl.sh
+            install_sing_box_release_binary 1.13.19
+            /tmp/sbctl-real-alpine/bin/sing-box version | grep -F "sing-box version 1.13.19"
           '

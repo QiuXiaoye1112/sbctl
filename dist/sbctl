@@ -4137,7 +4137,7 @@ version_ge() {
 _sing_box_binary_version() {
   local binary=$1
   [[ -x $binary ]] || return 1
-  "$binary" version 2>/dev/null | sed -nE '1s/^sing-box version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p'
+  "$binary" version 2>/dev/null | sed -n 's/^sing-box version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1
 }
 
 _sing_box_binary_sha256() {
@@ -4156,6 +4156,19 @@ detect_sing_box_arch() {
     s390x) printf 's390x' ;;
     *) error "不支持的 sing-box Release 架构：${machine}"; return 1 ;;
   esac
+}
+
+sing_box_release_platform() {
+  local version=$1 arch=$2
+  # sing-box 1.13.3 introduced dedicated musl archives for these Alpine
+  # architectures. The generic 1.13.x archive can require libcronet.so, so
+  # installing only its binary makes even `sing-box version` fail on Alpine.
+  if version_ge "$version" 1.13.3; then
+    case $arch in
+      amd64|arm64|armv7|386) printf 'linux-%s-musl' "$arch"; return 0 ;;
+    esac
+  fi
+  printf 'linux-%s' "$arch"
 }
 
 resolve_sing_box_version() {
@@ -4219,11 +4232,12 @@ _remove_previous_managed_release_for_apk() {
 }
 
 install_sing_box_release_binary() {
-  local requested=${1-} version arch archive_name archive_url work_dir archive member candidate
-  local candidate_version candidate_sha256 target target_dir staged=""
+  local requested=${1-} version arch platform archive_name archive_url work_dir archive member candidate
+  local candidate_output candidate_status=0 candidate_version candidate_sha256 target target_dir staged=""
 
   version=$(resolve_sing_box_version "$requested") || return 1
   arch=$(detect_sing_box_arch) || return 1
+  platform=$(sing_box_release_platform "$version" "$arch")
   target=$SING_BOX_RELEASE_INSTALL_PATH
   [[ $target == /* && ${target##*/} == sing-box && ! -d $target ]] || {
     error "不安全的 sing-box Release 安装路径：${target}"
@@ -4235,10 +4249,10 @@ install_sing_box_release_binary() {
     error "无法创建 sing-box Release 临时目录。"
     return 1
   }
-  archive_name="sing-box-${version}-linux-${arch}.tar.gz"
+  archive_name="sing-box-${version}-${platform}.tar.gz"
   archive_url="${SING_BOX_RELEASE_DOWNLOAD_BASE}/v${version}/${archive_name}"
   archive="${work_dir}/${archive_name}"
-  member="sing-box-${version}-linux-${arch}/sing-box"
+  member="sing-box-${version}-${platform}/sing-box"
 
   if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
     --connect-timeout 10 --max-time 120 "$archive_url" -o "$archive"; then
@@ -4258,10 +4272,22 @@ install_sing_box_release_binary() {
     return 1
   fi
   chmod 755 "$candidate"
-  candidate_version=$(_sing_box_binary_version "$candidate") || true
+  if candidate_output=$("$candidate" version 2>&1); then
+    candidate_version=$(printf '%s\n' "$candidate_output" \
+      | sed -n 's/^sing-box version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+      | head -n 1)
+  else
+    candidate_status=$?
+    candidate_version=""
+  fi
   if [[ -z $candidate_version || $candidate_version != "$version" ]]; then
     rm -rf -- "$work_dir"
     error "sing-box Release binary 版本校验失败（期望 ${version}，实际 ${candidate_version:-无法识别}）。"
+    if ((candidate_status != 0)); then
+      error "候选 binary 无法运行（退出码 ${candidate_status}）：$(printf '%s' "$candidate_output" | head -n 1)"
+    elif [[ -n $candidate_output ]]; then
+      error "候选 binary 输出：$(printf '%s' "$candidate_output" | head -n 1)"
+    fi
     return 1
   fi
   if ! version_ge "$candidate_version" "$SING_BOX_MIN_VERSION"; then
@@ -4296,7 +4322,7 @@ install_sing_box_release_binary() {
     error "sing-box 已安装，但安装来源 metadata 写入失败。"
     return 1
   }
-  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（linux/${arch}）。"
+  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（${platform}）。"
 }
 
 install_sing_box_alpine() {
@@ -4312,7 +4338,7 @@ install_sing_box_alpine() {
     info "已通过 Alpine APK 安装/更新 sing-box。"
     return 0
   fi
-  warn "Alpine 当前软件源无法安装 sing-box，改用 SagerNet 官方 GitHub Release。"
+  info "Alpine 当前软件源未提供 sing-box，自动使用 SagerNet 官方兼容版本。"
   install_sing_box_release_binary "$version"
 }
 
