@@ -10,6 +10,11 @@ readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly OFFICIAL_INSTALLER_URL="https://sing-box.app/install.sh"
+readonly SING_BOX_MIN_VERSION="1.12.0"
+
+SING_BOX_RELEASE_INSTALL_PATH="${SBCTL_SING_BOX_RELEASE_INSTALL_PATH:-/usr/local/bin/sing-box}"
+SING_BOX_RELEASE_API="${SBCTL_SING_BOX_RELEASE_API:-https://api.github.com/repos/SagerNet/sing-box/releases/latest}"
+SING_BOX_RELEASE_DOWNLOAD_BASE="${SBCTL_SING_BOX_RELEASE_DOWNLOAD_BASE:-https://github.com/SagerNet/sing-box/releases/download}"
 
 SING_BOX_BIN="${SBCTL_SING_BOX_BIN:-$(command -v sing-box 2>/dev/null || printf /usr/local/bin/sing-box)}"
 CONFIG_DIR="${SBCTL_CONFIG_DIR:-/etc/sing-box}"
@@ -4129,6 +4134,159 @@ version_ge() {
   ((10#$h3 >= 10#$n3))
 }
 
+_sing_box_binary_version() {
+  local binary=$1
+  [[ -x $binary ]] || return 1
+  "$binary" version 2>/dev/null | sed -nE '1s/^sing-box version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p'
+}
+
+_sing_box_binary_sha256() {
+  local binary=$1
+  [[ -f $binary ]] || return 1
+  openssl dgst -sha256 "$binary" 2>/dev/null | awk '{print $NF}'
+}
+
+detect_sing_box_arch() {
+  local machine=${1:-$(uname -m)}
+  case $machine in
+    x86_64) printf 'amd64' ;;
+    aarch64) printf 'arm64' ;;
+    armv7l) printf 'armv7' ;;
+    i386|i686) printf '386' ;;
+    s390x) printf 's390x' ;;
+    *) error "不支持的 sing-box Release 架构：${machine}"; return 1 ;;
+  esac
+}
+
+resolve_sing_box_version() {
+  local requested=${1-} payload resolved
+  if [[ -n $requested ]]; then
+    resolved=${requested#v}
+  else
+    payload=$(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+      --connect-timeout 10 --max-time 60 "$SING_BOX_RELEASE_API") || {
+      error "无法获取 sing-box 最新 stable Release。"
+      return 1
+    }
+    resolved=$(jq -r 'select(.draft==false and .prerelease==false) | .tag_name // empty' <<<"$payload")
+    resolved=${resolved#v}
+  fi
+  [[ $resolved =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    error "无效或非 stable 的 sing-box 版本：${resolved:-未知}"
+    return 1
+  }
+  printf '%s' "$resolved"
+}
+
+_record_sing_box_install() {
+  local source=$1 binary_path=${2-} binary_sha256=${3-} tmp
+  init_meta
+  tmp=$(temp_file)
+  jq --arg source "$source" --arg path "$binary_path" --arg sha256 "$binary_sha256" '
+    .managedResources.singBoxInstallSource=$source |
+    if $source=="release" then
+      .managedResources.singBoxBinaryPath=$path |
+      .managedResources.singBoxBinarySHA256=$sha256
+    else
+      del(.managedResources.singBoxBinaryPath,.managedResources.singBoxBinarySHA256)
+    end
+  ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
+}
+
+install_sing_box_release_binary() {
+  local requested=${1-} version arch archive_name archive_url work_dir archive member candidate
+  local candidate_version candidate_sha256 target target_dir staged=""
+
+  version=$(resolve_sing_box_version "$requested") || return 1
+  arch=$(detect_sing_box_arch) || return 1
+  target=$SING_BOX_RELEASE_INSTALL_PATH
+  [[ $target == /* && ${target##*/} == sing-box && ! -d $target ]] || {
+    error "不安全的 sing-box Release 安装路径：${target}"
+    return 1
+  }
+  command_exists tar || { error "缺少 tar，无法解压 sing-box Release。"; return 1; }
+
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-sing-box.XXXXXX") || {
+    error "无法创建 sing-box Release 临时目录。"
+    return 1
+  }
+  archive_name="sing-box-${version}-linux-${arch}.tar.gz"
+  archive_url="${SING_BOX_RELEASE_DOWNLOAD_BASE}/v${version}/${archive_name}"
+  archive="${work_dir}/${archive_name}"
+  member="sing-box-${version}-linux-${arch}/sing-box"
+
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+    --connect-timeout 10 --max-time 120 "$archive_url" -o "$archive"; then
+    rm -rf -- "$work_dir"
+    error "sing-box 官方 Release 下载失败：${archive_url}"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$work_dir" "$member"; then
+    rm -rf -- "$work_dir"
+    error "sing-box 官方 Release 解压失败。"
+    return 1
+  fi
+  candidate="${work_dir}/${member}"
+  if [[ ! -f $candidate || -L $candidate ]]; then
+    rm -rf -- "$work_dir"
+    error "sing-box 官方 Release 缺少有效 binary。"
+    return 1
+  fi
+  chmod 755 "$candidate"
+  candidate_version=$(_sing_box_binary_version "$candidate") || true
+  if [[ -z $candidate_version || $candidate_version != "$version" ]]; then
+    rm -rf -- "$work_dir"
+    error "sing-box Release binary 版本校验失败（期望 ${version}，实际 ${candidate_version:-无法识别}）。"
+    return 1
+  fi
+  if ! version_ge "$candidate_version" "$SING_BOX_MIN_VERSION"; then
+    rm -rf -- "$work_dir"
+    error "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}，Release ${candidate_version} 不受支持。"
+    return 1
+  fi
+  candidate_sha256=$(_sing_box_binary_sha256 "$candidate") || {
+    rm -rf -- "$work_dir"
+    error "无法计算 sing-box Release binary 校验值。"
+    return 1
+  }
+
+  target_dir=${target%/*}
+  mkdir -p "$target_dir" || { rm -rf -- "$work_dir"; error "无法创建 ${target_dir}。"; return 1; }
+  staged=$(mktemp "${target_dir}/.sing-box.sbctl.XXXXXX") || {
+    rm -rf -- "$work_dir"
+    error "无法在 ${target_dir} 创建安装临时文件。"
+    return 1
+  }
+  if ! install -m 755 "$candidate" "$staged" || ! mv -f -- "$staged" "$target"; then
+    rm -f -- "$staged"
+    rm -rf -- "$work_dir"
+    error "sing-box Release binary 安装失败，原有核心未被替换。"
+    return 1
+  fi
+  rm -rf -- "$work_dir"
+  hash -r 2>/dev/null || true
+  SBCTL_SING_BOX_BIN=$target
+  SING_BOX_BIN=$target
+  _record_sing_box_install release "$target" "$candidate_sha256" || {
+    error "sing-box 已安装，但安装来源 metadata 写入失败。"
+    return 1
+  }
+  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（linux/${arch}）。"
+}
+
+install_sing_box_alpine() {
+  local version=${1-}
+  if run_bounded 180 apk add --no-cache --upgrade sing-box; then
+    _record_sing_box_install apk
+    info "已通过 Alpine APK 安装/更新 sing-box。"
+    return 0
+  fi
+  warn "Alpine 当前软件源无法安装 sing-box，改用 SagerNet 官方 GitHub Release。"
+  install_sing_box_release_binary "$version"
+}
+
 require_sing_box() { refresh_binary_path; sing_box_installed || die "sing-box 尚未安装，请先运行 sbctl install。"; }
 
 require_supported_core() {
@@ -4136,7 +4294,7 @@ require_supported_core() {
   require_sing_box
   version=$(sing_box_version)
   [[ -n $version ]] || die "无法识别 sing-box 版本。"
-  version_ge "$version" 1.12.0 || die "sbctl 需要 sing-box >= 1.12.0（AnyTLS 从 1.12.0 起支持），当前为 ${version}。"
+  version_ge "$version" "$SING_BOX_MIN_VERSION" || die "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}（AnyTLS 从 1.12.0 起支持），当前为 ${version}。"
 }
 
 restart_service_checked() {
@@ -4241,7 +4399,7 @@ install_or_update_sing_box() {
   [[ -f $CONFIG_FILE ]] && had_config=1
   manager=$(pkg_manager)
   if [[ $manager == apk ]]; then
-    run_bounded 180 apk add --no-cache --upgrade sing-box || die "sing-box 安装/更新失败或超时。"
+    install_sing_box_alpine "$version" || die "sing-box Alpine 安装与 Release fallback 均失败。"
   else
     installer=$(temp_file)
     curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 \
@@ -4314,6 +4472,42 @@ _uninstall_snapshot_metadata() {
 _snapshot_meta_cert_list() { jq -r '.certificates // {} | keys[]' "$SNAPSHOT_META" 2>/dev/null; }
 _snapshot_meta_cert_get_field() { jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] // empty' "$SNAPSHOT_META" 2>/dev/null; }
 _snapshot_meta_resource_get() { jq -r --arg key "$1" '.managedResources[$key] // empty' "$SNAPSHOT_META" 2>/dev/null; }
+
+_sing_box_install_resource_get() {
+  local key=$1 source_file=""
+  if [[ -n ${SNAPSHOT_META:-} && -f ${SNAPSHOT_META:-} ]]; then source_file=$SNAPSHOT_META
+  elif [[ -f $META_FILE ]]; then source_file=$META_FILE
+  else return 0; fi
+  jq -r --arg key "$key" '.managedResources[$key] // empty' "$source_file" 2>/dev/null
+}
+
+_clear_sing_box_install_metadata() {
+  [[ -f $META_FILE ]] || return 0
+  meta_resource_remove singBoxInstallSource
+  meta_resource_remove singBoxBinaryPath
+  meta_resource_remove singBoxBinarySHA256
+}
+
+_remove_managed_sing_box_release_binary() {
+  local path expected_sha256 actual_sha256
+  path=$(_sing_box_install_resource_get singBoxBinaryPath)
+  expected_sha256=$(_sing_box_install_resource_get singBoxBinarySHA256)
+  [[ -n $path && $path == /* && ${path##*/} == sing-box ]] || {
+    warn "sing-box Release metadata 路径无效，保留现有 binary。"
+    return 1
+  }
+  [[ -e $path || -L $path ]] || return 0
+  if [[ ! -f $path || -L $path || -z $expected_sha256 ]]; then
+    warn "无法确认 ${path} 仍是 sbctl 安装的 binary，已保留。"
+    return 1
+  fi
+  actual_sha256=$(_sing_box_binary_sha256 "$path") || true
+  if [[ -z $actual_sha256 || $actual_sha256 != "$expected_sha256" ]]; then
+    warn "${path} 已被修改，无法确认归 sbctl 管理，已保留。"
+    return 1
+  fi
+  rm -f -- "$path"
+}
 
 _safe_remove_sbctl_dir() {
   local path=$1 key=${2:-} recorded=""
@@ -4389,17 +4583,26 @@ _remove_sbctl_service_definition() {
 _remove_sing_box_core() {
   service_stop >/dev/null 2>&1 || true
   service_disable >/dev/null 2>&1 || true
-  local manager
-  manager=$(pkg_manager 2>/dev/null || true)
-  case $manager in
-    apk) apk del sing-box >/dev/null 2>&1 || true;;
-    apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1 || true;;
-    dnf) dnf remove -y sing-box >/dev/null 2>&1 || true;;
-    yum) yum remove -y sing-box >/dev/null 2>&1 || true;;
-    pacman) pacman -Rns --noconfirm sing-box >/dev/null 2>&1 || true;;
-    zypper) zypper --non-interactive remove sing-box >/dev/null 2>&1 || true;;
-  esac
+  local manager install_source rc=0
+  install_source=$(_sing_box_install_resource_get singBoxInstallSource)
+  if [[ $install_source == release ]]; then
+    _remove_managed_sing_box_release_binary || rc=1
+  elif [[ $install_source == apk ]]; then
+    apk del sing-box >/dev/null 2>&1 || true
+  else
+    manager=$(pkg_manager 2>/dev/null || true)
+    case $manager in
+      apk) apk del sing-box >/dev/null 2>&1 || true;;
+      apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y sing-box >/dev/null 2>&1 || true;;
+      dnf) dnf remove -y sing-box >/dev/null 2>&1 || true;;
+      yum) yum remove -y sing-box >/dev/null 2>&1 || true;;
+      pacman) pacman -Rns --noconfirm sing-box >/dev/null 2>&1 || true;;
+      zypper) zypper --non-interactive remove sing-box >/dev/null 2>&1 || true;;
+    esac
+  fi
+  ((rc != 0)) || _clear_sing_box_install_metadata
   _remove_sbctl_service_definition
+  return "$rc"
 }
 
 _remove_quick_command_and_libs() {
@@ -4467,7 +4670,10 @@ _sbctl_uninstall_level_0() {
     local backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
     backup_all "$backup" >/dev/null 2>&1 && info "卸载前备份：$backup" || warn "卸载前备份失败，仍继续仅卸载核心。"
   fi
-  _remove_sing_box_core
+  if ! _remove_sing_box_core; then
+    warn "sing-box 核心未完全卸载；未确认归 sbctl 管理的 binary 已保留。"
+    return 1
+  fi
   info "sing-box 核心已卸载；配置、证书、sbctl、续期任务和备份已保留。"
   info "需要时运行 sbctl install 可重新安装。"
 }
