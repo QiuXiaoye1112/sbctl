@@ -302,6 +302,7 @@ set -Eeuo pipefail
 source ./sbctl.sh
 trap - ERR
 mkdir -p "$CASE_DIR"
+command_exists() { [[ ${1-} == iptables ]]; }
 write_default_config
 tmp=$(temp_file)
 jq '.inbounds=[{"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
