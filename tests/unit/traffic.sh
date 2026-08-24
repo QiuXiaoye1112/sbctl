@@ -113,6 +113,10 @@ jq -e '.inbounds.socks.deleted==true and .inbounds.socks.daily["2026-08-24"]==20
 
 [[ $(traffic_format_bytes 0) == '0 B' ]]
 [[ $(traffic_format_bytes 1024) == '1.00 KB' ]]
+[[ $(traffic_format_percent 0 107374182400) == '0.00%' ]]
+[[ $(traffic_format_percent 1 107374182400) == '<0.01%' ]]
+[[ $(traffic_format_cycle '2026-08-24 11:10:16' '2026-09-24 11:10:16') == '2026-08-24 11:10 → 09-24 11:10' ]]
+[[ $(traffic_format_cycle '2026-12-24 11:10:16' '2027-01-24 11:10:16') == '2026-12-24 11:10 → 2027-01-24 11:10' ]]
 
 # Backups include the retained traffic file and restore it atomically with the
 # rest of sbctl state.
@@ -169,9 +173,9 @@ jq -e '
   .inbounds.vless.limit.cycleEnd=="2026-09-07 18:00:00"
 ' "$TRAFFIC_FILE" >/dev/null
 output=$(traffic_limits_show)
-grep -Fq '功能状态：已启用' <<<"$output"
-grep -Fq '使用率' <<<"$output"
-grep -Fq '周期：2026-08-07 18:00:00 → 2026-09-07 18:00:00' <<<"$output"
+grep -Fq '功能：已启用  ·  已设置：1  ·  已禁用：0' <<<"$output"
+grep -Fq '流量  0 B / 1.00 GB  (0.00%)' <<<"$output"
+grep -Fq '周期  2026-08-07 18:00 → 09-07 18:00' <<<"$output"
 
 MOCK_COUNTERS=$'vless\t536870912\n'
 traffic_collect
@@ -180,6 +184,7 @@ MOCK_COUNTERS=$'vless\t536870912\n'
 traffic_collect
 traffic_limit_is_blocked vless
 output=$(traffic_limits_show)
+grep -Fq '已设置：1  ·  已禁用：1' <<<"$output"
 grep -Fq '100.00%' <<<"$output"
 grep -Fq '已禁用' <<<"$output"
 MOCK_COUNTERS=""

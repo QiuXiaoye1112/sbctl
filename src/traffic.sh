@@ -558,11 +558,22 @@ traffic_exhausted_tags() {
 }
 
 traffic_limits_show() {
-  local rows tag quota used remaining rate status cycle_start cycle_end feature
+  local rows tag quota used remaining rate status status_color cycle_start cycle_end cycle feature feature_color configured blocked limits_active=0
   traffic_init_file; traffic_sync_inventory
-  traffic_limits_are_enabled && feature="已启用" || feature="未启用"
+  if traffic_limits_are_enabled; then
+    feature="已启用"; feature_color=$C_GREEN; limits_active=1
+  else
+    feature="未启用"; feature_color=$C_YELLOW
+  fi
+  configured=$(traffic_limit_count)
+  if ((limits_active)); then
+    blocked=$(jq '[.inbounds[]? | select(.deleted!=true and .limit.enabled==true and
+      ((.limit.usedBytes // 0) >= (.limit.quotaBytes // 0)))] | length' "$TRAFFIC_FILE")
+  else
+    blocked=0
+  fi
   heading "月度流量限制"
-  printf '功能状态：%s\n\n' "$feature"
+  printf '功能：%s%s%s  ·  已设置：%s  ·  已禁用：%s\n\n' "$feature_color" "$feature" "$C_RESET" "$configured" "$blocked"
   rows=$(jq -r '
     .inbounds | to_entries | sort_by(.key)[] |
     select(.value.deleted!=true and .value.limit.enabled==true) |
@@ -574,26 +585,17 @@ traffic_limits_show() {
     info "还没有为入站设置流量额度。"
     return 0
   fi
-  print_table_cell_clipped "标签" 18; printf ' | '
-  print_table_cell_clipped "月额度" 12; printf ' | '
-  print_table_cell_clipped "本周期已用" 12; printf ' | '
-  print_table_cell_clipped "剩余" 12; printf ' | '
-  print_table_cell_clipped "使用率" 9; printf ' | '
-  print_table_cell_clipped "状态" 8; printf '\n'
-  printf '%s\n' '-------------------------------------------------------------------------------------'
   while IFS=$'\t' read -r tag quota used cycle_start cycle_end; do
     remaining=$((quota > used ? quota - used : 0))
     rate=$(traffic_format_percent "$used" "$quota")
-    if ! traffic_limits_are_enabled; then status="未执行"
-    elif ((used >= quota)); then status="已禁用"
-    else status="正常"; fi
-    print_table_cell_clipped "$tag" 18; printf ' | '
-    print_table_cell_clipped "$(traffic_format_bytes "$quota")" 12; printf ' | '
-    print_table_cell_clipped "$(traffic_format_bytes "$used")" 12; printf ' | '
-    print_table_cell_clipped "$(traffic_format_bytes "$remaining")" 12; printf ' | '
-    print_table_cell_clipped "$rate" 9; printf ' | '
-    print_table_cell_clipped "$status" 8; printf '\n'
-    printf '  周期：%s → %s\n' "$cycle_start" "$cycle_end"
+    cycle=$(traffic_format_cycle "$cycle_start" "$cycle_end")
+    if ((limits_active == 0)); then status="未执行"; status_color=$C_YELLOW
+    elif ((used >= quota)); then status="已禁用"; status_color=$C_RED
+    else status="正常"; status_color=$C_GREEN; fi
+    printf '%s%s%s  [%s%s%s]\n' "$C_BOLD" "$tag" "$C_RESET" "$status_color" "$status" "$C_RESET"
+    printf '  流量  %s / %s  (%s)\n' "$(traffic_format_bytes "$used")" "$(traffic_format_bytes "$quota")" "$rate"
+    printf '  剩余  %s\n' "$(traffic_format_bytes "$remaining")"
+    printf '  周期  %s\n\n' "$cycle"
   done <<<"$rows"
 }
 
@@ -601,8 +603,20 @@ traffic_format_percent() {
   local used=${1:-0} quota=${2:-0}
   awk -v used="$used" -v quota="$quota" 'BEGIN {
     if (quota<=0) {printf "-"; exit}
-    printf "%.2f%%", (used/quota)*100
+    percent=(used/quota)*100
+    if (used>0 && percent<0.01) printf "<0.01%%"; else printf "%.2f%%", percent
   }'
+}
+
+traffic_format_cycle() {
+  local start=${1-} end=${2-} start_min end_min
+  if ! traffic_validate_timestamp "$start" || ! traffic_validate_timestamp "$end"; then
+    printf '%s → %s' "$start" "$end"
+    return 0
+  fi
+  start_min=${start:0:16}; end_min=${end:0:16}
+  if [[ ${start:0:4} == "${end:0:4}" ]]; then end_min=${end:5:11}; fi
+  printf '%s → %s' "$start_min" "$end_min"
 }
 
 traffic_limit_quota_bytes() {

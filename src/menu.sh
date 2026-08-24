@@ -276,9 +276,9 @@ traffic_limit_menu() {
     clear_screen
     traffic_limits_show || true
     if traffic_limits_are_enabled; then
-      printf '\n1) 刷新状态\n2) 设置/修改入站额度\n3) 取消入站额度\n4) 关闭流量限制\n0) 返回\n'
+      printf '操作\n1) 刷新状态\n2) 设置/修改入站额度\n3) 取消入站额度\n4) 关闭流量限制\n0) 返回\n'
     else
-      printf '\n1) 启用流量限制\n0) 返回\n'
+      printf '操作\n1) 启用流量限制\n0) 返回\n'
     fi
     read -r -p "请选择: " choice || { echo; return; }
     if traffic_limits_are_enabled; then
