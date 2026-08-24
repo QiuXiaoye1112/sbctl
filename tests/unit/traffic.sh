@@ -170,7 +170,8 @@ jq -e '
 ' "$TRAFFIC_FILE" >/dev/null
 output=$(traffic_limits_show)
 grep -Fq '功能状态：已启用' <<<"$output"
-grep -Fq '当前周期：2026-08-07 18:00:00 ～ 2026-09-07 18:00:00' <<<"$output"
+grep -Fq '使用率' <<<"$output"
+grep -Fq '周期：2026-08-07 18:00:00 → 2026-09-07 18:00:00' <<<"$output"
 
 MOCK_COUNTERS=$'vless\t536870912\n'
 traffic_collect
@@ -178,7 +179,9 @@ traffic_collect
 MOCK_COUNTERS=$'vless\t536870912\n'
 traffic_collect
 traffic_limit_is_blocked vless
-grep -Fq '已禁用' <<<"$(traffic_limits_show)"
+output=$(traffic_limits_show)
+grep -Fq '100.00%' <<<"$output"
+grep -Fq '已禁用' <<<"$output"
 MOCK_COUNTERS=""
 traffic_limits_disable >/dev/null
 ! traffic_limits_are_enabled

@@ -3612,7 +3612,7 @@ traffic_exhausted_tags() {
 }
 
 traffic_limits_show() {
-  local rows tag quota used remaining status cycle_start cycle_end feature
+  local rows tag quota used remaining rate status cycle_start cycle_end feature
   traffic_init_file; traffic_sync_inventory
   traffic_limits_are_enabled && feature="已启用" || feature="未启用"
   heading "月度流量限制"
@@ -3628,16 +3628,35 @@ traffic_limits_show() {
     info "还没有为入站设置流量额度。"
     return 0
   fi
-  print_table_cell_clipped "标签" 20; printf '| %12s | %12s | %12s | %8s\n' "月额度" "本周期已用" "剩余" "状态"
+  print_table_cell_clipped "标签" 18; printf ' | '
+  print_table_cell_clipped "月额度" 12; printf ' | '
+  print_table_cell_clipped "本周期已用" 12; printf ' | '
+  print_table_cell_clipped "剩余" 12; printf ' | '
+  print_table_cell_clipped "使用率" 9; printf ' | '
+  print_table_cell_clipped "状态" 8; printf '\n'
+  printf '%s\n' '-------------------------------------------------------------------------------------'
   while IFS=$'\t' read -r tag quota used cycle_start cycle_end; do
     remaining=$((quota > used ? quota - used : 0))
+    rate=$(traffic_format_percent "$used" "$quota")
     if ! traffic_limits_are_enabled; then status="未执行"
     elif ((used >= quota)); then status="已禁用"
     else status="正常"; fi
-    print_table_cell_clipped "$tag" 20
-    printf '| %12s | %12s | %12s | %8s\n' "$(traffic_format_bytes "$quota")" "$(traffic_format_bytes "$used")" "$(traffic_format_bytes "$remaining")" "$status"
-    printf '  当前周期：%s ～ %s\n' "$cycle_start" "$cycle_end"
+    print_table_cell_clipped "$tag" 18; printf ' | '
+    print_table_cell_clipped "$(traffic_format_bytes "$quota")" 12; printf ' | '
+    print_table_cell_clipped "$(traffic_format_bytes "$used")" 12; printf ' | '
+    print_table_cell_clipped "$(traffic_format_bytes "$remaining")" 12; printf ' | '
+    print_table_cell_clipped "$rate" 9; printf ' | '
+    print_table_cell_clipped "$status" 8; printf '\n'
+    printf '  周期：%s → %s\n' "$cycle_start" "$cycle_end"
   done <<<"$rows"
+}
+
+traffic_format_percent() {
+  local used=${1:-0} quota=${2:-0}
+  awk -v used="$used" -v quota="$quota" 'BEGIN {
+    if (quota<=0) {printf "-"; exit}
+    printf "%.2f%%", (used/quota)*100
+  }'
 }
 
 traffic_limit_quota_bytes() {
