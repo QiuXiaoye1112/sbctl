@@ -80,6 +80,9 @@ output=$(traffic_show 2026-05-24 2026-08-24)
 grep -Fq '统计范围：2026-05-24 ～ 2026-08-24' <<<"$output"
 grep -Fq '1.00 GB' <<<"$output"
 grep -Fq '全部入站：1.00 GB' <<<"$output"
+# jq 1.6 parses `end` as a keyword, so date range filters must not expose it
+# as a jq variable even though newer jq releases accept it in some contexts.
+! grep -Eq -- '--arg(json)?[[:space:]]+end([[:space:]]|$)' src/traffic.sh
 
 # Entries older than the three-calendar-month cutoff are removed, while the
 # cutoff day and current day remain queryable.

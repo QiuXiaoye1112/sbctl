@@ -3593,8 +3593,8 @@ traffic_format_bytes() {
 }
 
 traffic_range_total() {
-  local start=$1 end=$2
-  jq --arg start "$start" --arg end "$end" '[.inbounds[]?.daily | to_entries[]? | select(.key >= $start and .key <= $end) | .value] | add // 0' "$TRAFFIC_FILE"
+  local start=$1 finish=$2
+  jq --arg start "$start" --arg finish "$finish" '[.inbounds[]?.daily | to_entries[]? | select(.key >= $start and .key <= $finish) | .value] | add // 0' "$TRAFFIC_FILE"
 }
 
 traffic_limit_count() {
@@ -3775,10 +3775,10 @@ traffic_show() {
   print_table_cell_clipped "标签" 20; printf '| '
   print_table_cell_clipped "协议" 10; printf '| '
   print_table_cell "端口" 7; printf '| %14s\n' "总流量"
-  rows=$(jq -r --arg start "$start" --arg end "$end" '
+  rows=$(jq -r --arg start "$start" --arg finish "$end" '
     .inbounds | to_entries | sort_by(.key)[] |
     [.key,(.value.protocol // "unknown"),((.value.port // 0)|tostring),
-     ([.value.daily | to_entries[]? | select(.key >= $start and .key <= $end) | .value] | add // 0),
+     ([.value.daily | to_entries[]? | select(.key >= $start and .key <= $finish) | .value] | add // 0),
      (.value.deleted // false)] | @tsv
   ' "$TRAFFIC_FILE")
   if [[ -n $rows ]]; then
