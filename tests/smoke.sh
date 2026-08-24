@@ -162,6 +162,7 @@ SBCTL_SING_BOX_BIN="$MOCK/sing-box" \
 SBCTL_CONFIG_DIR="$RESTORE/cfg" \
 SBCTL_CONFIG_FILE="$RESTORE/cfg/config.json" \
 SBCTL_META_FILE="$RESTORE/meta.json" \
+SBCTL_TRAFFIC_FILE="$RESTORE/traffic.json" \
 SBCTL_CERT_DIR="$RESTORE/certs" \
 SBCTL_BACKUP_DIR="$RESTORE/backups" \
 SBCTL_LOCK_FILE="$RESTORE/lock" \
@@ -172,15 +173,21 @@ bash -c '
   meta_set_host backup-tag backup.example
   printf old >"$CERT_DIR/kept.crt"
   printf old >"$CERT_DIR/kept.key"
+  traffic_init_file
+  tmp=$(temp_file)
+  jq ".inbounds.test={protocol:\"vless\",port:12345,deleted:false,daily:{\"2026-08-24\":4096}}" "$TRAFFIC_FILE" >"$tmp"
+  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
   archive="$SBCTL_BACKUP_DIR/test.tar.gz"
   backup_all "$archive"
   meta_set_host backup-tag changed.example
   printf stale >"$CERT_DIR/stale.crt"
   printf stale >"$CERT_DIR/stale.key"
+  tmp=$(temp_file); jq ".inbounds.test.daily[\"2026-08-24\"]=1" "$TRAFFIC_FILE" >"$tmp"; install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
   confirm(){ return 0; }
   restore_backup "$archive"
   [[ $(jq -r ".inbounds[\"backup-tag\"].host" "$META_FILE") == backup.example ]]
   [[ -f $CERT_DIR/kept.crt && ! -e $CERT_DIR/stale.crt ]]
+  [[ $(jq -r ".inbounds.test.daily[\"2026-08-24\"]" "$TRAFFIC_FILE") == 4096 ]]
 '
 
 run_generated_case() {

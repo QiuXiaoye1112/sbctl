@@ -296,6 +296,7 @@ hy2_hop_configure() {
     if apply_candidate "$tmp"; then
       hy2_hop_meta_set "$tag" "$range"
       hy2_hop_sync
+      traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
       info "Hysteria2 端口跳跃已启用：${range} -> UDP ${internal_port}（外部端口通过 NAT 重定向）"
     else
       rm -f "$tmp"
@@ -307,6 +308,7 @@ hy2_hop_configure() {
 
   hy2_hop_meta_set "$tag" "$range"
   hy2_hop_sync
+  traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
   info "Hysteria2 端口跳跃已启用：${range} -> UDP ${listen_port}"
 }
 

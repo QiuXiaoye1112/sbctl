@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SBCTL_VERSION="0.4.6"
+readonly SBCTL_VERSION="0.5.0"
 readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
@@ -19,6 +19,7 @@ SING_BOX_BIN="${SBCTL_SING_BOX_BIN:-$SING_BOX_RELEASE_INSTALL_PATH}"
 CONFIG_DIR="${SBCTL_CONFIG_DIR:-/etc/sing-box}"
 CONFIG_FILE="${SBCTL_CONFIG_FILE:-${CONFIG_DIR}/config.json}"
 META_FILE="${SBCTL_META_FILE:-/var/lib/sbctl/meta.json}"
+TRAFFIC_FILE="${SBCTL_TRAFFIC_FILE:-/var/lib/sbctl/traffic.json}"
 CERT_DIR="${SBCTL_CERT_DIR:-${CONFIG_DIR}/certs}"
 BACKUP_DIR="${SBCTL_BACKUP_DIR:-/var/backups/sbctl}"
 QUICK_COMMAND="${SBCTL_COMMAND_PATH:-/usr/local/sbin/sbctl}"
@@ -67,6 +68,7 @@ SBCTL_MODULES=(
   "inbound/clients"
   "outbound"
   "share"
+  "traffic"
   "certificate/lifecycle"
   "certificate/cloudflare"
   "certificate/certbot"

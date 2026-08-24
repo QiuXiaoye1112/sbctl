@@ -53,7 +53,7 @@ sing_box_installed() { return 1; }
 hy2_hop_sync() { :; }
 
 write_default_config
-[[ $SBCTL_VERSION == 0.4.6 ]]
+[[ $SBCTL_VERSION == 0.5.0 ]]
 
 # Generated service definitions should include explicit sbctl hardening.
 create_service_definition

@@ -13,6 +13,7 @@ bash tests/unit/inbound-build.sh
 bash tests/unit/share.sh
 bash tests/unit/inbound-modify.sh
 bash tests/unit/clients.sh
+bash tests/unit/traffic.sh
 bash tests/integration/state-transaction.sh
 bash tests/sing-box-install.sh
 bash tests/outbound.sh

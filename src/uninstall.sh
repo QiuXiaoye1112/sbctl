@@ -203,6 +203,7 @@ _remove_backups() {
 _scan_sbctl_residuals() {
   local __count_var=$1 include_backups=${2:-0} count=0 path
   local paths=("$QUICK_COMMAND" "$QUICK_SYMLINK" "$CONFIG_FILE" "$META_FILE" "$CERT_DIR" "$CERTBOT_VENV" "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR" \
+    "$TRAFFIC_FILE" "$TRAFFIC_SYSTEMD_SERVICE" "$TRAFFIC_SYSTEMD_TIMER" "$TRAFFIC_OPENRC_SERVICE" \
     "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" /etc/periodic/daily/sbctl-certbot-renew)
   [[ $LIB_DIR != /usr/local/lib/sbctl ]] || paths+=("$LIB_DIR")
   ((include_backups == 0)) || paths+=("$BACKUP_DIR" /etc/sysctl.d/99-sbctl-bbr.conf)
@@ -238,6 +239,7 @@ _sbctl_uninstall_level_1() {
     info "最终备份已创建：$backup"
   fi
   _uninstall_snapshot_metadata
+  cleanup_step "停止并删除流量统计" traffic_remove_all || ((failures+=1))
   cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
   cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
   cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
@@ -271,6 +273,7 @@ EOF_ERASE
   read -r answer || { echo; return 0; }
   [[ $answer == DELETE ]] || { info "已取消彻底删除。"; return 0; }
   _uninstall_snapshot_metadata
+  cleanup_step "停止并删除流量统计" traffic_remove_all || ((failures+=1))
   cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
   cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
   cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
@@ -295,6 +298,7 @@ uninstall_sing_box() {
   esac
   # Clean up Hysteria2 port hopping rules if sing-box was removed
   if ! sing_box_installed; then
+    traffic_runtime_stop || warn "流量统计运行时未能完全停止。"
     hy2_hop_clear_rules
     hy2_hop_boot_service_remove
   fi

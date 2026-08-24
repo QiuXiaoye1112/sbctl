@@ -207,6 +207,7 @@ add_inbound() {
         hy2_hop_meta_disable "$tag"
       fi
     fi
+    traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
     heading "入站已创建"
     show_inbound "$tag"
     print_share "$tag" "" || true
@@ -279,6 +280,7 @@ delete_inbound() {
   jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
     hy2_hop_sync
+    traffic_after_config_change "$tag" || warn "流量统计规则未能同步，请在流量信息中刷新。"
     info "已删除入站 ${tag}。"
   else
     rc=$?
@@ -301,6 +303,7 @@ modify_inbound_basic() {
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
     hy2_hop_sync
+    traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
   else
     rc=$?
   fi
@@ -369,6 +372,7 @@ rename_inbound() {
   jq --arg old "$old" --arg new "$new" 'if .inbounds[$old] then .inbounds[$new]=.inbounds[$old] | del(.inbounds[$old]) else . end' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
     hy2_hop_sync
+    traffic_after_config_change "$old" "$new" || warn "流量统计记录未能迁移，请在流量信息中刷新。"
     info "入站已重命名：${old} -> ${new}"
   else
     rc=$?

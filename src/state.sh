@@ -163,17 +163,19 @@ normalize_config_tags() {
 backup_all() {
   require_root backup; ensure_config
   local target=${1:-${BACKUP_DIR}/sbctl-$(timestamp).tar.gz} paths=("${CONFIG_FILE#/}" "${META_FILE#/}")
+  traffic_is_enabled && traffic_collect || true
   mkdir -p "$BACKUP_DIR" "$(dirname "$target")"
   [[ ! -d $CERT_DIR ]] || paths+=("${CERT_DIR#/}")
+  [[ ! -f $TRAFFIC_FILE ]] || paths+=("${TRAFFIC_FILE#/}")
   tar -czf "$target" -C / "${paths[@]}" || die "备份失败。"
   chmod 600 "$target"; meta_resource_register backupDir "$BACKUP_DIR"
   info "备份已创建：$target"
-  info "提示：备份包含配置、metadata 和证书副本，不包含 Certbot 账户/lineage 数据。"
+  info "提示：备份包含配置、metadata、流量记录和证书副本，不包含 Certbot 账户/lineage 数据。"
 }
 
 restore_backup() {
   ensure_dependencies restore; ensure_config
-  local archive=${1-} temp extract_config snapshot had_meta=0 had_certs=0
+  local archive=${1-} temp extract_config snapshot had_meta=0 had_certs=0 had_traffic=0 restored_traffic=0
   [[ -n $archive ]] || prompt_value archive "备份文件路径"
   [[ -r $archive ]] || die "无法读取备份。"
   tar -tzf "$archive" >/dev/null || { warn "不是有效的 tar.gz 备份。"; return 0; }
@@ -183,22 +185,29 @@ restore_backup() {
   [[ -f $temp/$extract_config ]] || { rm -rf "$temp"; die "备份中没有配置文件。"; }
   validate_candidate "$temp/$extract_config" || { rm -rf "$temp"; die "备份配置验证失败。"; }
   confirm "恢复会覆盖当前配置、元数据和托管证书，继续？" N || { rm -rf "$temp"; return; }
+  if traffic_is_enabled; then traffic_collect || true; traffic_runtime_stop; fi
   snapshot="$temp/.current"; mkdir -p "$snapshot"; cp -a "$CONFIG_FILE" "$snapshot/config.json"
   [[ ! -f $META_FILE ]] || { cp -a "$META_FILE" "$snapshot/meta.json"; had_meta=1; }
   [[ ! -d $CERT_DIR ]] || { cp -a "$CERT_DIR" "$snapshot/certs"; had_certs=1; }
+  [[ ! -f $TRAFFIC_FILE ]] || { cp -a "$TRAFFIC_FILE" "$snapshot/traffic.json"; had_traffic=1; }
   cp -a "$temp/$extract_config" "$CONFIG_FILE"
   if [[ -f $temp/${META_FILE#/} ]]; then cp -a "$temp/${META_FILE#/}" "$META_FILE"; else rm -f "$META_FILE"; fi
   init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
   [[ ! -d $temp/${CERT_DIR#/} ]] || cp -a "$temp/${CERT_DIR#/}/." "$CERT_DIR/"
-  if ! restart_service_checked || ! hy2_hop_sync; then
-    error "恢复后服务或 Hysteria2 端口跳跃规则失败，正在整体回滚。"
+  if [[ -f $temp/${TRAFFIC_FILE#/} ]]; then
+    mkdir -p "$(dirname "$TRAFFIC_FILE")"; install -m 600 "$temp/${TRAFFIC_FILE#/}" "$TRAFFIC_FILE"; restored_traffic=1
+  fi
+  if ! restart_service_checked || ! hy2_hop_sync || ! traffic_runtime_ensure; then
+    error "恢复后服务、端口跳跃或流量统计运行时失败，正在整体回滚。"
     cp -a "$snapshot/config.json" "$CONFIG_FILE"
     ((had_meta)) && cp -a "$snapshot/meta.json" "$META_FILE" || rm -f "$META_FILE"
     init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
     ((had_certs)) && cp -a "$snapshot/certs/." "$CERT_DIR/" || true
+    if ((had_traffic)); then install -m 600 "$snapshot/traffic.json" "$TRAFFIC_FILE"; elif ((restored_traffic)); then rm -f "$TRAFFIC_FILE"; fi
     restart_service_checked || true
     hy2_hop_sync || true
-    rm -rf "$temp"; die "恢复失败，已回滚 config/meta/certs 和端口跳跃规则。"
+    traffic_runtime_ensure || true
+    rm -rf "$temp"; die "恢复失败，已回滚 config/meta/certs/traffic 和相关运行时规则。"
   fi
   local id source auto_renew cert_name warned=0
   while IFS= read -r id; do

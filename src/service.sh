@@ -107,6 +107,8 @@ system_diagnostics() {
   printf 'BBR 持久化来源: %s\n' "$(bbr_manager)"
   printf '配置: %s\n' "$CONFIG_FILE"
   printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
+  if traffic_is_enabled; then printf '流量统计: 运行中（%s）\n' "$(traffic_backend)"; else printf '流量统计: 已停止\n'; fi
+  if traffic_limits_are_enabled; then printf '流量限制: 已启用（%s 个入站）\n' "$(traffic_limit_count)"; else printf '流量限制: 未启用\n'; fi
   printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"
   if load_cloudflare_credentials 2>/dev/null; then printf 'Cloudflare DNS: 已配置\n'; else printf 'Cloudflare DNS: 未配置\n'; fi
   if [[ -f $CONFIG_FILE ]]; then
@@ -543,6 +545,9 @@ install_quick_command() {
 install_or_update_sing_box() {
   ensure_dependencies install
   install_sing_box_release "${1-}" || die "sing-box 官方 Release 安装/更新失败；原核心与服务已保留。"
+  if traffic_is_enabled; then
+    traffic_runtime_ensure || warn "sing-box 已安装，但流量统计运行时恢复失败。"
+  fi
   info "sing-box 已就绪：$($SING_BOX_BIN version | sed -n '1p')"
 }
 

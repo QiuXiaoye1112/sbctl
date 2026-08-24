@@ -2,7 +2,7 @@
 
 `sbctl` 是面向 Linux 的 sing-box 终端管理器。交互思路参考 `xrayctl`，但配置、服务和协议实现均针对 sing-box。
 
-当前版本：`0.4.6`
+当前版本：`0.5.0`
 
 ## 支持环境
 
@@ -22,6 +22,7 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 - REALITY 与证书 TLS
 - 用户新增、重命名、删除和凭据轮换
 - SOCKS5 / HTTP / 本地地址出站与入站绑定
+- 按入站累计流量、日期范围查询和滚动三个月日分桶
 - 配置候选校验、事务应用和失败回滚
 - Let's Encrypt 域名证书、公网 IP 证书、证书导入
 - Cloudflare DNS 自动验证/续期（账号邮箱 + Global API Key）
@@ -76,6 +77,15 @@ sbctl update
 sbctl restart
 sbctl logs 100
 sbctl diagnose
+sbctl traffic
+sbctl traffic 2026-05-24 2026-08-24
+sbctl traffic enable
+sbctl traffic disable
+sbctl traffic limit enable
+sbctl traffic limit set vless 100
+sbctl traffic limit show
+sbctl traffic limit remove vless
+sbctl traffic limit disable
 
 sbctl inbound list
 sbctl inbound add
@@ -117,6 +127,37 @@ sbctl uninstall
 sbctl uninstall --purge
 sbctl uninstall --erase
 ```
+
+## 流量统计
+
+首页的“流量信息”按入站标签展示指定日期范围内的总流量，上传与下载合并计算。第一次进入时可选择开启统计；开启后 systemd timer 或 OpenRC supervise-daemon 每分钟采集一次。
+
+```text
+流量信息
+
+统计状态：运行中
+统计范围：2026-05-24 ～ 2026-08-24
+
+标签                 | 协议       | 端口    |       总流量
+vless                | vless      | 17225   |      12.48 GB
+vless2               | vless      | 14332   |       6.27 GB
+----------------------------------------------------------
+全部入站：18.75 GB
+```
+
+日期输入默认从今天向前推三个自然月至今天。流量按天保存在 `/var/lib/sbctl/traffic.json`，只保留滚动最近三个月；月底向前推三个月时会自动取目标月份最后一天。入站改名会迁移记录，已删除入站的记录保留至三个月窗口结束。
+
+统计使用 sbctl 独立管理的 nftables/iptables 计数表，不修改用户现有规则的内容，也不开放网络管理 API。数值是入站端口处收到和发出的网络层字节总和，包含协议握手及传输开销；采集任务异常退出时，最多可能丢失尚未落盘的一个采集周期。
+
+### 月度流量限制
+
+“流量限制”与流量统计相互独立，限制功能默认不启用。手动启用后，可以为每个入站分别设置月度额度；没有设置额度的入站不受影响。
+
+首次设置额度时，以服务器本地时间的准确时刻作为周期锚点。例如在 `2026-08-07 18:00:00` 设置 100 GB，首个周期是 `2026-08-07 18:00:00 ～ 2026-09-07 18:00:00`。修改额度不会重置原周期和已用流量；取消后重新创建才会使用新的创建时间。31 日创建的周期在短月份取最后一天，但后续仍回到 31 日，例如 `01-31 18:00 → 02-28 18:00 → 03-31 18:00`。
+
+本周期上传和下载合计达到额度时，sbctl 在自有 nftables/iptables 规则中阻断该入站端口，不删除 sing-box 配置，也不影响其他入站；到下一个周期自动解除。判断每分钟执行一次，因此极端情况下可能产生约一个采集周期的少量超额。关闭流量限制会立即解除阻断，但保留各入站的额度、周期和累计值；再次启用时按保留值继续判断。
+
+流量限制依赖流量统计。限制功能启用期间不能停止流量统计，需要先关闭限制功能。清空流量记录也会把对应入站的当前周期已用流量清零并解除阻断。
 
 ## v0.4 可靠性与成熟度设计
 
@@ -248,7 +289,7 @@ dns_cloudflare_api_key = YOUR_GLOBAL_API_KEY
 - 被 TLS 入站引用的证书禁止直接删除。
 - 删除 sbctl 签发的证书会同步删除对应 sbctl Certbot lineage。
 - 旧版证书会登记为 `legacy`，不会擅自假设可以自动续期。
-- 备份保存托管证书副本，但不保存 Certbot account/lineage 或 Cloudflare Key；恢复后缺失续期数据会明确告警。
+- 备份保存托管证书副本和流量记录，但不保存 Certbot account/lineage 或 Cloudflare Key；恢复后缺失续期数据会明确告警。
 
 ## 备份与恢复
 
@@ -257,7 +298,7 @@ sbctl backup
 sbctl restore /path/to/backup.tar.gz
 ```
 
-恢复前会检查 tar.gz 和路径穿越，再用 sing-box 校验备份配置。恢复 config、metadata、certs 后若服务无法恢复，会整体回滚三者，而不是只恢复 config。
+恢复前会检查 tar.gz 和路径穿越，再用 sing-box 校验备份配置。恢复 config、metadata、certs、traffic 后若服务或相关运行时无法恢复，会整体回滚，而不是只恢复 config。
 
 ## 卸载
 
@@ -302,6 +343,7 @@ sbctl diagnose
 - 公网 IPv4 / IPv6
 - BBR
 - metadata schema
+- 流量统计状态与计数后端
 - 托管证书与自动续期数量
 - Certbot account 数量
 - Cloudflare DNS 凭据状态
@@ -323,6 +365,7 @@ src/inbound.sh                   入站生命周期
 src/inbound/clients.sh           入站用户 CRUD
 src/outbound.sh                  出站与路由绑定
 src/share.sh                     分享 URI / 客户端 JSON（只读）
+src/traffic.sh                   按入站流量计数、三个月日分桶、月度额度与采集任务
 src/service.sh                   sing-box 安装、服务、BBR 与诊断
 src/uninstall.sh                 三级卸载与资源归属保护
 src/menu.sh                      菜单、CLI dispatch 与 help
