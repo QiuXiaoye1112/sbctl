@@ -243,6 +243,39 @@ grep -Fxq $'vless\t350' <<<"$rows"
 ! traffic_clear_nft_rules 2>/dev/null
 BASH_NFT
 
+# Real nft JSON includes table and chain objects alongside rule objects. Those
+# non-rule nodes must not be mistaken for foreign rules in an sbctl-owned table.
+SBCTL_TESTING=1 \
+SBCTL_CONFIG_DIR="$TMP/nft-owned/cfg" \
+SBCTL_CONFIG_FILE="$TMP/nft-owned/cfg/config.json" \
+SBCTL_META_FILE="$TMP/nft-owned/meta.json" \
+SBCTL_TRAFFIC_FILE="$TMP/nft-owned/traffic.json" \
+SBCTL_CERT_DIR="$TMP/nft-owned/cfg/certs" \
+SBCTL_LOCK_FILE="$TMP/nft-owned/lock" \
+CASE_DIR="$TMP/nft-owned" \
+bash <<'BASH_NFT_OWNED'
+set -Eeuo pipefail
+source ./sbctl.sh
+mkdir -p "$CASE_DIR"
+nft() {
+  if [[ ${1-} == -j ]]; then
+    cat <<'JSON'
+{"nftables":[
+  {"metainfo":{"version":"1.0.9"}},
+  {"table":{"family":"inet","name":"sbctl_traffic"}},
+  {"chain":{"family":"inet","table":"sbctl_traffic","name":"input"}},
+  {"chain":{"family":"inet","table":"sbctl_traffic","name":"output"}},
+  {"rule":{"family":"inet","table":"sbctl_traffic","chain":"input","comment":"sbctl-traffic:count:vless","expr":[]}}
+]}
+JSON
+    return 0
+  fi
+  local IFS=' '; printf '%s\n' "$*" >>"$CASE_DIR/nft-calls"
+}
+traffic_clear_nft_rules
+grep -Fxq 'delete table inet sbctl_traffic' "$CASE_DIR/nft-calls"
+BASH_NFT_OWNED
+
 # iptables fallback counts only accounting rules and places DROP rules before
 # the counter/RETURN rules for an exhausted inbound.
 SBCTL_TESTING=1 \
@@ -356,5 +389,20 @@ grep -Fxq "ExecStart=$QUICK_COMMAND internal-traffic-collect" "$TRAFFIC_SYSTEMD_
 traffic_timer_remove
 [[ ! -e $TRAFFIC_SYSTEMD_SERVICE && ! -e $TRAFFIC_SYSTEMD_TIMER ]]
 BASH_RUNTIME
+
+# Returning from either quota-menu state is a successful navigation action;
+# it must not bubble the preceding boolean probe's status up to traffic_menu.
+SBCTL_TESTING=1 bash <<'BASH_MENU_RETURN'
+set -Eeuo pipefail
+source ./sbctl.sh
+clear_screen() { :; }
+traffic_is_enabled() { return 0; }
+traffic_collect() { :; }
+traffic_limits_show() { :; }
+traffic_limits_are_enabled() { return 1; }
+traffic_limit_menu <<<"0" >/dev/null
+traffic_limits_are_enabled() { return 0; }
+traffic_limit_menu <<<"0" >/dev/null
+BASH_MENU_RETURN
 
 printf 'traffic accounting unit checks passed.\n'

@@ -343,7 +343,8 @@ traffic_clear_nft_rules() {
   local payload
   payload=$(nft -j list table inet "$TRAFFIC_NFT_TABLE" 2>/dev/null) || return 0
   if ! jq -e '
-    [.nftables[]?.rule | select(((.comment // "") | startswith("sbctl-traffic:")) | not)] | length==0
+    [.nftables[]?.rule | select(. != null) |
+      select(((.comment // "") | startswith("sbctl-traffic:")) | not)] | length==0
   ' <<<"$payload" >/dev/null; then
     warn "nftables 表 ${TRAFFIC_NFT_TABLE} 含有非 sbctl 规则，拒绝删除。"
     return 1

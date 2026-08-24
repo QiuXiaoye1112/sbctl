@@ -272,7 +272,7 @@ traffic_menu() {
 traffic_limit_menu() {
   local choice
   while true; do
-    traffic_is_enabled && run_menu_action traffic_collect
+    if traffic_is_enabled; then run_menu_action traffic_collect || true; fi
     clear_screen
     traffic_limits_show || true
     if traffic_limits_are_enabled; then
@@ -287,13 +287,13 @@ traffic_limit_menu() {
         2) run_menu_action traffic_limit_set; pause;;
         3) run_menu_action traffic_limit_remove; pause;;
         4) run_menu_action traffic_limits_disable; pause;;
-        0) return;;
+        0) return 0;;
         *) warn "无效选项。"; pause;;
       esac
     else
       case $choice in
         1) run_menu_action traffic_limits_enable; pause;;
-        0) return;;
+        0) return 0;;
         *) warn "无效选项。"; pause;;
       esac
     fi
