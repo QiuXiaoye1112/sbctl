@@ -269,6 +269,12 @@ find_external_sing_box() {
   command -v sing-box 2>/dev/null || true
 }
 
+create_sing_box_work_dir() {
+  local base=${SBCTL_TMP_DIR:-/var/tmp}
+  mkdir -p "$base" || return 1
+  mktemp -d "$base/sbctl-sing-box.XXXXXX"
+}
+
 ensure_sing_box_install_target_safe() {
   local target=$SING_BOX_RELEASE_INSTALL_PATH expected actual external
   [[ $target == /usr/local/bin/sing-box || ${SBCTL_TESTING:-0} == 1 ]] || {
@@ -367,7 +373,7 @@ install_sing_box_release() {
   ensure_sing_box_install_target_safe || return 1
   version=$(resolve_sing_box_version "$requested") || return 1
   arch=$(detect_sing_box_arch) || return 1
-  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-sing-box.XXXXXX") || { error "无法创建 sing-box 临时目录。"; return 1; }
+  work_dir=$(create_sing_box_work_dir) || { error "无法创建 sing-box 临时目录。"; return 1; }
   SING_BOX_DOWNLOADED_BINARY=""; SING_BOX_DOWNLOADED_PLATFORM=""
   if ! download_sing_box_release "$version" "$arch" "$work_dir"; then rm -rf -- "$work_dir"; return 1; fi
   candidate=$SING_BOX_DOWNLOADED_BINARY

@@ -15,7 +15,12 @@ fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --conn
 [[ $(id -u) -eq 0 ]] || die "请使用 root 运行。"
 for dependency in curl install bash; do command -v "$dependency" >/dev/null 2>&1 || die "缺少 ${dependency}。"; done
 
-candidate=$(mktemp "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
+bootstrap_tmp_dir() {
+  local base=${SBCTL_TMP_DIR:-/var/tmp}
+  mkdir -p "$base" && mktemp "$base/sbctl-bootstrap.XXXXXX"
+}
+
+candidate=$(bootstrap_tmp_dir) || die "无法创建引导安装临时文件。"
 trap 'rm -f "$candidate"' EXIT
 fetch "$DIST_URL" "$candidate" || die "sbctl 发行版下载失败。"
 grep -Fq '# Built from modular sources by scripts/build.sh.' "$candidate" || die "下载内容不是有效的 sbctl 发行版。"
