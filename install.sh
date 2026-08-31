@@ -9,7 +9,14 @@ readonly DIST_URL="${SBCTL_DIST_URL:-https://raw.githubusercontent.com/${REPO}/r
 
 info() { printf '[sbctl] %s\n' "$*"; }
 die() { printf '[sbctl] 错误: %s\n' "$*" >&2; exit 1; }
-fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$1" -o "$2"; }
+fetch() {
+  local url=$1 separator='?'
+  [[ $url == *\?* ]] && separator='&'
+  # Raw/CDN may serve an older immutable-looking main-branch object; use a
+  # per-run query parameter so the README installer always obtains current code.
+  url="${url}${separator}sbctl_cache=$(date +%s)"
+  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 60 "$url" -o "$2"
+}
 
 [[ $(uname -s) == Linux ]] || die "仅支持 Linux。"
 [[ $(id -u) -eq 0 ]] || die "请使用 root 运行。"
