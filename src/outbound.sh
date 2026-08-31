@@ -556,7 +556,7 @@ select_outbound() {
       for ((i=0; i<${#local_ip_tags[@]}; i++)); do
         [[ ${local_ip_tags[$i]} == "$t" ]] && { dlabel="${local_ips[$i]}"; found=1; break; }
       done
-      if ((found)); then display_labels+=("${dlabel}"); else display_labels+=("$t"); fi
+      if ((found)); then display_labels+=("${dlabel%% *}"); else display_labels+=("$t"); fi
     else
       display_labels+=("$t")
     fi
