@@ -155,7 +155,7 @@ sing_box_version_summary() {
 }
 
 node_summary() {
-  local svc count=0 ver
+  local svc count=0 bbr ver
   if [[ ${SBCTL_TESTING:-0} != 1 ]]; then
     local load active
     read -r load active _ <<< "$(_service_states)"
@@ -166,8 +166,13 @@ node_summary() {
     svc=未安装
   fi
   [[ -f $CONFIG_FILE ]] && count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf 0)
+  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+    if [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then bbr=已启用; else bbr=未启用; fi
+  else
+    bbr=不可用
+  fi
   ver=$(sing_box_version_summary)
-  printf '服务: %s  |  入站: %s  |  sing-box: %s\n' "$svc" "$count" "${ver:-已安装}"
+  printf '服务: %s  |  入站: %s  |  BBR: %s  |  sing-box: %s\n' "$svc" "$count" "$bbr" "${ver:-已安装}"
 }
 
 # APT uses a foreground timeout when available so package hooks cannot suspend
