@@ -2622,9 +2622,7 @@ select_outbound() {
       done
       if ((found)); then display_labels+=("${dlabel}"); else display_labels+=("$t"); fi
     else
-      local stype; stype=$(jq -r --arg tag "$t" '.outbounds[]?|select(.tag==$tag)|.type' "$CONFIG_FILE" 2>/dev/null || printf '?')
-      local saddr; saddr=$(jq -r --arg tag "$t" '.outbounds[]?|select(.tag==$tag)|"\(.server // "?"):\(.server_port // "?")"' "$CONFIG_FILE" 2>/dev/null || printf '?:?')
-      display_labels+=("$t ($stype · $saddr)")
+      display_labels+=("$t")
     fi
   done
   choose answer "选择出站" "${display_labels[@]}"
