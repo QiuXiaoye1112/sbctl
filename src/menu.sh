@@ -336,7 +336,7 @@ sbctl - sing-box Linux 管理器
   sbctl traffic [开始日期] [结束日期] 查看按入站累计流量
   sbctl traffic enable|disable       开启/停止流量统计
   sbctl traffic limit show|enable|disable
-  sbctl traffic limit set <标签> <GB>
+  sbctl traffic limit set <标签> <GB> <重置日>
   sbctl traffic limit remove <标签>
 
   sbctl inbound list                 列出入站
@@ -421,7 +421,7 @@ dispatch() {
             show) traffic_limits_show;;
             enable|start) traffic_limits_enable;;
             disable|stop) traffic_limits_disable;;
-            set) traffic_limit_set "${3-}" "${4-}";;
+            set) traffic_limit_set "${3-}" "${4-}" "${5-}";;
             remove|delete) traffic_limit_remove "${3-}";;
             *) die "未知 traffic limit 子命令：${2}";;
           esac
