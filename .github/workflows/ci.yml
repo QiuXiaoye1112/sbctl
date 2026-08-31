@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq openssl shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq openssl ripgrep shellcheck
       - name: Static validation
         run: |
           bash scripts/build.sh
@@ -71,7 +71,7 @@ jobs:
       - name: Alpine/OpenRC compatibility tests
         run: |
           docker run --rm -v "$PWD:/src" -w /src alpine:3.21 sh -ec '
-            apk add --no-cache bash curl jq openssl coreutils >/dev/null
+            apk add --no-cache bash curl jq openssl coreutils ripgrep >/dev/null
             export TERM=xterm SBCTL_TESTING=1
             bash scripts/build.sh
             bash -n sbctl.sh src/*.sh src/*/*.sh tests/*.sh tests/*/*.sh dist/sbctl
