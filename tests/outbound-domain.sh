@@ -166,16 +166,16 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
     map(.domain_suffix[0]) | sort == ["batch-one.test", "batch-three.test", "batch-two.test"]
   ' "$CONFIG_FILE" >/dev/null
 
-  before=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
-  add_domain_rule in-test suffix batch-one.test,batch-four.test socks-B
-  after=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
-  [[ $before == "$after" ]]
+  mixed_output=$(add_domain_rule in-test suffix \
+    batch-one.test,batch-four.test,batch-four.test socks-B 2>&1)
+  [[ $mixed_output == *'已跳过已有域名规则：in-test suffix batch-one.test。'* ]]
   jq -e '
     [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-one.test"])] |
     length == 1 and .[0].outbound == "socks-A"
   ' "$CONFIG_FILE" >/dev/null
   jq -e '
-    [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-four.test"])] | length == 0
+    [.route.rules[] | select(.inbound==["in-test"] and .domain_suffix==["batch-four.test"])] |
+    length == 1 and .[0].outbound == "socks-B"
   ' "$CONFIG_FILE" >/dev/null
 
   local_tag=$(_ensure_local_outbound 2001:db8::1234)
@@ -307,26 +307,26 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   [[ $choice_outbound == direct ]]
   ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
 
-  desired_top='192.0.2.123 (IPv4)'
+  desired_top='192.0.2.123'
   choose_prompts=()
   select_outbound choice_outbound 1
   [[ $choice_outbound == local-192-0-2-123 ]]
   ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
   jq -e --arg tag "$choice_outbound" '.outbounds | any(.[]; .tag==$tag and has("inet4_bind_address") and (.inet6_bind_address|not) and (.domain_strategy|not) and (.fallback_delay|not))' "$CONFIG_FILE" >/dev/null
 
-  desired_top='socks-A (socks · 127.0.0.1:1080)'
+  desired_top='socks-A'
   choose_prompts=()
   select_outbound choice_outbound 1
   [[ $choice_outbound == socks-A ]]
   ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
 
-  desired_top='http-A (http · 127.0.0.1:8080)'
+  desired_top='http-A'
   choose_prompts=()
   select_outbound choice_outbound 1
   [[ $choice_outbound == http-A ]]
   ! printf '%s\n' "${choose_prompts[@]}" | grep -Fxq 'IPv4 回退'
 
-  desired_top='2001:db8::1234 (IPv6)'
+  desired_top='2001:db8::1234'
   desired_fallback=1
   choose_prompts=()
   select_outbound choice_outbound 1
@@ -390,7 +390,7 @@ add_domain_rule in-test suffix OPENAI.COM socks-A
   detect_local_ips() {
     printf '%s\t%s\t%s\n' '2001:db8::1234 (IPv6)' 2001:db8::1234 eth0
   }
-  desired_top='2001:db8::1234 (IPv6)'
+  desired_top='2001:db8::1234'
   choose_prompts=()
   select_outbound choice_outbound 1
   [[ $choice_outbound == local-2001-db8--1234 ]]

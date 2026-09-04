@@ -614,7 +614,7 @@ assign_outbound() {
 add_domain_rule() {
   ensure_dependencies outbound-rule-add; require_supported_core; ensure_config
   local inbound=${1-} match=${2-} domain=${3-} outbound=${4-} prompt_details=${5-} choice tmp
-  local normalized_domains normalized_domains_json domain_summary domain_count
+  local normalized_domains normalized_domains_json existing_domains existing_domains_json domain_summary domain_count
   local cli=0
   if [[ $prompt_details == --prompt ]]; then
     [[ -n $inbound && -z $match && -z $domain && -z $outbound ]] || die "内部调用参数无效。"
@@ -645,26 +645,30 @@ add_domain_rule() {
   if ((cli)); then
     normalized_domains=$(_normalize_domain_list "$domain") || die "域名列表无效。"
   fi
-  normalized_domains_json=$(printf '%s\n' "$normalized_domains" | jq -Rsc 'split("\n") | map(select(length > 0))')
-  if ! jq -e 'length == (unique | length)' <<<"$normalized_domains_json" >/dev/null; then
-    warn "域名列表中不能重复添加同一个域名。"
-    return 0
-  fi
-  local existing_domains
-  existing_domains=$(jq -r --arg inbound "$inbound" --arg match "$match" --argjson domains "$normalized_domains_json" "$(_sbctl_managed_domain_rule_filter)
+  normalized_domains_json=$(printf '%s\n' "$normalized_domains" | jq -Rsc '
+    split("\n") | map(select(length > 0)) |
+    reduce .[] as $domain ([]; if index($domain) then . else . + [$domain] end)')
+  existing_domains_json=$(jq -c --arg inbound "$inbound" --arg match "$match" --argjson domains "$normalized_domains_json" "$(_sbctl_managed_domain_rule_filter)
     def sbctl_rule_domain(\$rule):
       (\$rule | if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end);
     [.route.rules[]? |
       select(sbctl_managed_domain_rule and .inbound==[\$inbound]) |
       (.) as \$rule |
       select(any(\$domains[]; . == sbctl_rule_domain(\$rule))) |
-      sbctl_rule_domain(\$rule)] | unique | join(\",\")" "$CONFIG_FILE")
+      sbctl_rule_domain(\$rule)] | unique" "$CONFIG_FILE")
+  existing_domains=$(jq -r 'join(",")' <<<"$existing_domains_json")
   if [[ -n $existing_domains ]]; then
-    warn "已有此域名规则：${inbound} ${match} ${existing_domains}！"
+    warn "已跳过已有域名规则：${inbound} ${match} ${existing_domains}。"
+  fi
+  normalized_domains_json=$(jq -c --argjson existing "$existing_domains_json" '
+    [.[] as $domain | select(($existing | index($domain)) == null) | $domain]' \
+    <<<"$normalized_domains_json")
+  domain_count=$(jq -r 'length' <<<"$normalized_domains_json")
+  if ((domain_count == 0)); then
+    info "没有需要添加的新域名规则。"
     return 0
   fi
-  domain_summary=${normalized_domains//$'\n'/,}
-  domain_count=$(jq -r 'length' <<<"$normalized_domains_json")
+  domain_summary=$(jq -r 'join(",")' <<<"$normalized_domains_json")
   tmp=$(temp_file)
   jq --arg inbound "$inbound" --arg match "$match" --arg outbound "$outbound" \
     --argjson domains "$normalized_domains_json" "$(_sbctl_managed_domain_rule_filter)
