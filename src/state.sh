@@ -56,7 +56,7 @@ apply_candidate_with_meta() {
   ensure_config
   validate_candidate "$candidate" || return 1
   if [[ -n $meta_candidate ]]; then
-    jq -e 'type=="object" and ((.inbounds // {})|type=="object")' "$meta_candidate" >/dev/null \
+    validate_metadata_candidate "$meta_candidate" \
       || { error "metadata 候选文件无效。"; return 1; }
   fi
   service_is_active && old_active=1
@@ -237,8 +237,47 @@ init_meta() {
   _sbctl_meta_legacy_cert_scan
 }
 
+validate_metadata_candidate() {
+  jq -e '
+    type=="object" and
+    ((.inbounds // {})|type)=="object" and
+    ((.certificates // {})|type)=="object" and
+    ((.managedResources // {})|type)=="object" and
+    ((.migrations // {})|type)=="object" and
+    ((.domainTemplates // {templates:[],bindings:[]})|type)=="object" and
+    ((.domainTemplates.templates // [])|type)=="array" and
+    ((.domainTemplates.bindings // [])|type)=="array" and
+    ((.domainTemplates.managed // [])|type)=="array"
+  ' "$1" >/dev/null 2>&1
+}
+
+commit_metadata_mutation() {
+  local mutator=$1 candidate rc=0
+  shift
+  init_meta
+  candidate=$(temp_file)
+  "$mutator" "$META_FILE" "$candidate" "$@" || { rm -f "$candidate"; return 1; }
+  commit_metadata_candidate "$candidate" || rc=$?
+  rm -f "$candidate"
+  return "$rc"
+}
+
+commit_metadata_candidate() {
+  local candidate=$1 snapshot rc=0
+  init_meta
+  validate_metadata_candidate "$candidate" || { error "metadata 候选文件无效。"; return 1; }
+  snapshot=$(temp_file)
+  cp -a "$META_FILE" "$snapshot"
+  if ! install -m 600 "$candidate" "$META_FILE"; then
+    install -m 600 "$snapshot" "$META_FILE" || true
+    rc=1
+  fi
+  rm -f "$snapshot"
+  return "$rc"
+}
+
 _sbctl_meta_default_json() {
-  printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{}}'
+  printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{},"domainTemplates":{"templates":[],"bindings":[],"managed":[]}}'
 }
 
 _sbctl_meta_upgrade_file() {
@@ -249,7 +288,11 @@ _sbctl_meta_upgrade_file() {
     .inbounds=(if (.inbounds|type)=="object" then .inbounds else {} end) |
     .certificates=(if (.certificates|type)=="object" then .certificates else {} end) |
     .managedResources=(if (.managedResources|type)=="object" then .managedResources else {} end) |
-    .migrations=(if (.migrations|type)=="object" then .migrations else {} end)
+    .migrations=(if (.migrations|type)=="object" then .migrations else {} end) |
+    .domainTemplates=(if (.domainTemplates|type)=="object" then .domainTemplates else {templates:[],bindings:[]} end) |
+    .domainTemplates.templates=(if (.domainTemplates.templates|type)=="array" then .domainTemplates.templates else [] end) |
+    .domainTemplates.bindings=(if (.domainTemplates.bindings|type)=="array" then .domainTemplates.bindings else [] end) |
+    .domainTemplates.managed=(if (.domainTemplates.managed|type)=="array" then .domainTemplates.managed else [] end)
   ' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
   install -m 600 "$tmp" "$META_FILE"
   rm -f "$tmp"

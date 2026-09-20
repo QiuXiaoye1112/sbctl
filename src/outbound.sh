@@ -382,14 +382,303 @@ _normalize_domain_list() {
   done
 }
 
+_meta_template_add() {
+  local current=$1 candidate=$2 name=$3
+  jq --arg name "$name" '
+    .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
+    if any(.domainTemplates.templates[]?; .name==$name) then
+      error("template already exists")
+    else
+      .domainTemplates.templates += [{name:$name,exact:[],suffix:[]}]
+    end
+  ' "$current" >"$candidate"
+}
+
+_meta_template_domains_add() {
+  local current=$1 candidate=$2 name=$3 match=$4 domains_json=$5
+  jq --arg name "$name" --arg match "$match" --argjson domains "$domains_json" '
+    if ($match!="exact" and $match!="suffix") then error("invalid match")
+    elif any(.domainTemplates.templates[]?; .name==$name) then
+      .domainTemplates.templates |= map(
+        if .name==$name then .[$match]=(((.[$match] // []) + $domains) | unique) else . end)
+    else error("template not found") end
+  ' "$current" >"$candidate"
+}
+
+_meta_template_domains_delete() {
+  local current=$1 candidate=$2 name=$3 match=$4 domains_json=$5
+  jq --arg name "$name" --arg match "$match" --argjson domains "$domains_json" '
+    if ($match!="exact" and $match!="suffix") then error("invalid match")
+    elif any(.domainTemplates.templates[]?; .name==$name) then
+      .domainTemplates.templates |= map(
+        if .name==$name then
+          .[$match]=[.[$match][]? as $domain | select(($domains | index($domain)) == null) | $domain]
+        else . end)
+    else error("template not found") end
+  ' "$current" >"$candidate"
+}
+
+_meta_template_bind() {
+  local current=$1 candidate=$2 inbound=$3 name=$4 outbound=$5
+  jq --arg inbound "$inbound" --arg name "$name" --arg outbound "$outbound" '
+    .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
+    if any(.domainTemplates.templates[]?; .name==$name) then
+      .domainTemplates.bindings=(
+        [.domainTemplates.bindings[]? | select(.inbound!=$inbound or .template!=$name)] +
+        [{inbound:$inbound,template:$name,outbound:$outbound}])
+    else error("template not found") end
+  ' "$current" >"$candidate"
+}
+
+_meta_template_unbind() {
+  local current=$1 candidate=$2 inbound=$3 name=$4
+  jq --arg inbound "$inbound" --arg name "$name" '
+    .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
+    .domainTemplates.bindings=[.domainTemplates.bindings[]? |
+      select(.inbound!=$inbound or .template!=$name)]
+  ' "$current" >"$candidate"
+}
+
+_meta_template_set_outbound() {
+  local current=$1 candidate=$2 inbound=$3 name=$4 outbound=$5
+  jq --arg inbound "$inbound" --arg name "$name" --arg outbound "$outbound" '
+    if any(.domainTemplates.bindings[]?; .inbound==$inbound and .template==$name) then
+      .domainTemplates.bindings |= map(
+        if .inbound==$inbound and .template==$name then .outbound=$outbound else . end)
+    else error("binding not found") end
+  ' "$current" >"$candidate"
+}
+
+list_domain_templates() {
+  init_meta
+  jq -r '.domainTemplates.templates[]? |
+    [.name,((.exact // [])|length),((.suffix // [])|length)] | @tsv' "$META_FILE"
+}
+
+domain_template_exists() {
+  init_meta
+  jq -e --arg name "$1" 'any(.domainTemplates.templates[]?; .name==$name)' "$META_FILE" >/dev/null
+}
+
+list_inbound_template_bindings() {
+  init_meta
+  jq -r --arg inbound "$1" '.domainTemplates.bindings[]? |
+    select(.inbound==$inbound) | [.template,.outbound] | @tsv' "$META_FILE"
+}
+
+# Later bindings win when multiple templates contain the same domain.
+_inbound_desired_template_entries() {
+  local __var=$1 metadata=$2 inbound=$3 result
+  result=$(jq -c --arg inbound "$inbound" '
+    .domainTemplates as $templates |
+    [$templates.bindings[]? | select(.inbound==$inbound)] as $bindings |
+    reduce (
+      $bindings[] as $binding |
+      ($templates.templates[]? | select(.name==$binding.template)) as $template |
+      (($template.exact[]? | {match:"exact",domain:.,key:("exact:"+.)}),
+       ($template.suffix[]? | {match:"suffix",domain:.,key:("suffix:"+.)})) |
+      {key:.key,match:.match,domain:.domain,template:$binding.template,outbound:$binding.outbound}
+    ) as $entry ({}; .[$entry.key]=$entry) |
+    [.[]]
+  ' "$metadata") || return 1
+  printf -v "$__var" '%s' "$result"
+}
+
+_sbctl_reconcile_template_filter() {
+  _sbctl_managed_domain_rule_filter
+  cat <<'JQ'
+def sbctl_rule_key:
+  if has("domain_suffix") then "suffix:"+.domain_suffix[0]
+  elif has("domain") then "exact:"+.domain[0]
+  else "" end;
+($desired | map({key:.key,value:.}) | from_entries) as $desired_map |
+.route=(.route // {}) |
+.route.rules=[(.route.rules // [])[]? |
+  (sbctl_rule_key) as $key |
+  if (sbctl_managed_domain_rule and .inbound==[$inbound] and (($owned | index($key)) != null)) then
+    if $desired_map[$key] != null then
+      .outbound=$desired_map[$key].outbound
+    else empty end
+  else . end]
+JQ
+}
+
+_sbctl_missing_template_filter() {
+  _sbctl_managed_domain_rule_filter
+  cat <<'JQ'
+def sbctl_rule_key:
+  if has("domain_suffix") then "suffix:"+.domain_suffix[0]
+  elif has("domain") then "exact:"+.domain[0]
+  else "" end;
+([.route.rules[]? | select(sbctl_managed_domain_rule and .inbound==[$inbound]) | sbctl_rule_key]) as $present |
+[$desired[] | select(.key as $key | ($present | index($key)) == null)]
+JQ
+}
+
+_sbctl_insert_template_filter() {
+  _sbctl_managed_domain_rule_filter
+  _sbctl_canonical_default_rule_filter
+  _sbctl_domain_rule_insert_filter
+  cat <<'JQ'
+def insert_template_rule($rules; $entry):
+  ($rules | sbctl_domain_insert_index($rules; $inbound; $entry.match; $entry.domain)) as $index |
+  sbctl_insert_rule($rules; $index;
+    ({inbound:[$inbound]} +
+     (if $entry.match=="suffix" then {domain_suffix:[$entry.domain]} else {domain:[$entry.domain]} end) +
+     {action:"route",outbound:$entry.outbound}));
+.route=(.route // {}) |
+(.route.rules // []) as $rules |
+.route.rules=(reduce $additions[] as $entry ($rules; insert_template_rule(.; $entry)))
+JQ
+}
+
+_rebuild_inbound_template_config() {
+  local __var=$1 base=$2 inbound=$3 metadata=$4 desired owned reconciled missing present new_owned metadata_next candidate
+  _inbound_desired_template_entries desired "$metadata" "$inbound" || return 1
+  owned=$(jq -c --arg inbound "$inbound" '[.domainTemplates.managed[]? |
+    select(.inbound==$inbound) | .match+":"+.domain]' "$metadata") || return 1
+  reconciled=$(temp_file)
+  jq --arg inbound "$inbound" --argjson desired "$desired" --argjson owned "$owned" \
+    "$(_sbctl_reconcile_template_filter)" "$base" >"$reconciled" || { rm -f "$reconciled"; return 1; }
+
+  missing=$(jq -c --arg inbound "$inbound" --argjson desired "$desired" \
+    "$(_sbctl_missing_template_filter)" "$reconciled") || { rm -f "$reconciled"; return 1; }
+
+  present=$(jq -c --arg inbound "$inbound" "$(_sbctl_managed_domain_rule_filter)
+    def rule_key: if has(\"domain_suffix\") then \"suffix:\"+.domain_suffix[0] else \"exact:\"+.domain[0] end;
+    [.route.rules[]? | select(sbctl_managed_domain_rule and .inbound==[\$inbound]) | rule_key]
+  " "$reconciled") || { rm -f "$reconciled"; return 1; }
+  new_owned=$(jq -nc --arg inbound "$inbound" --argjson desired "$desired" --argjson owned "$owned" --argjson present "$present" '
+    [$desired[] | . as $entry |
+      select(($owned | index($entry.key)) != null or ($present | index($entry.key)) == null) |
+      {inbound:$inbound,match:$entry.match,domain:$entry.domain}]') || { rm -f "$reconciled"; return 1; }
+  metadata_next=$(temp_file)
+  jq --arg inbound "$inbound" --argjson managed "$new_owned" '
+    .domainTemplates.managed=([.domainTemplates.managed[]? | select(.inbound!=$inbound)] + $managed)
+  ' "$metadata" >"$metadata_next" || { rm -f "$reconciled" "$metadata_next"; return 1; }
+  mv -f "$metadata_next" "$metadata"
+
+  if [[ $missing == '[]' ]]; then
+    printf -v "$__var" '%s' "$reconciled"
+    return 0
+  fi
+
+  candidate=$(temp_file)
+  jq --arg inbound "$inbound" --argjson additions "$missing" \
+    "$(_sbctl_insert_template_filter)" "$reconciled" >"$candidate" || { rm -f "$reconciled" "$candidate"; return 1; }
+  rm -f "$reconciled"
+  printf -v "$__var" '%s' "$candidate"
+}
+
+_rebuild_template_bound_inbounds_config() {
+  local __var=$1 metadata=$2 name=$3 current next inbound
+  current=$(temp_file)
+  cp "$CONFIG_FILE" "$current"
+  while IFS= read -r inbound; do
+    [[ -n $inbound ]] || continue
+    if ! _rebuild_inbound_template_config next "$current" "$inbound" "$metadata"; then
+      rm -f "$current"
+      return 1
+    fi
+    rm -f "$current"
+    current=$next
+  done < <(jq -r --arg name "$name" '.domainTemplates.bindings[]? |
+    select(.template==$name) | .inbound' "$metadata")
+  printf -v "$__var" '%s' "$current"
+}
+
+_commit_template_change() {
+  local config_candidate=$1 metadata_candidate=$2 message=$3 rc=0
+  if cmp -s "$CONFIG_FILE" "$config_candidate"; then
+    commit_metadata_candidate "$metadata_candidate" || rc=$?
+  else
+    apply_candidate_with_meta "$config_candidate" "$metadata_candidate" >/dev/null || rc=$?
+  fi
+  rm -f "$config_candidate" "$metadata_candidate"
+  ((rc == 0)) || return "$rc"
+  info "$message"
+}
+
+create_domain_template() {
+  ensure_dependencies outbound-template-create; ensure_config; init_meta
+  local name
+  prompt_value name "模板名称" || return 1
+  validate_tag "$name" || { warn "模板名称只能包含字母、数字、点、下划线和横线。"; return 1; }
+  if domain_template_exists "$name"; then warn "模板已存在：${name}"; return 1; fi
+  commit_metadata_mutation _meta_template_add "$name" || return 1
+  info "模板 ${name} 已创建。"
+}
+
+apply_domain_template() {
+  ensure_dependencies outbound-template-apply; require_supported_core; ensure_config; init_meta
+  local inbound=$1 name=$2 outbound=$3 metadata_candidate config_candidate
+  inbound_exists "$inbound" || die "找不到入站：$inbound"
+  domain_template_exists "$name" || die "找不到模板：$name"
+  [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
+  metadata_candidate=$(temp_file)
+  _meta_template_bind "$META_FILE" "$metadata_candidate" "$inbound" "$name" "$outbound" || { rm -f "$metadata_candidate"; return 1; }
+  _rebuild_inbound_template_config config_candidate "$CONFIG_FILE" "$inbound" "$metadata_candidate" || { rm -f "$metadata_candidate"; return 1; }
+  _commit_template_change "$config_candidate" "$metadata_candidate" "模板 ${name} 已应用到入站 ${inbound}（出站：${outbound}）。"
+}
+
+add_domain_template_domains() {
+  ensure_dependencies outbound-template-edit; require_supported_core; ensure_config; init_meta
+  local name=$1 match=$2 raw=$3 normalized domains_json metadata_candidate config_candidate
+  normalized=$(_normalize_domain_list "$raw") || return 1
+  domains_json=$(printf '%s\n' "$normalized" | jq -Rsc 'split("\n") | map(select(length>0)) | unique')
+  metadata_candidate=$(temp_file)
+  _meta_template_domains_add "$META_FILE" "$metadata_candidate" "$name" "$match" "$domains_json" || { rm -f "$metadata_candidate"; return 1; }
+  _rebuild_template_bound_inbounds_config config_candidate "$metadata_candidate" "$name" || { rm -f "$metadata_candidate"; return 1; }
+  _commit_template_change "$config_candidate" "$metadata_candidate" "模板 ${name} 已更新，已同步到已应用的入站。"
+}
+
+delete_domain_template_domains() {
+  ensure_dependencies outbound-template-edit; require_supported_core; ensure_config; init_meta
+  local name=$1 match=$2 raw=$3 normalized domains_json metadata_candidate config_candidate
+  normalized=$(_normalize_domain_list "$raw") || return 1
+  domains_json=$(printf '%s\n' "$normalized" | jq -Rsc 'split("\n") | map(select(length>0)) | unique')
+  metadata_candidate=$(temp_file)
+  _meta_template_domains_delete "$META_FILE" "$metadata_candidate" "$name" "$match" "$domains_json" || { rm -f "$metadata_candidate"; return 1; }
+  _rebuild_template_bound_inbounds_config config_candidate "$metadata_candidate" "$name" || { rm -f "$metadata_candidate"; return 1; }
+  _commit_template_change "$config_candidate" "$metadata_candidate" "模板 ${name} 已更新，已同步删除已应用入站中的规则。"
+}
+
+remove_domain_template() {
+  ensure_dependencies outbound-template-remove; require_supported_core; ensure_config; init_meta
+  local inbound=$1 name=$2 metadata_candidate config_candidate
+  metadata_candidate=$(temp_file)
+  _meta_template_unbind "$META_FILE" "$metadata_candidate" "$inbound" "$name" || { rm -f "$metadata_candidate"; return 1; }
+  _rebuild_inbound_template_config config_candidate "$CONFIG_FILE" "$inbound" "$metadata_candidate" || { rm -f "$metadata_candidate"; return 1; }
+  _commit_template_change "$config_candidate" "$metadata_candidate" "已从入站 ${inbound} 移除模板 ${name}。"
+}
+
+update_domain_template_outbound() {
+  ensure_dependencies outbound-template-set-outbound; require_supported_core; ensure_config; init_meta
+  local inbound=$1 name=$2 outbound=$3 metadata_candidate config_candidate
+  inbound_exists "$inbound" || die "找不到入站：$inbound"
+  domain_template_exists "$name" || die "找不到模板：$name"
+  [[ $outbound == direct ]] || outbound_exists "$outbound" || die "找不到出站：$outbound"
+  metadata_candidate=$(temp_file)
+  _meta_template_set_outbound "$META_FILE" "$metadata_candidate" "$inbound" "$name" "$outbound" || { rm -f "$metadata_candidate"; return 1; }
+  _rebuild_inbound_template_config config_candidate "$CONFIG_FILE" "$inbound" "$metadata_candidate" || { rm -f "$metadata_candidate"; return 1; }
+  _commit_template_change "$config_candidate" "$metadata_candidate" "模板 ${name} 的出站已更新为 ${outbound}（入站：${inbound}）。"
+}
+
 # Pure display — only sbctl's strict canonical domain rules are shown.
 list_domain_rules() {
   ensure_dependencies outbound-rule-list; ensure_config
-  local inbound=${1-} context=${2-} row group_inbound="" number=0 match domain outbound group_start display match_label
+  local inbound=${1-} context=${2-} row group_inbound="" number=0 match domain outbound group_start display match_label hide_templates=0 owned
   [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
-  row=$(jq -r --arg inbound "$inbound" "$(_sbctl_managed_domain_rule_filter)
+  [[ $context == --menu ]] && hide_templates=1
+  owned=$(jq -c '.domainTemplates.managed // []' "$META_FILE")
+  row=$(jq -r --arg inbound "$inbound" --arg hideTemplates "$hide_templates" --argjson owned "$owned" "$(_sbctl_managed_domain_rule_filter)
+    def template_owned:
+      (. as \$rule | any(\$owned[];
+        .inbound==\$rule.inbound[0] and
+        ((.match==\"suffix\" and \$rule.domain_suffix==[.domain]) or
+         (.match==\"exact\" and \$rule.domain==[.domain]))));
     ([.route.rules[]? |
-      select(sbctl_managed_domain_rule) |
+      select(sbctl_managed_domain_rule and (\$hideTemplates!=\"1\" or (template_owned|not))) |
       .inbound[0] as \$rule_inbound |
       (if has(\"domain_suffix\") then \"suffix\" else \"exact\" end) as \$match |
       (if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end) as \$domain |
@@ -406,7 +695,7 @@ list_domain_rules() {
       .value + [(if .key==0 then \"first\" else \"\" end)]
     ) | @tsv" "$CONFIG_FILE")
   heading "域名分流规则"
-  [[ -n $row ]] || { info "还没有域名分流规则。"; return 0; }
+  [[ -n $row ]] || { info "还没有直接域名规则。"; return 0; }
   while IFS=$'\t' read -r inbound match domain outbound group_start; do
     [[ -n $inbound ]] || continue
     if [[ $inbound != "$group_inbound" ]]; then
@@ -696,117 +985,125 @@ add_domain_rule() {
 
 delete_domain_rule() {
   ensure_dependencies outbound-rule-delete; require_supported_core; ensure_config
-  local inbound=${1-} row choice selected_inbound tmp selection token idx
-  local inbound_row inbound_tag inbound_count
-  local -a inbound_tags=() inbound_labels=()
-  local -a rule_matches=() rule_domains=() rule_outbounds=() requested=()
-  [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
+  local inbound=${1-} match=${2-} domain=${3-} scope=${4:---direct-only}
+  local row choice selected_inbound tmp selection token idx inbound_row inbound_tag inbound_count template_owned owned
+  local selected_json='[]' match_label display selected_match selected_domain selected_outbound
+  local -a inbound_tags=() inbound_labels=() rule_matches=() rule_domains=() rule_outbounds=() requested=()
+  init_meta
+  owned=$(jq -c '.domainTemplates.managed // []' "$META_FILE")
 
-  if [[ -z $inbound ]]; then
-    inbound_row=$(jq -r "$(_sbctl_managed_domain_rule_filter)
-      ([.route.rules[]? | select(sbctl_managed_domain_rule)] ) as \$managed |
-      [.inbounds[].tag] as \$inbound_order |
-      \$inbound_order[] as \$tag |
-      [\$managed[] | select(.inbound==[\$tag])] | length as \$count |
-      select(\$count > 0) | [\$tag, \$count] | @tsv" "$CONFIG_FILE")
-    while IFS=$'\t' read -r inbound_tag inbound_count; do
-      [[ -n $inbound_tag ]] || continue
-      inbound_tags+=("$inbound_tag")
-      inbound_labels+=("${inbound_tag}（${inbound_count} 条）")
-    done <<<"$inbound_row"
-    ((${#inbound_tags[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
-    if ((${#inbound_tags[@]} == 1)); then
-      selected_inbound=${inbound_tags[0]}
-    else
-      choose choice "选择入站" "${inbound_labels[@]}" || return 0
-      selected_inbound=${inbound_tags[$((choice-1))]}
-    fi
-  else
+  if [[ -n $match || -n $domain ]]; then
+    [[ -n $inbound && -n $match && -n $domain ]] || die "用法：sbctl outbound rule delete [入站] [suffix|exact] [域名]"
+    case $match in suffix|exact) ;; *) die "匹配方式只能是 suffix 或 exact。";; esac
+    _normalize_domain_input domain "$domain" || die "域名格式无效。"
+    inbound_exists "$inbound" || die "找不到入站：$inbound"
     selected_inbound=$inbound
+    template_owned=$(jq -r --arg inbound "$inbound" --arg match "$match" --arg domain "$domain" '
+      [.domainTemplates.managed[]? | select(.inbound==$inbound and .match==$match and .domain==$domain)] | length' "$META_FILE")
+    ((template_owned == 0)) || die "该域名规则由模板管理，请在“管理模板”中调整模板或移除模板。"
+    row=$(jq -r --arg inbound "$inbound" --arg match "$match" --arg domain "$domain" "$(_sbctl_managed_domain_rule_filter)
+      [.route.rules[]? | select(sbctl_managed_domain_rule and .inbound==[\$inbound]) |
+       select((if \$match==\"suffix\" then .domain_suffix else .domain end)==[\$domain])] | length" "$CONFIG_FILE")
+    if ((row == 0)); then
+      die "找不到域名规则：${inbound} ${match} ${domain}"
+    fi
+    ((row == 1)) || die "域名规则存在重复项，请先使用交互菜单处理。"
+    selected_json=$(jq -nc --arg match "$match" --arg domain "$domain" '[{match:$match,domain:$domain}]')
+  else
+    [[ -z $inbound ]] || inbound_exists "$inbound" || die "找不到入站：$inbound"
+    if [[ -z $inbound ]]; then
+      inbound_row=$(jq -r --arg scope "$scope" --argjson owned "$owned" "$(_sbctl_managed_domain_rule_filter)
+        def template_owned:
+          (. as \$rule | any(\$owned[]; .inbound==\$rule.inbound[0] and
+            ((.match==\"suffix\" and \$rule.domain_suffix==[.domain]) or
+             (.match==\"exact\" and \$rule.domain==[.domain]))));
+        ([.route.rules[]? | select(sbctl_managed_domain_rule and
+          (\$scope!=\"--direct-only\" or (template_owned|not)))] ) as \$managed |
+        [.inbounds[].tag] as \$inbound_order |
+        \$inbound_order[] as \$tag |
+        [\$managed[] | select(.inbound==[\$tag])] | length as \$count |
+        select(\$count > 0) | [\$tag,\$count] | @tsv" "$CONFIG_FILE")
+      while IFS=$'\t' read -r inbound_tag inbound_count; do
+        [[ -n $inbound_tag ]] || continue
+        inbound_tags+=("$inbound_tag"); inbound_labels+=("${inbound_tag}（${inbound_count} 条）")
+      done <<<"$inbound_row"
+      ((${#inbound_tags[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
+      if ((${#inbound_tags[@]} == 1)); then selected_inbound=${inbound_tags[0]}
+      else choose choice "选择入站" "${inbound_labels[@]}" || return 0; selected_inbound=${inbound_tags[$((choice-1))]}; fi
+    else
+      selected_inbound=$inbound
+    fi
+
+    row=$(jq -r --arg inbound "$selected_inbound" --arg scope "$scope" --argjson owned "$owned" "$(_sbctl_managed_domain_rule_filter)
+      def template_owned:
+        (. as \$rule | any(\$owned[]; .inbound==\$rule.inbound[0] and
+          ((.match==\"suffix\" and \$rule.domain_suffix==[.domain]) or
+           (.match==\"exact\" and \$rule.domain==[.domain]))));
+      [.route.rules[]? |
+        select(sbctl_managed_domain_rule and .inbound==[\$inbound] and
+          (\$scope!=\"--direct-only\" or (template_owned|not))) |
+        (if has(\"domain_suffix\") then \"suffix\" else \"exact\" end) as \$match |
+        (if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end) as \$domain |
+        [\$match,\$domain,.outbound]] as \$rules |
+      (\$rules | sort_by([(if .[0]==\"suffix\" then 0 else 1 end),.[2]]) |
+       group_by([.[0],.[2]])[] | sort_by([(.[1]|ascii_downcase),.[1]])[]) | @tsv" "$CONFIG_FILE")
+    while IFS=$'\t' read -r selected_match selected_domain selected_outbound; do
+      [[ -n $selected_domain ]] || continue
+      rule_matches+=("$selected_match"); rule_domains+=("$selected_domain"); rule_outbounds+=("$selected_outbound")
+    done <<<"$row"
+    ((${#rule_domains[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
+    printf '\n入站：%s\n\n' "$selected_inbound"
+    for ((idx=0; idx<${#rule_domains[@]}; idx++)); do printf '%d) %s\n' "$((idx+1))" "${rule_domains[$idx]}"; done
+    while true; do
+      read -r -p '请选择要删除的规则（支持 1,3,2）: ' selection || return 0
+      selection=$(printf '%s' "$selection" | tr -d '[:space:]'); requested=()
+      IFS=',' read -r -a tokens <<<"$selection"; local valid=1
+      for token in "${tokens[@]}"; do
+        if [[ ! $token =~ ^[0-9]+$ ]] || ((10#$token < 1 || 10#$token > ${#rule_domains[@]})); then valid=0; break; fi
+        idx=$((10#$token))
+        if ((${#requested[@]})); then
+          for choice in "${requested[@]}"; do ((choice != idx)) || { valid=0; break 2; }; done
+        fi
+        requested+=("$idx")
+      done
+      ((valid)) && ((${#requested[@]})) && break
+      warn "请输入有效且不重复的序号，例如 1,3,2。"
+    done
+    printf '\n将删除：\n'
+    for choice in "${requested[@]}"; do
+      idx=$((choice-1)); [[ ${rule_matches[$idx]} == suffix ]] && match_label=子域名 || match_label=精确
+      display=$(_outbound_display_name "${rule_outbounds[$idx]}")
+      printf -- '- %s（%s → %s）\n' "${rule_domains[$idx]}" "$match_label" "$display"
+      selected_json=$(jq -c --arg match "${rule_matches[$idx]}" --arg domain "${rule_domains[$idx]}" \
+        '. + [{match:$match,domain:$domain}]' <<<"$selected_json")
+    done
+    confirm "确认删除这些规则？" N || return 0
   fi
 
-  row=$(jq -r --arg inbound "$selected_inbound" "$(_sbctl_managed_domain_rule_filter)
-    [.route.rules[]? |
-      select(sbctl_managed_domain_rule) |
-      select(.inbound==[\$inbound]) |
-      (if has(\"domain_suffix\") then \"suffix\" else \"exact\" end) as \$match |
-      (if \$match==\"suffix\" then .domain_suffix[0] else .domain[0] end) as \$domain |
-      [\$match,\$domain,.outbound]] as \$rules |
-    (\$rules |
-      sort_by([(if .[0]==\"suffix\" then 0 else 1 end), .[2]]) |
-      group_by([.[0], .[2]])[] |
-      sort_by([(.[1] | ascii_downcase), .[1]])[]
-    ) | @tsv" "$CONFIG_FILE")
-  [[ -n $row ]] || { warn "没有可删除的域名分流规则。"; return 0; }
-  while IFS=$'\t' read -r selected_match selected_domain selected_outbound; do
-    [[ -n $selected_domain ]] || continue
-    rule_matches+=("$selected_match")
-    rule_domains+=("$selected_domain")
-    rule_outbounds+=("$selected_outbound")
-  done <<<"$row"
-  ((${#rule_domains[@]})) || { warn "没有可删除的域名分流规则。"; return 0; }
-
-  printf '\n入站：%s\n\n' "$selected_inbound"
-  for ((idx=0; idx<${#rule_domains[@]}; idx++)); do
-    printf '%d) %s\n' "$((idx+1))" "${rule_domains[$idx]}"
-  done
-  while true; do
-    read -r -p '请选择要删除的规则（支持 1,3,2）: ' selection || return 0
-    selection=$(printf '%s' "$selection" | tr -d '[:space:]')
-    requested=()
-    IFS=',' read -r -a tokens <<<"$selection"
-    local valid=1
-    for token in "${tokens[@]}"; do
-      if [[ ! $token =~ ^[0-9]+$ ]] || ((10#$token < 1 || 10#$token > ${#rule_domains[@]})); then
-        valid=0
-        break
-      fi
-      idx=$((10#$token))
-      if ((${#requested[@]})); then
-        for choice in "${requested[@]}"; do
-          if ((choice == idx)); then
-            valid=0
-            break 2
-          fi
-        done
-      fi
-      requested+=("$idx")
-    done
-    ((valid)) && ((${#requested[@]})) && break
-    warn "请输入有效且不重复的序号，例如 1,3,2。"
-  done
-
-  printf '\n将删除：\n'
-  local selected_json='[]' match_label display
-  for choice in "${requested[@]}"; do
-    idx=$((choice-1))
-    [[ ${rule_matches[$idx]} == suffix ]] && match_label=子域名 || match_label=精确
-    display=$(_outbound_display_name "${rule_outbounds[$idx]}")
-    printf -- '- %s（%s → %s）\n' "${rule_domains[$idx]}" "$match_label" "$display"
-    selected_json=$(jq -c --arg match "${rule_matches[$idx]}" --arg domain "${rule_domains[$idx]}" \
-      '. + [{match:$match,domain:$domain}]' <<<"$selected_json")
-  done
-  confirm "确认删除这些规则？" N || return 0
-
   tmp=$(temp_file)
-  jq --arg inbound "$selected_inbound" --argjson selected "$selected_json" "$(_sbctl_managed_domain_rule_filter)
-    def sbctl_selected_domain_rule(\$rule; \$selected):
+  jq --arg inbound "$selected_inbound" --argjson selected "$selected_json" --argjson owned "$owned" "$(_sbctl_managed_domain_rule_filter)
+    def template_owned:
+      (. as \$rule | any(\$owned[]; .inbound==\$rule.inbound[0] and
+        ((.match==\"suffix\" and \$rule.domain_suffix==[.domain]) or
+         (.match==\"exact\" and \$rule.domain==[.domain]))));
+    def selected_domain_rule(\$rule; \$selected):
       any(\$selected[]; . as \$target |
         (\$rule | if \$target.match==\"suffix\" then .domain_suffix else .domain end)==[\$target.domain]);
     .route=(.route // {}) |
-    .route.rules=[(.route.rules // [])[]? |
-      (.) as \$rule |
-      select((\$rule | sbctl_managed_domain_rule) and
-        \$rule.inbound==[\$inbound] and
-        sbctl_selected_domain_rule(\$rule; \$selected) | not)]" \
-    "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "已删除 ${#requested[@]} 条域名规则（入站：${selected_inbound}）。"; fi
+    .route.rules=[(.route.rules // [])[]? | (.) as \$rule |
+      select(((\$rule | sbctl_managed_domain_rule) and (\$rule | template_owned | not) and
+        \$rule.inbound==[\$inbound] and selected_domain_rule(\$rule;\$selected)) | not)]
+  " "$CONFIG_FILE" >"$tmp"
+  if apply_candidate "$tmp"; then
+    if [[ -n $match ]]; then info "已删除域名规则：${selected_inbound} ${match} ${domain}。"
+    else info "已删除 ${#requested[@]} 条域名规则（入站：${selected_inbound}）。"; fi
+  fi
   rm -f "$tmp"
 }
 
 delete_outbound() {
-  ensure_dependencies outbound-delete; require_supported_core; ensure_config
-  local tag=${1-} answer item tmp manual_refs default_refs domain_refs
+  ensure_dependencies outbound-delete; require_supported_core; ensure_config; init_meta
+  local tag=${1-} answer item tmp manual_refs default_refs domain_refs binding_refs metadata_candidate="" owned_records removed_managed
   if [[ -z $tag ]]; then
     local tags=()
     while IFS= read -r item; do [[ -n $item ]] && tags+=("$item"); done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|.tag' "$CONFIG_FILE")
@@ -824,21 +1121,41 @@ delete_outbound() {
     [.route.rules[]? | select(sbctl_canonical_default_rule and .outbound==\$tag)] | length" "$CONFIG_FILE")
   domain_refs=$(jq -r --arg tag "$tag" "$(_sbctl_managed_domain_rule_filter)
     [.route.rules[]? | select(sbctl_managed_domain_rule and .outbound==\$tag)] | length" "$CONFIG_FILE")
-  if ((default_refs > 0 || domain_refs > 0)); then
+  binding_refs=$(jq -r --arg tag "$tag" '[.domainTemplates.bindings[]? | select(.outbound==$tag)] | length' "$META_FILE")
+  if ((default_refs > 0 || domain_refs > 0 || binding_refs > 0)); then
     printf '出站 %s 当前被：\n' "$tag"
     ((default_refs > 0)) && printf '%s 个入站默认出站使用\n' "$default_refs"
     ((domain_refs > 0)) && printf '%s 条域名规则使用\n' "$domain_refs"
+    ((binding_refs > 0)) && printf '%s 个模板绑定使用\n' "$binding_refs"
     printf '删除后：\n'
     ((default_refs > 0)) && printf '%s 个默认绑定恢复 direct\n' "$default_refs"
     ((domain_refs > 0)) && printf '%s 条域名规则会一并删除\n' "$domain_refs"
+    ((binding_refs > 0)) && printf '%s 个模板绑定会一并移除\n' "$binding_refs"
   fi
   confirm "删除出站 ${tag}？" N || return 0
   tmp=$(temp_file)
   jq --arg tag "$tag" '
     .outbounds |= map(select(.tag!=$tag)) |
     .route.rules = ((.route.rules // []) | map(select(.outbound!=$tag)))' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "出站 ${tag} 已删除。"; fi
-  rm -f "$tmp"
+  if ((binding_refs > 0)); then
+    metadata_candidate=$(temp_file)
+    owned_records=$(jq -c '.domainTemplates.managed // []' "$META_FILE")
+    removed_managed=$(jq -c --arg tag "$tag" --argjson owned "$owned_records" '
+      [.route.rules[]? | select(.outbound==$tag) | . as $rule |
+       $owned[] | select(.inbound==$rule.inbound[0] and
+         ((.match=="suffix" and $rule.domain_suffix==[.domain]) or
+          (.match=="exact" and $rule.domain==[.domain])))]' "$CONFIG_FILE")
+    jq --arg tag "$tag" --argjson removed "$removed_managed" '
+      .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
+      .domainTemplates.bindings=[.domainTemplates.bindings[]? | select(.outbound!=$tag)] |
+      .domainTemplates.managed=[.domainTemplates.managed[]? | . as $item |
+        select(any($removed[]; .inbound==$item.inbound and .match==$item.match and .domain==$item.domain) | not)]
+    ' "$META_FILE" >"$metadata_candidate"
+    if apply_candidate_with_meta "$tmp" "$metadata_candidate"; then info "出站 ${tag} 已删除。"; fi
+  else
+    if apply_candidate "$tmp"; then info "出站 ${tag} 已删除。"; fi
+  fi
+  rm -f "$tmp" "$metadata_candidate"
 }
 
 # ---- outbound overview display (from layout.sh) ----

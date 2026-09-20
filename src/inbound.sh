@@ -277,7 +277,12 @@ delete_inbound() {
         .inbound |= map(select(.!=$tag)) | select((.inbound|length)>0)
       elif (.inbound // null)==$tag then empty
       else . end]' "$CONFIG_FILE" >"$tmp"
-  jq --arg tag "$tag" 'del(.inbounds[$tag])' "$META_FILE" >"$meta_tmp"
+  jq --arg tag "$tag" '
+    del(.inbounds[$tag]) |
+    .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
+    .domainTemplates.bindings=[.domainTemplates.bindings[]? | select(.inbound!=$tag)] |
+    .domainTemplates.managed=[.domainTemplates.managed[]? | select(.inbound!=$tag)]
+  ' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
     hy2_hop_sync
     traffic_after_config_change "$tag" || warn "流量统计规则未能同步，请在流量信息中刷新。"
@@ -369,7 +374,14 @@ rename_inbound() {
         .inbound |= map(if .==$old then $new else . end)
       elif (.inbound // null)==$old then .inbound=$new
       else . end]' "$CONFIG_FILE" >"$tmp"
-  jq --arg old "$old" --arg new "$new" 'if .inbounds[$old] then .inbounds[$new]=.inbounds[$old] | del(.inbounds[$old]) else . end' "$META_FILE" >"$meta_tmp"
+  jq --arg old "$old" --arg new "$new" '
+    (if .inbounds[$old] then .inbounds[$new]=.inbounds[$old] | del(.inbounds[$old]) else . end) |
+    .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
+    .domainTemplates.bindings=[.domainTemplates.bindings[]? |
+      if .inbound==$old then .inbound=$new else . end] |
+    .domainTemplates.managed=[.domainTemplates.managed[]? |
+      if .inbound==$old then .inbound=$new else . end]
+  ' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
     hy2_hop_sync
     traffic_after_config_change "$old" "$new" || warn "流量统计记录未能迁移，请在流量信息中刷新。"
