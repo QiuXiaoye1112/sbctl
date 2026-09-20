@@ -40,6 +40,8 @@ jobs:
         run: sudo bash tests/lifecycle.sh
       - name: cloudflare
         run: sudo bash tests/cloudflare.sh
+      - name: certificate transaction
+        run: bash tests/certificate-transaction.sh
       - name: maturity
         run: sudo bash tests/maturity.sh
       - name: outbound

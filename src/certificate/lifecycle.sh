@@ -150,6 +150,36 @@ replace_certificate_pair() {
   [[ -z $__changed_var ]] || printf -v "$__changed_var" '%s' "$replace_changed"
 }
 
+certificate_transaction_snapshot() {
+  local __var=$1 cert_target=$2 key_target=$3 snapshot_dir
+  snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-cert-transaction.XXXXXX") || return 1
+  if [[ -f $cert_target ]]; then cp -p "$cert_target" "$snapshot_dir/cert" || { rm -rf "$snapshot_dir"; return 1; }; fi
+  if [[ -f $key_target ]]; then cp -p "$key_target" "$snapshot_dir/key" || { rm -rf "$snapshot_dir"; return 1; }; fi
+  if [[ -f $META_FILE ]]; then
+    cp -p "$META_FILE" "$snapshot_dir/meta" || { rm -rf "$snapshot_dir"; return 1; }
+  fi
+  printf -v "$__var" '%s' "$snapshot_dir"
+}
+
+certificate_transaction_rollback() {
+  local snapshot=$1 cert_target=$2 key_target=$3
+  [[ -d $snapshot ]] || return 1
+  if [[ -f $snapshot/cert ]]; then
+    install -m 600 "$snapshot/cert" "$cert_target" || return 1
+  else
+    rm -f "$cert_target"
+  fi
+  if [[ -f $snapshot/key ]]; then
+    install -m 600 "$snapshot/key" "$key_target" || return 1
+  else
+    rm -f "$key_target"
+  fi
+  if [[ -f $snapshot/meta ]]; then install -m 600 "$snapshot/meta" "$META_FILE" || return 1; else rm -f "$META_FILE"; fi
+  rm -rf "$snapshot"
+}
+
+certificate_transaction_commit() { rm -rf "$1"; }
+
 restart_sing_box_if_certificate_changed() {
   [[ ${1:-0} == 1 ]] || return 0
   service_is_active || return 0
@@ -365,29 +395,59 @@ issue_certificate() {
     auto_renew=true
   fi
 
+  local transaction cert_target="${CERT_DIR}/${identifier}.crt" key_target="${CERT_DIR}/${identifier}.key"
+  certificate_transaction_snapshot transaction "$cert_target" "$key_target" || return 1
   diagnostic_seq=${SBCTL_DIAGNOSTIC_SEQ:-0}
   if ! sync_managed_certificate "$identifier" "$cert_name" changed; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
     warn_if_no_diagnostic "$diagnostic_seq" "证书已签发，但同步到 sbctl 托管目录失败。"
     return 1
   fi
-  meta_cert_set "$identifier" "$subject" "$cert_name" letsencrypt "$validation" "$auto_renew"
-  [[ $auto_renew == true ]] && setup_certbot_renewal_timer
-  restart_sing_box_if_certificate_changed "$changed" || return 1
+  if ! meta_cert_set "$identifier" "$subject" "$cert_name" letsencrypt "$validation" "$auto_renew"; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    warn "证书 metadata 写入失败，证书文件已回滚。"
+    return 1
+  fi
+  if [[ $auto_renew == true ]] && ! setup_certbot_renewal_timer; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    warn "证书续期任务设置失败，证书文件和 metadata 已回滚。"
+    return 1
+  fi
+  if ! restart_sing_box_if_certificate_changed "$changed"; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    restart_service_checked || true
+    return 1
+  fi
+  certificate_transaction_commit "$transaction"
   info "证书已签发并托管：${identifier}"
 }
 
 import_certificate() {
   ensure_dependencies cert-import
-  local identifier=${1-} cert=${2-} key=${3-} subject changed=0
+  local identifier=${1-} cert=${2-} key=${3-} subject changed=0 transaction
   [[ -n $identifier ]] || prompt_value identifier "证书标识/域名" || return 1
   validate_certificate_identifier "$identifier" || die "证书标识无效。"
   [[ -n $cert ]] || prompt_value cert "证书文件路径" || return 1
   [[ -n $key ]] || prompt_value key "私钥文件路径" || return 1
   validate_certificate_pair "$cert" "$key" || { warn "证书/私钥无效、不匹配或已过期。"; return 1; }
   subject=$(certificate_server_names "$cert" | head -1 || true); [[ -n $subject ]] || subject=$identifier
-  replace_certificate_pair "$cert" "$key" "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" changed || return 1
-  meta_cert_set "$identifier" "$subject" "$identifier" imported imported false
-  restart_sing_box_if_certificate_changed "$changed" || return 1
+  local cert_target="${CERT_DIR}/${identifier}.crt" key_target="${CERT_DIR}/${identifier}.key"
+  certificate_transaction_snapshot transaction "$cert_target" "$key_target" || return 1
+  if ! replace_certificate_pair "$cert" "$key" "$cert_target" "$key_target" changed; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    return 1
+  fi
+  if ! meta_cert_set "$identifier" "$subject" "$identifier" imported imported false; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    warn "证书 metadata 写入失败，证书文件已回滚。"
+    return 1
+  fi
+  if ! restart_sing_box_if_certificate_changed "$changed"; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    restart_service_checked || true
+    return 1
+  fi
+  certificate_transaction_commit "$transaction"
   info "证书已导入：${identifier}"
 }
 
@@ -468,8 +528,10 @@ delete_certificate() {
 # ---- canonical renewal (includes Cloudflare DNS path) ----
 renew_one_certificate() {
   local identifier=$1 __result_var=${2:-} cert_name validation owner before_serial="" after_serial="" changed=0 was_active=0 renewal_result_internal=failed
+  local transaction cert_target key_target
   meta_cert_exists "$identifier" || { warn "证书不在托管列表：$identifier"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
   cert_name=$(meta_cert_get_field "$identifier" certName); validation=$(meta_cert_get_field "$identifier" validation)
+  cert_target="${CERT_DIR}/${identifier}.crt"; key_target="${CERT_DIR}/${identifier}.key"
 
   # Cloudflare DNS path
   if [[ $validation == dns-cloudflare ]]; then
@@ -490,8 +552,17 @@ renew_one_certificate() {
       return 1
     fi
     [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
-    sync_managed_certificate "$identifier" "$cert_name" changed || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
-    restart_sing_box_if_certificate_changed "$changed" || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+    certificate_transaction_snapshot transaction "$cert_target" "$key_target" || return 1
+    sync_managed_certificate "$identifier" "$cert_name" changed || {
+      certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1;
+    }
+    if ! restart_sing_box_if_certificate_changed "$changed"; then
+      certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+      restart_service_checked || true
+      [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
+    fi
+    certificate_transaction_commit "$transaction"
     if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then renewal_result_internal=renewed; else renewal_result_internal=unchanged; fi
     [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$renewal_result_internal"
     return 0
@@ -519,8 +590,17 @@ renew_one_certificate() {
   fi
   ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
   [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
-  sync_managed_certificate "$identifier" "$cert_name" changed || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
-  restart_sing_box_if_certificate_changed "$changed" || { [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  certificate_transaction_snapshot transaction "$cert_target" "$key_target" || return 1
+  sync_managed_certificate "$identifier" "$cert_name" changed || {
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1;
+  }
+  if ! restart_sing_box_if_certificate_changed "$changed"; then
+    certificate_transaction_rollback "$transaction" "$cert_target" "$key_target" || true
+    restart_service_checked || true
+    [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
+  fi
+  certificate_transaction_commit "$transaction"
   if [[ -n $before_serial && -n $after_serial && $before_serial != "$after_serial" ]]; then renewal_result_internal=renewed; else renewal_result_internal=unchanged; fi
   [[ -z $__result_var ]] || printf -v "$__result_var" '%s' "$renewal_result_internal"
 }

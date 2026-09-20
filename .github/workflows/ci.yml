@@ -67,6 +67,7 @@ jobs:
           bash tests/hy2-hop.sh
           bash tests/lifecycle.sh
           bash tests/cloudflare.sh
+          bash tests/certificate-transaction.sh
           bash tests/maturity.sh
       - name: Alpine/OpenRC compatibility tests
         run: |
@@ -78,6 +79,7 @@ jobs:
             sh -n alpine/install.sh
             bash tests/lifecycle.sh
             bash tests/cloudflare.sh
+            bash tests/certificate-transaction.sh
             bash tests/maturity.sh
             bash tests/alpine-release-real.sh
           '
