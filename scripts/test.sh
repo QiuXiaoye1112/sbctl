@@ -7,6 +7,7 @@ cd "$ROOT"
 bash scripts/build.sh
 bash tests/architecture.sh
 bash tests/unit/core.sh
+bash tests/unit/local-ip-detection.sh
 bash tests/unit/protocols.sh
 bash tests/unit/protocol-registry.sh
 bash tests/unit/inbound-build.sh

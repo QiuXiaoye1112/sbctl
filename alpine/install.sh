@@ -8,7 +8,7 @@ DIST_URL="${SBCTL_DIST_URL:-https://raw.githubusercontent.com/${REPO}/refs/heads
 
 [ "$(id -u)" -eq 0 ] || { echo '[sbctl] 请使用 root 运行。' >&2; exit 1; }
 [ -f /etc/alpine-release ] || { echo '[sbctl] 此入口仅用于 Alpine Linux。' >&2; exit 1; }
-apk add --no-cache bash curl jq openssl coreutils >/dev/null
+apk add --no-cache bash curl jq openssl coreutils iproute2 >/dev/null
 
 candidate=$(mktemp "${TMPDIR:-/tmp}/sbctl-bootstrap.XXXXXX")
 trap 'rm -f "$candidate"' EXIT INT TERM
