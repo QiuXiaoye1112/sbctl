@@ -527,7 +527,7 @@ sbctl - sing-box Linux 管理器
   sbctl inbound modify [标签]        修改监听地址/端口
   sbctl inbound security [标签]      修改 TLS/REALITY
   sbctl inbound disable <标签> [--yes] 禁用入站
-  sbctl inbound enable <标签>        启用入站
+  sbctl inbound enable <标签> [--yes] 启用入站
   sbctl inbound delete [标签] [--yes]
 
   sbctl outbound list
@@ -629,7 +629,7 @@ dispatch() {
         modify|edit) modify_inbound_basic "${2-}";;
         security|tls) modify_inbound_security "${2-}";;
         disable) disable_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
-        enable) enable_inbound "${2-}";;
+        enable) enable_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
         delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 inbound 子命令：${1}";;
       esac

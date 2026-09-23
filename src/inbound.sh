@@ -227,14 +227,7 @@ list_inbounds() {
   local rows tag_width=16 type_width=10 port_width=6 security_width=8 transport_width=7 users_width=4
 
   # One jq call: produces TSV, empty means no inbounds
-  rows=$(jq -r --slurpfile meta "$META_FILE" '
-    ([.inbounds[] | {config:.,status:"运行中"}] +
-     [($meta[0].disabledInbounds // {})[] | {config:.config,status:"已禁用"}])[] |
-    .config as $inbound |
-    [$inbound.tag,$inbound.type,($inbound.listen_port|tostring),
-     (if $inbound.tls.reality.enabled==true then "reality" elif $inbound.tls.enabled==true then "tls" else "none" end),
-     ($inbound.transport.type // (if $inbound.type=="hysteria2" then "quic" else "tcp" end)),
-     (($inbound.users//[])|length|tostring),.status] | @tsv' "$CONFIG_FILE")
+  rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),(.transport.type // (if .type=="hysteria2" then "quic" else "tcp" end)),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
   if [[ -z $rows ]]; then info "还没有入站。"; return 0; fi
 
   print_table_cell_clipped "标签" "$tag_width"; printf '| '
@@ -242,15 +235,15 @@ list_inbounds() {
   print_table_cell "端口" "$port_width"; printf '| '
   print_table_cell_clipped "安全" "$security_width"; printf '| '
   print_table_cell_clipped "传输" "$transport_width"; printf '| '
-  printf '用户 | 状态\n'
+  printf '用户\n'
 
-  while IFS=$'\t' read -r tag type port security transport users status; do
+  while IFS=$'\t' read -r tag type port security transport users; do
     print_table_cell_clipped "$tag" "$tag_width"; printf '| '
     print_table_cell_clipped "$type" "$type_width"; printf '| '
     print_table_cell "$port" "$port_width"; printf '| '
     print_table_cell_clipped "$security" "$security_width"; printf '| '
     print_table_cell_clipped "$transport" "$transport_width"; printf '| '
-    printf '%s | %s\n' "$users" "$status"
+    printf '%s\n' "$users"
   done <<<"$rows"
 }
 
@@ -311,7 +304,7 @@ disable_inbound() {
 
 enable_inbound() {
   ensure_dependencies inbound-enable; ensure_config
-  local tag=${1-} entry inbound position port type candidate meta_candidate rc=0
+  local tag=${1-} assume_yes=${2:-0} entry inbound position port type candidate meta_candidate rc=0
   [[ -n $tag ]] || select_inbound_toggle tag || return 0
   inbound_is_disabled "$tag" || { warn "入站 ${tag} 未处于禁用状态。"; return 1; }
   inbound_exists "$tag" && { warn "运行配置中已有同名入站：${tag}。"; return 1; }
@@ -324,6 +317,7 @@ enable_inbound() {
     warn "端口 ${port} 已被占用，无法启用入站 ${tag}。"
     return 1
   fi
+  [[ $assume_yes == 1 ]] || confirm "启用入站 ${tag}？将重新应用 sing-box 配置。" N || return 0
   candidate=$(temp_file); meta_candidate=$(temp_file)
   jq --argjson inbound "$inbound" --argjson position "$position" \
     '.inbounds |= (.[0:$position] + [$inbound] + .[$position:])' "$CONFIG_FILE" >"$candidate"
