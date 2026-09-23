@@ -241,7 +241,6 @@ validate_metadata_candidate() {
   jq -e '
     type=="object" and
     ((.inbounds // {})|type)=="object" and
-    ((.disabledInbounds // {})|type)=="object" and
     ((.certificates // {})|type)=="object" and
     ((.managedResources // {})|type)=="object" and
     ((.migrations // {})|type)=="object" and
@@ -278,7 +277,7 @@ commit_metadata_candidate() {
 }
 
 _sbctl_meta_default_json() {
-  printf '%s\n' '{"schema":2,"inbounds":{},"disabledInbounds":{},"certificates":{},"managedResources":{},"migrations":{},"domainTemplates":{"templates":[],"bindings":[],"managed":[]}}'
+  printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{},"domainTemplates":{"templates":[],"bindings":[],"managed":[]}}'
 }
 
 _sbctl_meta_upgrade_file() {
@@ -287,7 +286,6 @@ _sbctl_meta_upgrade_file() {
   jq '
     .schema=2 |
     .inbounds=(if (.inbounds|type)=="object" then .inbounds else {} end) |
-    .disabledInbounds=(if (.disabledInbounds|type)=="object" then .disabledInbounds else {} end) |
     .certificates=(if (.certificates|type)=="object" then .certificates else {} end) |
     .managedResources=(if (.managedResources|type)=="object" then .managedResources else {} end) |
     .migrations=(if (.migrations|type)=="object" then .migrations else {} end) |

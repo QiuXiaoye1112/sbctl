@@ -3,8 +3,6 @@
 # Uses a single jq call per display page.
 
 inbound_exists() { jq -e --arg tag "$1" '.inbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; }
-inbound_is_disabled() { [[ -f $META_FILE ]] && jq -e --arg tag "$1" '.disabledInbounds[$tag].config != null' "$META_FILE" >/dev/null 2>&1; }
-inbound_tag_reserved() { inbound_exists "$1" || inbound_is_disabled "$1"; }
 port_in_config() { jq -e --argjson port "$1" --arg except "${2-}" '.inbounds[]?|select(.listen_port==$port and .tag!=$except)' "$CONFIG_FILE" >/dev/null; }
 port_in_use_os() {
   local port=$1
@@ -17,7 +15,7 @@ prompt_tag() {
   while true; do
     prompt_value value "入站标签" "$default"
     validate_tag "$value" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-    inbound_tag_reserved "$value" && { warn "标签已存在。"; continue; }
+    inbound_exists "$value" && { warn "标签已存在。"; continue; }
     printf -v "$__var" '%s' "$value"; return
   done
 }
@@ -265,82 +263,11 @@ select_inbound() {
   printf -v "$__var" '%s' "$__selected"
 }
 
-select_inbound_toggle() {
-  local __var=$1 answer state __item_tag
-  local tags=() labels=()
-  ensure_config
-  while IFS=$'\t' read -r __item_tag state; do
-    [[ -n $__item_tag ]] || continue
-    tags+=("$__item_tag"); labels+=("${__item_tag}（${state}）")
-  done < <(jq -r --slurpfile meta "$META_FILE" '
-    ([.inbounds[] | [.tag,"运行中"]] +
-     [($meta[0].disabledInbounds // {}) | keys[] | [.,"已禁用"]])[] | @tsv' "$CONFIG_FILE")
-  ((${#tags[@]})) || { warn "没有可选入站。"; return 1; }
-  if ((${#tags[@]} == 1)); then answer=1; else choose answer "选择要禁用或启用的入站" "${labels[@]}" || return 1; fi
-  printf -v "$__var" '%s' "${tags[$((answer-1))]}"
-}
-
-disable_inbound() {
-  ensure_dependencies inbound-disable; ensure_config
-  local tag=${1-} assume_yes=${2:-0} inbound position type candidate meta_candidate rc=0
-  [[ -n $tag ]] || select_inbound tag || return 0
-  inbound_exists "$tag" || { warn "入站 ${tag} 未启用。"; return 1; }
-  [[ $assume_yes == 1 ]] || confirm "禁用入站 ${tag}？连接将中断。" N || return 0
-  if traffic_is_enabled; then traffic_collect || return 1; fi
-  inbound=$(jq -c --arg tag "$tag" '.inbounds[]|select(.tag==$tag)' "$CONFIG_FILE")
-  position=$(jq --arg tag "$tag" '.inbounds|map(.tag)|index($tag)' "$CONFIG_FILE")
-  type=$(jq -r '.type' <<<"$inbound")
-  candidate=$(temp_file); meta_candidate=$(temp_file)
-  jq --arg tag "$tag" '.inbounds |= map(select(.tag!=$tag))' "$CONFIG_FILE" >"$candidate"
-  jq --arg tag "$tag" --argjson inbound "$inbound" --argjson position "$position" \
-    '.disabledInbounds[$tag]={config:$inbound,position:$position}' "$META_FILE" >"$meta_candidate"
-  apply_candidate_with_meta "$candidate" "$meta_candidate" || rc=$?
-  rm -f "$candidate" "$meta_candidate"
-  ((rc == 0)) || return "$rc"
-  [[ $type != hysteria2 ]] || hy2_hop_sync || warn "Hysteria2 端口跳跃规则暂未同步。"
-  traffic_after_config_change || warn "入站已禁用，但流量规则暂未同步，采集任务会自动重试。"
-  info "入站 ${tag} 已禁用。"
-}
-
-enable_inbound() {
-  ensure_dependencies inbound-enable; ensure_config
-  local tag=${1-} assume_yes=${2:-0} entry inbound position port type candidate meta_candidate rc=0
-  [[ -n $tag ]] || select_inbound_toggle tag || return 0
-  inbound_is_disabled "$tag" || { warn "入站 ${tag} 未处于禁用状态。"; return 1; }
-  inbound_exists "$tag" && { warn "运行配置中已有同名入站：${tag}。"; return 1; }
-  entry=$(jq -c --arg tag "$tag" '.disabledInbounds[$tag]' "$META_FILE")
-  inbound=$(jq -c '.config' <<<"$entry")
-  position=$(jq '.position // 0' <<<"$entry")
-  port=$(jq -r '.listen_port' <<<"$inbound")
-  type=$(jq -r '.type' <<<"$inbound")
-  if port_in_config "$port" || port_in_use_os "$port"; then
-    warn "端口 ${port} 已被占用，无法启用入站 ${tag}。"
-    return 1
-  fi
-  [[ $assume_yes == 1 ]] || confirm "启用入站 ${tag}？将重新应用 sing-box 配置。" N || return 0
-  candidate=$(temp_file); meta_candidate=$(temp_file)
-  jq --argjson inbound "$inbound" --argjson position "$position" \
-    '.inbounds |= (.[0:$position] + [$inbound] + .[$position:])' "$CONFIG_FILE" >"$candidate"
-  jq --arg tag "$tag" 'del(.disabledInbounds[$tag])' "$META_FILE" >"$meta_candidate"
-  apply_candidate_with_meta "$candidate" "$meta_candidate" || rc=$?
-  rm -f "$candidate" "$meta_candidate"
-  ((rc == 0)) || return "$rc"
-  [[ $type != hysteria2 ]] || hy2_hop_sync || warn "Hysteria2 端口跳跃规则暂未同步。"
-  traffic_after_config_change || warn "入站已启用，但流量规则暂未同步，采集任务会自动重试。"
-  info "入站 ${tag} 已启用。"
-}
-
-toggle_inbound() {
-  local tag=${1-}
-  [[ -n $tag ]] || select_inbound_toggle tag || return 0
-  if inbound_is_disabled "$tag"; then enable_inbound "$tag"; else disable_inbound "$tag"; fi
-}
-
 delete_inbound() {
   ensure_dependencies inbound-delete; ensure_config
   local tag=${1-} yes=${2:-0} tmp meta_tmp rc=0
-  [[ -n $tag ]] || select_inbound_toggle tag || return 0
-  inbound_tag_reserved "$tag" || die "找不到入站：$tag"
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
   [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return 0
   tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
   jq --arg tag "$tag" '
@@ -351,7 +278,7 @@ delete_inbound() {
       elif (.inbound // null)==$tag then empty
       else . end]' "$CONFIG_FILE" >"$tmp"
   jq --arg tag "$tag" '
-    del(.inbounds[$tag], .disabledInbounds[$tag]) |
+    del(.inbounds[$tag]) |
     .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
     .domainTemplates.bindings=[.domainTemplates.bindings[]? | select(.inbound!=$tag)] |
     .domainTemplates.managed=[.domainTemplates.managed[]? | select(.inbound!=$tag)]
@@ -432,12 +359,12 @@ rename_inbound() {
       prompt_value new "新入站名称" "$old"
       [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
       validate_tag "$new" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-      if inbound_tag_reserved "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
+      if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
       break
     done
   fi
   validate_tag "$new" || die "标签格式无效。"
-  inbound_tag_reserved "$new" && die "入站标签已存在：$new"
+  inbound_exists "$new" && die "入站标签已存在：$new"
   outbound_exists "$new" && die "出站标签已存在：$new"
   tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
   jq --arg old "$old" --arg new "$new" '

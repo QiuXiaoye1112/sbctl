@@ -132,8 +132,6 @@ sbctl uninstall --purge
 sbctl uninstall --erase
 ```
 
-入站管理的 `4) 禁用/启用入站` 可以暂停或恢复单个入站。切换时 sing-box 会短暂重启，禁用入站的配置、路由和流量额度保留；启用前会检查原端口是否仍可用。
-
 ## 流量统计
 
 首页的“流量信息”按入站标签展示当前统一月度周期内的总流量，上传与下载合并计算。第一次进入时可选择开启统计；开启后 systemd timer 或 OpenRC supervise-daemon 每分钟采集一次。可将统一起点设置为每月某日的某个时分，例如 `sbctl traffic period set 22 18:30`。

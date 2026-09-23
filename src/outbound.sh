@@ -807,7 +807,7 @@ prompt_outbound_tag() {
   while true; do
     prompt_value candidate "出站标签" "$default" || return 1
     validate_tag "$candidate" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-    if outbound_exists "$candidate" || inbound_tag_reserved "$candidate"; then warn "标签已存在。"; continue; fi
+    if outbound_exists "$candidate" || inbound_exists "$candidate"; then warn "标签已存在。"; continue; fi
     printf -v "$__var" '%s' "$candidate"
     return 0
   done
