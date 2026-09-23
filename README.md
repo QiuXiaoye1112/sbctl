@@ -95,6 +95,8 @@ sbctl inbound show TAG
 sbctl inbound rename OLD NEW
 sbctl inbound modify TAG
 sbctl inbound security TAG
+sbctl inbound disable TAG --yes  # 暂停入站，保留配置和流量额度
+sbctl inbound enable TAG        # 恢复入站
 sbctl inbound delete TAG
 
 sbctl outbound list
@@ -129,6 +131,8 @@ sbctl uninstall
 sbctl uninstall --purge
 sbctl uninstall --erase
 ```
+
+入站管理的 `4) 禁用/启用入站` 可以暂停或恢复单个入站。切换时 sing-box 会短暂重启，禁用入站的配置、路由和流量额度保留；启用前会检查原端口是否仍可用。
 
 ## 流量统计
 

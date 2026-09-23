@@ -134,7 +134,12 @@ hy2_hop_meta_disable() {
 
 hy2_hop_enabled_count() {
   init_meta
-  jq '[.inbounds[]?|select(.hysteria2PortHopping.enabled==true and (.hysteria2PortHopping.range//"")!="")]|length' "$META_FILE"
+  [[ -f $CONFIG_FILE ]] || { printf '0'; return; }
+  jq --slurpfile config "$CONFIG_FILE" '
+    [.inbounds|to_entries[]?|.key as $tag|
+      select(.value.hysteria2PortHopping.enabled==true and
+             (.value.hysteria2PortHopping.range//"")!="" and
+             any($config[0].inbounds[]?; .tag==$tag))]|length' "$META_FILE"
 }
 
 hy2_hop_ensure_backend() {

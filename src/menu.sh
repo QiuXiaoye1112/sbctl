@@ -84,13 +84,14 @@ inbound_menu() {
     heading "入站管理"
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
-    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
+    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 禁用/启用入站\n5) 删除入站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
       2) select_inbound tag && manage_inbound_menu "$tag";;
       3) run_menu_action print_all_share; pause;;
-      4) run_menu_action delete_inbound; pause;;
+      4) run_menu_action toggle_inbound; pause;;
+      5) run_menu_action delete_inbound; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -525,6 +526,8 @@ sbctl - sing-box Linux 管理器
   sbctl inbound rename <旧标签> <新标签>
   sbctl inbound modify [标签]        修改监听地址/端口
   sbctl inbound security [标签]      修改 TLS/REALITY
+  sbctl inbound disable <标签> [--yes] 禁用入站
+  sbctl inbound enable <标签>        启用入站
   sbctl inbound delete [标签] [--yes]
 
   sbctl outbound list
@@ -625,6 +628,8 @@ dispatch() {
         rename) rename_inbound "${2-}" "${3-}";;
         modify|edit) modify_inbound_basic "${2-}";;
         security|tls) modify_inbound_security "${2-}";;
+        disable) disable_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
+        enable) enable_inbound "${2-}";;
         delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 inbound 子命令：${1}";;
       esac

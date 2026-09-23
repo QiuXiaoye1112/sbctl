@@ -871,6 +871,7 @@ validate_metadata_candidate() {
   jq -e '
     type=="object" and
     ((.inbounds // {})|type)=="object" and
+    ((.disabledInbounds // {})|type)=="object" and
     ((.certificates // {})|type)=="object" and
     ((.managedResources // {})|type)=="object" and
     ((.migrations // {})|type)=="object" and
@@ -907,7 +908,7 @@ commit_metadata_candidate() {
 }
 
 _sbctl_meta_default_json() {
-  printf '%s\n' '{"schema":2,"inbounds":{},"certificates":{},"managedResources":{},"migrations":{},"domainTemplates":{"templates":[],"bindings":[],"managed":[]}}'
+  printf '%s\n' '{"schema":2,"inbounds":{},"disabledInbounds":{},"certificates":{},"managedResources":{},"migrations":{},"domainTemplates":{"templates":[],"bindings":[],"managed":[]}}'
 }
 
 _sbctl_meta_upgrade_file() {
@@ -916,6 +917,7 @@ _sbctl_meta_upgrade_file() {
   jq '
     .schema=2 |
     .inbounds=(if (.inbounds|type)=="object" then .inbounds else {} end) |
+    .disabledInbounds=(if (.disabledInbounds|type)=="object" then .disabledInbounds else {} end) |
     .certificates=(if (.certificates|type)=="object" then .certificates else {} end) |
     .managedResources=(if (.managedResources|type)=="object" then .managedResources else {} end) |
     .migrations=(if (.migrations|type)=="object" then .migrations else {} end) |
@@ -1371,7 +1373,12 @@ hy2_hop_meta_disable() {
 
 hy2_hop_enabled_count() {
   init_meta
-  jq '[.inbounds[]?|select(.hysteria2PortHopping.enabled==true and (.hysteria2PortHopping.range//"")!="")]|length' "$META_FILE"
+  [[ -f $CONFIG_FILE ]] || { printf '0'; return; }
+  jq --slurpfile config "$CONFIG_FILE" '
+    [.inbounds|to_entries[]?|.key as $tag|
+      select(.value.hysteria2PortHopping.enabled==true and
+             (.value.hysteria2PortHopping.range//"")!="" and
+             any($config[0].inbounds[]?; .tag==$tag))]|length' "$META_FILE"
 }
 
 hy2_hop_ensure_backend() {
@@ -1565,6 +1572,8 @@ internal_hy2_hop_clear() {
 # Uses a single jq call per display page.
 
 inbound_exists() { jq -e --arg tag "$1" '.inbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; }
+inbound_is_disabled() { [[ -f $META_FILE ]] && jq -e --arg tag "$1" '.disabledInbounds[$tag].config != null' "$META_FILE" >/dev/null 2>&1; }
+inbound_tag_reserved() { inbound_exists "$1" || inbound_is_disabled "$1"; }
 port_in_config() { jq -e --argjson port "$1" --arg except "${2-}" '.inbounds[]?|select(.listen_port==$port and .tag!=$except)' "$CONFIG_FILE" >/dev/null; }
 port_in_use_os() {
   local port=$1
@@ -1577,7 +1586,7 @@ prompt_tag() {
   while true; do
     prompt_value value "入站标签" "$default"
     validate_tag "$value" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-    inbound_exists "$value" && { warn "标签已存在。"; continue; }
+    inbound_tag_reserved "$value" && { warn "标签已存在。"; continue; }
     printf -v "$__var" '%s' "$value"; return
   done
 }
@@ -1787,7 +1796,14 @@ list_inbounds() {
   local rows tag_width=16 type_width=10 port_width=6 security_width=8 transport_width=7 users_width=4
 
   # One jq call: produces TSV, empty means no inbounds
-  rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),(.transport.type // (if .type=="hysteria2" then "quic" else "tcp" end)),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
+  rows=$(jq -r --slurpfile meta "$META_FILE" '
+    ([.inbounds[] | {config:.,status:"运行中"}] +
+     [($meta[0].disabledInbounds // {})[] | {config:.config,status:"已禁用"}])[] |
+    .config as $inbound |
+    [$inbound.tag,$inbound.type,($inbound.listen_port|tostring),
+     (if $inbound.tls.reality.enabled==true then "reality" elif $inbound.tls.enabled==true then "tls" else "none" end),
+     ($inbound.transport.type // (if $inbound.type=="hysteria2" then "quic" else "tcp" end)),
+     (($inbound.users//[])|length|tostring),.status] | @tsv' "$CONFIG_FILE")
   if [[ -z $rows ]]; then info "还没有入站。"; return 0; fi
 
   print_table_cell_clipped "标签" "$tag_width"; printf '| '
@@ -1795,15 +1811,15 @@ list_inbounds() {
   print_table_cell "端口" "$port_width"; printf '| '
   print_table_cell_clipped "安全" "$security_width"; printf '| '
   print_table_cell_clipped "传输" "$transport_width"; printf '| '
-  printf '用户\n'
+  printf '用户 | 状态\n'
 
-  while IFS=$'\t' read -r tag type port security transport users; do
+  while IFS=$'\t' read -r tag type port security transport users status; do
     print_table_cell_clipped "$tag" "$tag_width"; printf '| '
     print_table_cell_clipped "$type" "$type_width"; printf '| '
     print_table_cell "$port" "$port_width"; printf '| '
     print_table_cell_clipped "$security" "$security_width"; printf '| '
     print_table_cell_clipped "$transport" "$transport_width"; printf '| '
-    printf '%s\n' "$users"
+    printf '%s | %s\n' "$users" "$status"
   done <<<"$rows"
 }
 
@@ -1825,11 +1841,81 @@ select_inbound() {
   printf -v "$__var" '%s' "$__selected"
 }
 
+select_inbound_toggle() {
+  local __var=$1 answer tag state
+  local tags=() labels=()
+  ensure_config
+  while IFS=$'\t' read -r tag state; do
+    [[ -n $tag ]] || continue
+    tags+=("$tag"); labels+=("${tag}（${state}）")
+  done < <(jq -r --slurpfile meta "$META_FILE" '
+    ([.inbounds[] | [.tag,"运行中"]] +
+     [($meta[0].disabledInbounds // {}) | keys[] | [.,"已禁用"]])[] | @tsv' "$CONFIG_FILE")
+  ((${#tags[@]})) || { warn "没有可选入站。"; return 1; }
+  if ((${#tags[@]} == 1)); then answer=1; else choose answer "选择要禁用或启用的入站" "${labels[@]}" || return 1; fi
+  printf -v "$__var" '%s' "${tags[$((answer-1))]}"
+}
+
+disable_inbound() {
+  ensure_dependencies inbound-disable; ensure_config
+  local tag=${1-} assume_yes=${2:-0} inbound position type candidate meta_candidate rc=0
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || { warn "入站 ${tag} 未启用。"; return 1; }
+  [[ $assume_yes == 1 ]] || confirm "禁用入站 ${tag}？连接将中断。" N || return 0
+  if traffic_is_enabled; then traffic_collect || return 1; fi
+  inbound=$(jq -c --arg tag "$tag" '.inbounds[]|select(.tag==$tag)' "$CONFIG_FILE")
+  position=$(jq --arg tag "$tag" '.inbounds|map(.tag)|index($tag)' "$CONFIG_FILE")
+  type=$(jq -r '.type' <<<"$inbound")
+  candidate=$(temp_file); meta_candidate=$(temp_file)
+  jq --arg tag "$tag" '.inbounds |= map(select(.tag!=$tag))' "$CONFIG_FILE" >"$candidate"
+  jq --arg tag "$tag" --argjson inbound "$inbound" --argjson position "$position" \
+    '.disabledInbounds[$tag]={config:$inbound,position:$position}' "$META_FILE" >"$meta_candidate"
+  apply_candidate_with_meta "$candidate" "$meta_candidate" || rc=$?
+  rm -f "$candidate" "$meta_candidate"
+  ((rc == 0)) || return "$rc"
+  [[ $type != hysteria2 ]] || hy2_hop_sync || warn "Hysteria2 端口跳跃规则暂未同步。"
+  traffic_after_config_change || warn "入站已禁用，但流量规则暂未同步，采集任务会自动重试。"
+  info "入站 ${tag} 已禁用。"
+}
+
+enable_inbound() {
+  ensure_dependencies inbound-enable; ensure_config
+  local tag=${1-} entry inbound position port type candidate meta_candidate rc=0
+  [[ -n $tag ]] || select_inbound_toggle tag || return 0
+  inbound_is_disabled "$tag" || { warn "入站 ${tag} 未处于禁用状态。"; return 1; }
+  inbound_exists "$tag" && { warn "运行配置中已有同名入站：${tag}。"; return 1; }
+  entry=$(jq -c --arg tag "$tag" '.disabledInbounds[$tag]' "$META_FILE")
+  inbound=$(jq -c '.config' <<<"$entry")
+  position=$(jq '.position // 0' <<<"$entry")
+  port=$(jq -r '.listen_port' <<<"$inbound")
+  type=$(jq -r '.type' <<<"$inbound")
+  if port_in_config "$port" || port_in_use_os "$port"; then
+    warn "端口 ${port} 已被占用，无法启用入站 ${tag}。"
+    return 1
+  fi
+  candidate=$(temp_file); meta_candidate=$(temp_file)
+  jq --argjson inbound "$inbound" --argjson position "$position" \
+    '.inbounds |= (.[0:$position] + [$inbound] + .[$position:])' "$CONFIG_FILE" >"$candidate"
+  jq --arg tag "$tag" 'del(.disabledInbounds[$tag])' "$META_FILE" >"$meta_candidate"
+  apply_candidate_with_meta "$candidate" "$meta_candidate" || rc=$?
+  rm -f "$candidate" "$meta_candidate"
+  ((rc == 0)) || return "$rc"
+  [[ $type != hysteria2 ]] || hy2_hop_sync || warn "Hysteria2 端口跳跃规则暂未同步。"
+  traffic_after_config_change || warn "入站已启用，但流量规则暂未同步，采集任务会自动重试。"
+  info "入站 ${tag} 已启用。"
+}
+
+toggle_inbound() {
+  local tag=${1-}
+  [[ -n $tag ]] || select_inbound_toggle tag || return 0
+  if inbound_is_disabled "$tag"; then enable_inbound "$tag"; else disable_inbound "$tag"; fi
+}
+
 delete_inbound() {
   ensure_dependencies inbound-delete; ensure_config
   local tag=${1-} yes=${2:-0} tmp meta_tmp rc=0
-  [[ -n $tag ]] || select_inbound tag || return 0
-  inbound_exists "$tag" || die "找不到入站：$tag"
+  [[ -n $tag ]] || select_inbound_toggle tag || return 0
+  inbound_tag_reserved "$tag" || die "找不到入站：$tag"
   [[ $yes == 1 ]] || confirm "删除入站 ${tag}？" N || return 0
   tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
   jq --arg tag "$tag" '
@@ -1840,7 +1926,7 @@ delete_inbound() {
       elif (.inbound // null)==$tag then empty
       else . end]' "$CONFIG_FILE" >"$tmp"
   jq --arg tag "$tag" '
-    del(.inbounds[$tag]) |
+    del(.inbounds[$tag], .disabledInbounds[$tag]) |
     .domainTemplates=(.domainTemplates // {templates:[],bindings:[]}) |
     .domainTemplates.bindings=[.domainTemplates.bindings[]? | select(.inbound!=$tag)] |
     .domainTemplates.managed=[.domainTemplates.managed[]? | select(.inbound!=$tag)]
@@ -1921,12 +2007,12 @@ rename_inbound() {
       prompt_value new "新入站名称" "$old"
       [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
       validate_tag "$new" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-      if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
+      if inbound_tag_reserved "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
       break
     done
   fi
   validate_tag "$new" || die "标签格式无效。"
-  inbound_exists "$new" && die "入站标签已存在：$new"
+  inbound_tag_reserved "$new" && die "入站标签已存在：$new"
   outbound_exists "$new" && die "出站标签已存在：$new"
   tmp=$(temp_file); meta_tmp=$(temp_file); init_meta
   jq --arg old "$old" --arg new "$new" '
@@ -2926,7 +3012,7 @@ prompt_outbound_tag() {
   while true; do
     prompt_value candidate "出站标签" "$default" || return 1
     validate_tag "$candidate" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
-    if outbound_exists "$candidate" || inbound_exists "$candidate"; then warn "标签已存在。"; continue; fi
+    if outbound_exists "$candidate" || inbound_tag_reserved "$candidate"; then warn "标签已存在。"; continue; fi
     printf -v "$__var" '%s' "$candidate"
     return 0
   done
@@ -3668,7 +3754,15 @@ traffic_set_backend() {
 
 traffic_inventory_json() {
   if [[ -f $CONFIG_FILE ]]; then
-    jq '[.inbounds[]? | {key:.tag,value:{protocol:.type,port:.listen_port}}] | from_entries' "$CONFIG_FILE" 2>/dev/null || printf '{}\n'
+    if [[ -f $META_FILE ]]; then
+      jq --slurpfile meta "$META_FILE" '
+        ([.inbounds[]? | {key:.tag,value:{protocol:.type,port:.listen_port,disabled:false}}] +
+         [($meta[0].disabledInbounds // {})[] | .config |
+           {key:.tag,value:{protocol:.type,port:.listen_port,disabled:true}}]) | from_entries
+      ' "$CONFIG_FILE" 2>/dev/null || printf '{}\n'
+    else
+      jq '[.inbounds[]? | {key:.tag,value:{protocol:.type,port:.listen_port,disabled:false}}] | from_entries' "$CONFIG_FILE" 2>/dev/null || printf '{}\n'
+    fi
   else
     printf '{}\n'
   fi
@@ -3733,7 +3827,7 @@ traffic_update_file() {
     reduce ($inventory|to_entries[]) as $item (.;
       .inbounds[$item.key]=((.inbounds[$item.key] // {daily:{}}) + $item.value + {deleted:false})
     ) |
-    .inbounds |= with_entries(.value.deleted = ($inventory[.key] == null)) |
+    .inbounds |= with_entries(.value.deleted = ($inventory[.key] == null) | .value.disabled = ($inventory[.key].disabled // false)) |
     reduce ($limits|to_entries[]) as $item (.;
       if .inbounds[$item.key] then .inbounds[$item.key].limit=$item.value else . end
     ) |
@@ -4325,7 +4419,7 @@ traffic_show() {
   print_table_cell_clipped "标签" 20; printf '| '
   print_table_cell_clipped "协议" 10; printf '| '
   print_table_cell "端口" 7; printf '| %14s\n' "总流量"
-  display_order=$(jq -c '[.inbounds[]?.tag]' "$CONFIG_FILE" 2>/dev/null || printf '[]')
+  display_order=$(jq -c --slurpfile meta "$META_FILE" '[.inbounds[]?.tag] + (($meta[0].disabledInbounds // {})|keys)' "$CONFIG_FILE" 2>/dev/null || printf '[]')
   rows=$(jq -r --arg start "$start" --arg finish "$end" --argjson period "$period" --argjson order "$display_order" '
     ($order | to_entries | map({key:.value,value:.key}) | from_entries) as $positions |
     .inbounds | to_entries |
@@ -4333,11 +4427,11 @@ traffic_show() {
     [.key,(.value.protocol // "unknown"),((.value.port // 0)|tostring),
      (if $period then (.value.cycles[$start] // 0)
       else ([.value.daily | to_entries[]? | select(.key >= $start and .key <= $finish) | .value] | add // 0) end),
-     (.value.deleted // false)] | @tsv
+     (.value.deleted // false),(.value.disabled // false)] | @tsv
   ' "$TRAFFIC_FILE")
   if [[ -n $rows ]]; then
-    while IFS=$'\t' read -r tag protocol port bytes deleted; do
-      [[ $deleted != true ]] || tag="${tag}(已删除)"
+    while IFS=$'\t' read -r tag protocol port bytes deleted disabled; do
+      if [[ $disabled == true ]]; then tag="${tag}(已禁用)"; elif [[ $deleted == true ]]; then tag="${tag}(已删除)"; fi
       print_table_cell_clipped "$tag" 20; printf '| '
       print_table_cell_clipped "$protocol" 10; printf '| '
       print_table_cell "$port" 7; printf '| %14s\n' "$(traffic_format_bytes "$bytes")"
@@ -4376,23 +4470,26 @@ traffic_prompt_range() {
 }
 
 traffic_select_record_tag() {
-  local __var=$1 __item __deleted __answer __selected
+  local __var=$1 __item __deleted __disabled __answer __selected
   local tags=() labels=()
   ensure_config
   traffic_init_file
   traffic_sync_inventory || return 1
-  while IFS=$'\t' read -r __item __deleted; do
+  while IFS=$'\t' read -r __item __deleted __disabled; do
     [[ -n $__item ]] || continue
     tags+=("$__item")
-    if [[ $__deleted == true ]]; then labels+=("${__item}(已删除)"); else labels+=("$__item"); fi
+    if [[ $__disabled == true ]]; then labels+=("${__item}(已禁用)")
+    elif [[ $__deleted == true ]]; then labels+=("${__item}(已删除)")
+    else labels+=("$__item"); fi
   done < <(
-    jq -r --slurpfile traffic "$TRAFFIC_FILE" '
-      ([.inbounds[]?.tag | {tag:.,deleted:false}] +
+    jq -r --slurpfile traffic "$TRAFFIC_FILE" --slurpfile meta "$META_FILE" '
+      ([.inbounds[]?.tag | {tag:.,deleted:false,disabled:false}] +
+       [($meta[0].disabledInbounds // {}) | keys[] | {tag:.,deleted:false,disabled:true}] +
        [($traffic[0].inbounds // {} | to_entries[]? |
-         select(.value.deleted==true) | {tag:.key,deleted:true})]) |
+         select(.value.deleted==true) | {tag:.key,deleted:true,disabled:false})]) |
       reduce .[] as $item ([];
         if any(.[]; .tag==$item.tag) then . else . + [$item] end) |
-      .[] | [.tag,(.deleted|tostring)] | @tsv
+      .[] | [.tag,(.deleted|tostring),(.disabled|tostring)] | @tsv
     ' "$CONFIG_FILE"
   )
   ((${#tags[@]})) || { warn "没有可清空的入站流量记录。"; return 1; }
@@ -6577,13 +6674,14 @@ inbound_menu() {
     heading "入站管理"
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
-    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
+    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 禁用/启用入站\n5) 删除入站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
       2) select_inbound tag && manage_inbound_menu "$tag";;
       3) run_menu_action print_all_share; pause;;
-      4) run_menu_action delete_inbound; pause;;
+      4) run_menu_action toggle_inbound; pause;;
+      5) run_menu_action delete_inbound; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -7018,6 +7116,8 @@ sbctl - sing-box Linux 管理器
   sbctl inbound rename <旧标签> <新标签>
   sbctl inbound modify [标签]        修改监听地址/端口
   sbctl inbound security [标签]      修改 TLS/REALITY
+  sbctl inbound disable <标签> [--yes] 禁用入站
+  sbctl inbound enable <标签>        启用入站
   sbctl inbound delete [标签] [--yes]
 
   sbctl outbound list
@@ -7118,6 +7218,8 @@ dispatch() {
         rename) rename_inbound "${2-}" "${3-}";;
         modify|edit) modify_inbound_basic "${2-}";;
         security|tls) modify_inbound_security "${2-}";;
+        disable) disable_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
+        enable) enable_inbound "${2-}";;
         delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 inbound 子命令：${1}";;
       esac
