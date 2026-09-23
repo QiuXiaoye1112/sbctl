@@ -421,26 +421,26 @@ show_main_inbounds() {
 }
 
 traffic_menu() {
-  local choice start end
-  start=$(traffic_retention_start); end=$(traffic_today)
+  local choice
   traffic_is_enabled && run_menu_action traffic_collect
   while true; do
     clear_screen
-    traffic_show "$start" "$end" || true
-    printf '\n1) 刷新\n2) 设置时间范围\n3) 流量限制\n4) 清空指定入站记录\n5) 清空全部流量记录\n'
-    if traffic_is_enabled; then printf '6) 停止流量统计\n'; else printf '6) 开启流量统计\n'; fi
+    traffic_show || true
+    printf '\n1) 刷新\n2) 流量限制\n3) 清空指定入站记录\n4) 清空全部流量记录\n'
+    if traffic_is_enabled; then printf '5) 停止流量统计\n'; else printf '5) 开启流量统计\n'; fi
+    printf '6) 设置月度统计起点\n'
     printf '0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action traffic_collect;;
-      2) traffic_prompt_range start end || true;;
-      3) traffic_limit_menu;;
-      4) run_menu_action traffic_clear_tag_records; pause;;
-      5) run_menu_action traffic_clear_all_records; pause;;
-      6)
+      2) traffic_limit_menu;;
+      3) run_menu_action traffic_clear_tag_records; pause;;
+      4) run_menu_action traffic_clear_all_records; pause;;
+      5)
         if traffic_is_enabled; then run_menu_action traffic_disable; else run_menu_action traffic_enable; fi
         pause
         ;;
+      6) run_menu_action traffic_period_set; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac
@@ -511,7 +511,9 @@ sbctl - sing-box Linux 管理器
   sbctl start|stop|restart           服务控制
   sbctl enable|disable               开关开机自启
   sbctl logs [行数]                  查看日志
-  sbctl traffic [开始日期] [结束日期] 查看按入站累计流量
+  sbctl traffic                      查看当前月度周期流量
+  sbctl traffic period show          查看统一统计起点
+  sbctl traffic period set <日> <时:分> 设置统一统计起点
   sbctl traffic enable|disable       开启/停止流量统计
   sbctl traffic limit show|enable|disable
   sbctl traffic limit set <标签> <GB> <重置日>
@@ -587,10 +589,17 @@ dispatch() {
     logs) service_logs "${1:-100}";;
     traffic)
       case ${1:-show} in
-        show) traffic_collect || true; traffic_show "${2:-$(traffic_retention_start)}" "${3:-$(traffic_today)}";;
+        show) traffic_collect || true; traffic_show "${2-}" "${3-}";;
         enable|start) traffic_enable;;
         disable|stop) traffic_disable;;
         collect|refresh) traffic_collect;;
+        period)
+          case ${2:-show} in
+            show) traffic_period_show;;
+            set) traffic_period_set "${3-}" "${4-}";;
+            *) die "未知 traffic period 子命令：${2}";;
+          esac
+          ;;
         reset)
           if [[ ${2-} == --all ]]; then traffic_clear_all_records; else traffic_clear_tag_records "${2-}"; fi
           ;;

@@ -10,7 +10,7 @@ version=$(SBCTL_TESTING=1 bash ./sbctl.sh version)
 help=$(SBCTL_TESTING=1 bash ./sbctl.sh help)
 grep -Fq 'sbctl inbound add' <<<"$help"
 grep -Fq 'sbctl config check|show|edit' <<<"$help"
-grep -Fq 'sbctl traffic [开始日期] [结束日期]' <<<"$help"
+grep -Fq 'sbctl traffic period set <日> <时:分>' <<<"$help"
 grep -Fq 'sbctl traffic limit set <标签> <GB> <重置日>' <<<"$help"
 grep -Fq 'sbctl outbound rule list [入站]' <<<"$help"
 grep -Fq 'sbctl outbound rule add <入站> <suffix|exact> <域名[,域名...]> <出站>' <<<"$help"

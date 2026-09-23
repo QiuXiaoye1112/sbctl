@@ -22,7 +22,7 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 - REALITY 与证书 TLS
 - 用户新增、重命名、删除和凭据轮换
 - SOCKS5 / HTTP / 本地地址出站与入站绑定
-- 按入站累计流量、日期范围查询和滚动三个月日分桶
+- 按入站累计流量、可自定义月度统计起点，并只保留当前展示周期
 - 配置候选校验、事务应用和失败回滚
 - Let's Encrypt 域名证书、公网 IP 证书、证书导入
 - Cloudflare DNS 自动验证/续期（账号邮箱 + Global API Key）
@@ -78,7 +78,9 @@ sbctl restart
 sbctl logs 100
 sbctl diagnose
 sbctl traffic
-sbctl traffic 2026-05-24 2026-08-24
+sbctl traffic
+sbctl traffic period show
+sbctl traffic period set 22 18:30
 sbctl traffic enable
 sbctl traffic disable
 sbctl traffic limit enable
@@ -130,13 +132,13 @@ sbctl uninstall --erase
 
 ## 流量统计
 
-首页的“流量信息”按入站标签展示指定日期范围内的总流量，上传与下载合并计算。第一次进入时可选择开启统计；开启后 systemd timer 或 OpenRC supervise-daemon 每分钟采集一次。
+首页的“流量信息”按入站标签展示当前统一月度周期内的总流量，上传与下载合并计算。第一次进入时可选择开启统计；开启后 systemd timer 或 OpenRC supervise-daemon 每分钟采集一次。可将统一起点设置为每月某日的某个时分，例如 `sbctl traffic period set 22 18:30`。
 
 ```text
 流量信息
 
 统计状态：运行中
-统计范围：2026-05-24 ～ 2026-08-24
+统计范围：2026-08-22 18:30:00 ～ 2026-09-22 18:30:00
 
 标签                 | 协议       | 端口    |       总流量
 vless                | vless      | 17225   |      12.48 GB
@@ -145,7 +147,7 @@ vless2               | vless      | 14332   |       6.27 GB
 全部入站：18.75 GB
 ```
 
-日期输入默认从今天向前推三个自然月至今天。流量按天保存在 `/var/lib/sbctl/traffic.json`，只保留滚动最近三个月；月底向前推三个月时会自动取目标月份最后一天。入站改名会迁移记录，已删除入站的记录保留至三个月窗口结束。
+默认起点为每月 1 日 00:00，时间精确到分钟。到下一起点时，展示流量归零并开始新周期。若设置 31 日，短月份取最后一天，后续有 31 日时仍回到 31 日。`/var/lib/sbctl/traffic.json` 仅保留当前展示周期；已有按天数据迁移时，边界当天的旧流量只能近似归属。新数据按每分钟采集结果归属周期，因此边界最多有一个采集间隔的误差。入站改名会迁移记录，已删除入站的记录保留至当前周期结束。入站额度的已用流量单独累计，展示周期清零及历史记录清理不会清除额度累计值。
 
 统计使用 sbctl 独立管理的 nftables/iptables 计数表，不修改用户现有规则的内容，也不开放网络管理 API。数值是入站端口处收到和发出的网络层字节总和，包含协议握手及传输开销；采集任务异常退出时，最多可能丢失尚未落盘的一个采集周期。
 
@@ -365,7 +367,7 @@ src/inbound.sh                   入站生命周期
 src/inbound/clients.sh           入站用户 CRUD
 src/outbound.sh                  出站与路由绑定
 src/share.sh                     分享 URI / 客户端 JSON（只读）
-src/traffic.sh                   按入站流量计数、三个月日分桶、月度额度与采集任务
+src/traffic.sh                   按入站流量计数、可自定义月度展示周期、月度额度与采集任务
 src/service.sh                   sing-box 安装、服务、BBR 与诊断
 src/uninstall.sh                 三级卸载与资源归属保护
 src/menu.sh                      菜单、CLI dispatch 与 help
