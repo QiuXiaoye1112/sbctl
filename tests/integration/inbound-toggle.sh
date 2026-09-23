@@ -34,6 +34,10 @@ jq -e '.inbounds|length==1' "$CONFIG_FILE" >/dev/null
 jq -e '.disabledInbounds.vless.config.listen_port==17225 and .disabledInbounds.vless.position==0' "$META_FILE" >/dev/null
 jq -e '.inbounds.vless.limit.usedBytes==123 and .inbounds.vless.deleted==false and .inbounds.vless.disabled==true' "$TRAFFIC_FILE" >/dev/null
 [[ $(list_inbounds) == *'已禁用'* ]]
+choose() { printf -v "$1" '%s' 2; }
+tag=""
+select_inbound_toggle tag
+[[ $tag == vless ]]
 port_in_use_os() { return 0; }
 if enable_inbound vless; then exit 1; fi
 jq -e '.inbounds|length==1' "$CONFIG_FILE" >/dev/null
