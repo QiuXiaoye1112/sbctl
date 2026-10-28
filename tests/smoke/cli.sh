@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 
-version=$(SBCTL_TESTING=1 bash ./sbctl.sh version)
+version=$(SBCTL_TESTING=1 SBCTL_BUILD_COMMIT=development bash ./sbctl.sh version)
 [[ $version == 'sbctl 0.5.0' ]]
 
 help=$(SBCTL_TESTING=1 bash ./sbctl.sh help)
