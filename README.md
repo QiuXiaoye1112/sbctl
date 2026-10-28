@@ -40,6 +40,22 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 
 CI 使用真实 sing-box `1.13.18` 校验 fallback 配置并执行 TCP 黑洞回退测试。测试中的 `1.14` mock 只保护 JSON 生成分支，不能作为兼容性依据；未来声明支持 sing-box `1.14` 前，必须增加真实 `1.14.x` binary 的 CI 检查与集成测试。
 
+## 安装
+
+通用 Linux（需要 root）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/QiuXiaoye1112/sbctl/main/install.sh | sudo bash
+```
+
+Alpine Linux（以 root 运行）：
+
+```sh
+wget -qO- https://raw.githubusercontent.com/QiuXiaoye1112/sbctl/main/alpine/install.sh | sh
+```
+
+安装器会安装管理命令和 sing-box 核心；运行 `sbctl` 进入菜单，或使用 `sbctl install [版本]` 安装或修复核心。bootstrap 下载的是仓库 main 分支的发行文件；本地修改发布到该分支后上述远程命令才会生效。
+
 ## 常用命令
 
 ```bash

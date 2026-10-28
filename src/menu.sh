@@ -410,13 +410,14 @@ service_menu() {
     # Single _service_summary_all call, parse with read — no repeated awk/systemctl
     read -r svc_summary boot_summary ver_summary <<< "$(_service_summary_all)"
     printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$svc_summary" "$boot_summary" "$ver_summary"
-    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n0) 返回\n'
+    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装 sing-box\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action toggle_service_running; pause;;
       2) run_menu_action service_action restart; pause;;
       3) run_menu_action toggle_service_startup; pause;;
       4) run_menu_action service_logs 100; pause;;
+      5) run_menu_action install_or_update_sing_box; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -511,6 +512,7 @@ sbctl - sing-box Linux 管理器
 
 用法:
   sbctl                              打开交互菜单
+  sbctl install [版本]              安装/修复 sing-box
   sbctl status                       查看状态
   sbctl start|stop|restart           服务控制
   sbctl enable|disable               开关开机自启
@@ -580,6 +582,7 @@ dispatch() {
     menu) main_menu;;
     help|-h|--help) show_help;;
     version|-v|--version) printf 'sbctl %s' "$SBCTL_VERSION"; [[ $SBCTL_BUILD_COMMIT == development ]] || printf ' (commit %s)' "$SBCTL_BUILD_COMMIT"; printf '\n';;
+    install) install_or_update_sing_box "${1-}";;
     status) show_status;;
     start|stop|restart|enable|disable) service_action "$cmd";;
     logs) service_logs "${1:-100}";;
