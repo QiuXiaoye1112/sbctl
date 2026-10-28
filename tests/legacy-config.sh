@@ -52,6 +52,17 @@ bash -c '
   source ./sbctl.sh
 
   ensure_config
+  [[ $(jq -r ".inbounds[0].tag // empty" "$CONFIG_FILE") == "" ]]
+  [[ ! -d $BACKUP_DIR ]]
+  [[ ! -e $META_FILE && ! -e $CERT_DIR ]]
+  cp "$CONFIG_FILE" "${CONFIG_FILE}.original"
+  service_is_active(){ return 0; }
+  restart_service_checked(){ return 1; }
+  service_restart(){ return 0; }
+  if normalize_config_tags; then exit 1; fi
+  cmp -s "${CONFIG_FILE}.original" "$CONFIG_FILE"
+  service_is_active(){ return 1; }
+  normalize_config_tags
   [[ $(jq -r ".inbounds[0].tag" "$CONFIG_FILE") == legacy-shadowsocks-1 ]]
   [[ $(jq -r ".outbounds[0].tag" "$CONFIG_FILE") == direct ]]
   [[ $(jq -r ".route.final" "$CONFIG_FILE") == direct ]]

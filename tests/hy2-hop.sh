@@ -248,12 +248,29 @@ bash -c '
   hy2_hop_sync() { return 1; }
 
   # Simulate add_inbound post-apply NAT failure path
-  if hy2_hop_sync; then :; else
+  if hy2_hop_apply_nat; then
+    echo "NAT failure was not propagated" >&2; exit 1
+  else
     warn "端口跳跃 NAT 配置失败，当前使用内部监听端口连接。"
     hy2_hop_meta_disable hy2-fail
   fi
 
   [[ -z $(hy2_hop_range_for_tag hy2-fail) ]]
+
+  (
+    hy2_hop_enabled_count() { echo 1; }
+    hy2_hop_ensure_backend() { :; }
+    command_exists() { [[ $1 == nft ]]; }
+    nft() { [[ ${1-} != -f ]]; }
+    if hy2_hop_restore_all; then echo "nft failure was not propagated" >&2; exit 1; fi
+  )
+
+  # A failing restore must not be hidden by successful boot-service setup.
+  hy2_hop_enabled_count() { echo 1; }
+  hy2_hop_clear_rules() { :; }
+  hy2_hop_restore_all() { return 1; }
+  hy2_hop_boot_service_ensure() { :; }
+  if hy2_hop_sync; then echo "restore failure was not propagated" >&2; exit 1; fi
 '
 
 # ============================================================
@@ -275,6 +292,10 @@ JSON
   cat >"$META_FILE" <<"JSON"
 {"schema":1,"inbounds":{"hy2-mod":{"host":"203.0.113.10"}}}
 JSON
+
+  before_config=$(cat "$CONFIG_FILE"); before_meta=$(cat "$META_FILE")
+  if hy2_hop_configure hy2-mod 1 </dev/null >/dev/null 2>&1; then exit 1; fi
+  [[ $(cat "$CONFIG_FILE") == "$before_config" && $(cat "$META_FILE") == "$before_meta" ]]
 
   # Enable hopping (assume_yes=1 mode) — fresh, no existing range
   prompt_value() { printf -v "$1" "%s" 20000-40000; }
@@ -348,6 +369,28 @@ bash -c '
   restore_backup "$backup" >/dev/null
   [[ $sync_count == 1 ]]
   [[ $(hy2_hop_range_for_tag hy2-restored) == 20000-30000 ]]
+'
+
+SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t9/cfg" SBCTL_CONFIG_FILE="$TMP/t9/cfg/config.json" \
+SBCTL_META_FILE="$TMP/t9/meta.json" SBCTL_LOCK_FILE="$TMP/t9/lock" bash -c '
+  set -Eeuo pipefail
+  source ./sbctl.sh
+  mkdir -p "$SBCTL_CONFIG_DIR"
+  cat >"$CONFIG_FILE" <<"JSON"
+{"inbounds":[{"type":"hysteria2","tag":"h","listen_port":25000}],"outbounds":[{"type":"direct","tag":"direct"}]}
+JSON
+  cat >"$META_FILE" <<"JSON"
+{"schema":1,"inbounds":{"h":{"hysteria2PortHopping":{"enabled":true,"range":"30000-40000"}}}}
+JSON
+  init_meta
+  before_cfg=$(cat "$CONFIG_FILE"); before_meta=$(cat "$META_FILE")
+  prompt_value() { printf -v "$1" "%s" 20000-30000; }
+  hy2_pick_internal_port() { printf -v "$1" "%s" 45000; }
+  apply_candidate() { cp "$1" "$CONFIG_FILE"; }
+  calls=0
+  hy2_hop_sync() { ((calls+=1)); ((calls > 1)); }
+  if hy2_hop_configure h 1; then exit 1; fi
+  [[ $(cat "$CONFIG_FILE") == "$before_cfg" && $(cat "$META_FILE") == "$before_meta" && $calls == 2 ]]
 '
 
 printf 'hy2 hop tests passed.\n'

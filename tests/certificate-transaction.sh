@@ -40,6 +40,7 @@ fi
 [[ $(<"$SBCTL_CERT_DIR/example.com.key") == 'old key' ]]
 [[ $(jq -r '.certificates["example.com"].source' "$SBCTL_META_FILE") == old ]]
 
+chmod 640 "$SBCTL_CERT_DIR/example.com.crt" "$SBCTL_CERT_DIR/example.com.key"
 snapshot=''
 certificate_transaction_snapshot snapshot "$SBCTL_CERT_DIR/example.com.crt" "$SBCTL_CERT_DIR/example.com.key"
 printf 'new certificate\n' >"$SBCTL_CERT_DIR/example.com.crt"
@@ -49,6 +50,7 @@ certificate_transaction_rollback "$snapshot" "$SBCTL_CERT_DIR/example.com.crt" "
 [[ $(<"$SBCTL_CERT_DIR/example.com.crt") == 'old certificate' ]]
 [[ $(<"$SBCTL_CERT_DIR/example.com.key") == 'old key' ]]
 [[ $(jq -r '.certificates["example.com"].source' "$SBCTL_META_FILE") == old ]]
+[[ $(stat -c %a "$SBCTL_CERT_DIR/example.com.crt") == 640 && $(stat -c %a "$SBCTL_CERT_DIR/example.com.key") == 640 ]]
 
 rm -f "$SBCTL_CERT_DIR/example.com.crt" "$SBCTL_CERT_DIR/example.com.key" "$SBCTL_META_FILE"
 snapshot=''
@@ -60,5 +62,21 @@ certificate_transaction_rollback "$snapshot" "$SBCTL_CERT_DIR/example.com.crt" "
 [[ ! -e $SBCTL_CERT_DIR/example.com.crt ]]
 [[ ! -e $SBCTL_CERT_DIR/example.com.key ]]
 [[ ! -e $SBCTL_META_FILE ]]
+
+# A stopped service must be restarted when Certbot is missing, and a failed
+# restart must remain visible to the outer recovery trap.
+meta_cert_exists() { :; }
+meta_cert_get_field() { case $2 in certName) printf example.com;; validation) printf http-standalone;; esac; }
+detect_port80_owner() { printf sing-box; }
+service_is_active() { :; }
+service_stop() { :; }
+service_start() { printf 'start\n' >>"$TEST_ROOT/starts"; return "${START_FAIL:-0}"; }
+CERTBOT_BIN="$TEST_ROOT/missing-certbot"
+CERT_STOPPED_SERVICE=0
+if renew_one_certificate example.com; then exit 1; fi
+[[ $(wc -l <"$TEST_ROOT/starts") == 1 && $CERT_STOPPED_SERVICE == 0 ]]
+START_FAIL=1
+if renew_one_certificate example.com; then exit 1; fi
+[[ $CERT_STOPPED_SERVICE == 1 ]]
 
 printf 'certificate transactions restore certificate pairs and metadata\n'

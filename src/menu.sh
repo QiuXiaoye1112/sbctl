@@ -4,7 +4,7 @@
 
 # ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
 manage_inbound_menu() {
-  local tag=$1 choice row
+  local tag=$1 choice row type port security user_count
   while inbound_exists "$tag"; do
     clear_screen
     # Single-jq: fetch type, port, security, user_count in one call
@@ -15,24 +15,30 @@ manage_inbound_menu() {
 
     case $type in
       anytls|vless|trojan|hysteria2)
-        printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        if [[ $security == tls ]]; then
+          printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 证书管理\n5) 查看 JSON\n0) 返回列表\n'
+        else
+          printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        fi
         read -r -p "请选择: " choice || { echo; return; }
         case $choice in
           1) run_menu_action print_share "$tag"; pause;;
           2) client_menu "$tag";;
-          3) modify_inbound_menu "$tag";;
-          4) run_menu_action show_inbound "$tag"; pause;;
+          3) modify_inbound_menu tag;;
+          4) if [[ $security == tls ]]; then inbound_certificate_menu "$tag"; else run_menu_action show_inbound "$tag"; pause; fi;;
+          5) if [[ $security == tls ]]; then run_menu_action show_inbound "$tag"; else warn "无效选项。"; fi; pause;;
           0) return;; *) warn "无效选项。"; pause;;
         esac
         ;;
       socks|http)
+        if ((user_count > 0)); then printf '认证: 已启用\n\n'; else printf '认证: 无\n\n'; fi
         if ((user_count > 0)); then
           printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
           read -r -p "请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
             2) client_menu "$tag";;
-            3) modify_inbound_menu "$tag";;
+            3) modify_inbound_menu tag;;
             4) run_menu_action show_inbound "$tag"; pause;;
             0) return;; *) warn "无效选项。"; pause;;
           esac
@@ -41,7 +47,7 @@ manage_inbound_menu() {
           read -r -p "请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
-            2) modify_inbound_menu "$tag";;
+            2) modify_inbound_menu tag;;
             3) run_menu_action show_inbound "$tag"; pause;;
             0) return;; *) warn "无效选项。"; pause;;
           esac
@@ -52,24 +58,48 @@ manage_inbound_menu() {
   done
 }
 
+inbound_certificate_menu() {
+  local tag=$1 choice row cert key sni
+  while inbound_exists "$tag" && jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true and (.tls.reality.enabled!=true)' "$CONFIG_FILE" >/dev/null; do
+    row=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|[.tls.certificate_path // "未设置",.tls.key_path // "未设置",.tls.server_name // "未设置"]|@tsv' "$CONFIG_FILE")
+    IFS=$'\t' read -r cert key sni <<<"$row"
+    clear_screen; heading "证书管理 · ${tag}"
+    printf '证书: %s\n私钥: %s\nSNI: %s\n\n1) 更换证书\n0) 返回入站\n' "$cert" "$key" "$sni"
+    read -r -p '请选择: ' choice || { echo; return; }
+    case $choice in
+      1) run_menu_action modify_inbound_certificate "$tag"; pause;;
+      0) return;; *) warn '无效选项。'; pause;;
+    esac
+  done
+}
+
 # ---- modify inbound menu (from hy2_hop.sh — adds port hopping for hysteria2) ----
 modify_inbound_menu() {
-  local tag=$1 choice type
-  while inbound_exists "$tag"; do
+  local -n current_tag=$1
+  local choice type new_tag
+  while inbound_exists "$current_tag"; do
     clear_screen
-    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+    type=$(jq -r --arg tag "$current_tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
     heading "修改入站信息 · ${tag}"
     if [[ $type == hysteria2 ]]; then
       printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
     else
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n'
+      [[ $type == vless || $type == trojan ]] && printf '4) 修改传输方式\n'
+      printf '0) 返回\n'
     fi
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
-      1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
-      2) run_menu_action modify_inbound_basic "$tag"; pause;;
-      3) run_menu_action modify_inbound_security "$tag"; pause;;
-      4) [[ $type == hysteria2 ]] && { run_menu_action hy2_hop_configure "$tag"; pause; } || { warn "无效选项。"; pause; };;
+      1) prompt_value new_tag "新入站名称" "$current_tag" || continue
+         if [[ $new_tag == "$current_tag" ]]; then info "名称未更改。"
+         else
+           run_menu_action rename_inbound "$current_tag" "$new_tag"
+           if ! inbound_exists "$current_tag" && inbound_exists "$new_tag"; then current_tag=$new_tag; fi
+         fi
+         pause;;
+      2) run_menu_action modify_inbound_basic "$current_tag"; pause;;
+      3) run_menu_action modify_inbound_security "$current_tag"; pause;;
+      4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; vless|trojan) run_menu_action modify_inbound_transport "$current_tag";; *) warn "无效选项。";; esac; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac
@@ -84,7 +114,7 @@ inbound_menu() {
     heading "入站管理"
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
-    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
+    printf '1) 新增入站\n2) 管理已有入站\n3) 全部分享信息\n4) 删除入站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
@@ -164,11 +194,9 @@ domain_rule_menu() {
     heading '域名分流'
     printf '入站列表\n\n'
     tags=()
-    while IFS= read -r tag; do [[ -n $tag ]] && tags+=("$tag"); done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+    while IFS= read -r tag; do [[ -n $tag ]] && tags+=("$tag"); done < <(jq -r '.inbounds[].tag // empty' "$CONFIG_FILE")
     if ((${#tags[@]} == 0)); then
       info '没有可选入站。'
-      pause
-      return 0
     fi
     for ((number=0; number<${#tags[@]}; number++)); do
       tag=${tags[$number]}
@@ -370,7 +398,9 @@ toggle_service_running() {
 }
 
 toggle_service_startup() {
-  if service_is_enabled; then service_disable; info "开机自启已关闭；当前运行状态未改变。"; else service_enable; info "开机自启已开启。"; fi
+  ensure_dependencies service
+  service_exists || die "sing-box 服务不存在。"
+  if service_is_enabled; then service_disable || return; info "开机自启已关闭；当前服务运行状态未改变。"; else service_enable || return; info "开机自启已开启。"; fi
 }
 
 service_menu() {
@@ -380,35 +410,13 @@ service_menu() {
     # Single _service_summary_all call, parse with read — no repeated awk/systemctl
     read -r svc_summary boot_summary ver_summary <<< "$(_service_summary_all)"
     printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$svc_summary" "$boot_summary" "$ver_summary"
-    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装/更新/修复 sing-box\n6) 系统诊断\n7) 修复快捷命令\n0) 返回\n'
+    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action toggle_service_running; pause;;
       2) run_menu_action service_action restart; pause;;
       3) run_menu_action toggle_service_startup; pause;;
       4) run_menu_action service_logs 100; pause;;
-      5) run_menu_action install_or_update_sing_box; pause;;
-      6) run_menu_action system_diagnostics; pause;;
-      7) run_menu_action repair_quick_command; pause;;
-      0) return;; *) warn "无效选项。"; pause;;
-    esac
-  done
-}
-
-# ---- three-level uninstall menu ----
-uninstall_menu() {
-  local choice
-  while true; do
-    clear_screen; heading "卸载"
-    printf '1) 卸载程序 — 仅删除 sing-box 核心，保留配置/证书/sbctl\n'
-    printf '2) 完全卸载 — 删除 sing-box/sbctl/配置/证书，保留备份\n'
-    printf '3) 彻底删除 — 清除全部 sbctl 数据和备份\n'
-    printf '0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
-    case $choice in
-      1) run_menu_action uninstall_sing_box 0; pause;;
-      2) run_menu_action uninstall_sing_box 1; return;;
-      3) run_menu_action uninstall_sing_box 2; return;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -490,7 +498,7 @@ main_menu() {
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) inbound_menu;; 2) outbound_menu;; 3) certificate_menu;; 4) traffic_menu;;
-      5) run_menu_action toggle_bbr; pause;; 6) service_menu;; 7) uninstall_menu;;
+      5) run_menu_action toggle_bbr; pause;; 6) service_menu;; 7) clear_screen; run_menu_action uninstall_sing_box; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -503,10 +511,6 @@ sbctl - sing-box Linux 管理器
 
 用法:
   sbctl                              打开交互菜单
-  sbctl install [版本]               安装/更新 sing-box
-  sbctl uninstall                    仅卸载 sing-box 核心，保留配置
-  sbctl uninstall --purge            完全卸载，保留备份
-  sbctl uninstall --erase            彻底删除全部 sbctl 数据和备份
   sbctl status                       查看状态
   sbctl start|stop|restart           服务控制
   sbctl enable|disable               开关开机自启
@@ -516,7 +520,7 @@ sbctl - sing-box Linux 管理器
   sbctl traffic period set <日> <时:分> 设置统一统计起点
   sbctl traffic enable|disable       开启/停止流量统计
   sbctl traffic limit show|enable|disable
-  sbctl traffic limit set <标签> <GB> <重置日>
+  sbctl traffic limit set <标签> <GB> <重置日> [HH:MM]
   sbctl traffic limit remove <标签>
 
   sbctl inbound list                 列出入站
@@ -525,8 +529,7 @@ sbctl - sing-box Linux 管理器
   sbctl inbound rename <旧标签> <新标签>
   sbctl inbound modify [标签]        修改监听地址/端口
   sbctl inbound security [标签]      修改 TLS/REALITY
-  sbctl inbound disable <标签> [--yes] 禁用入站
-  sbctl inbound enable <标签> [--yes] 启用入站
+  sbctl inbound transport [标签]     修改 TCP/WS 传输
   sbctl inbound delete [标签] [--yes]
 
   sbctl outbound list
@@ -541,10 +544,11 @@ sbctl - sing-box Linux 管理器
   sbctl client add [标签]
   sbctl client rename [标签] [旧名称] [新名称]
   sbctl client rotate [标签] [用户]
-  sbctl client delete [标签] [用户]
+  sbctl client delete [标签] [用户] [--yes]
 
   sbctl link [标签] [用户]           输出分享信息/客户端 JSON
-  sbctl config check|show|edit
+  sbctl subscription [标签]          输出 Base64 VLESS 订阅
+  sbctl config check|show|edit|migrate-tags
   sbctl cert list
   sbctl cert issue [域名/IP] [邮箱]
   sbctl cert import [标识] [证书] [私钥]
@@ -555,7 +559,6 @@ sbctl - sing-box Linux 管理器
   sbctl backup [文件.tar.gz]
   sbctl restore [文件.tar.gz]
   sbctl bbr                           启用/关闭 BBR（交互式）
-  sbctl diagnose
   sbctl version
 
 证书说明:
@@ -576,16 +579,7 @@ dispatch() {
   case $cmd in
     menu) main_menu;;
     help|-h|--help) show_help;;
-    version|-v|--version) printf 'sbctl %s\n' "$SBCTL_VERSION";;
-    install|update|upgrade) install_or_update_sing_box "${1-}";;
-    uninstall)
-      case ${1-} in
-        "") uninstall_sing_box 0;;
-        --purge) uninstall_sing_box 1;;
-        --erase) uninstall_sing_box 2;;
-        *) die "未知卸载选项：${1}";;
-      esac
-      ;;
+    version|-v|--version) printf 'sbctl %s' "$SBCTL_VERSION"; [[ $SBCTL_BUILD_COMMIT == development ]] || printf ' (commit %s)' "$SBCTL_BUILD_COMMIT"; printf '\n';;
     status) show_status;;
     start|stop|restart|enable|disable) service_action "$cmd";;
     logs) service_logs "${1:-100}";;
@@ -610,7 +604,7 @@ dispatch() {
             show) traffic_limits_show;;
             enable|start) traffic_limits_enable;;
             disable|stop) traffic_limits_disable;;
-            set) traffic_limit_set "${3-}" "${4-}" "${5-}";;
+            set) traffic_limit_set "${3-}" "${4-}" "${5-}" "${6-}";;
             remove|delete) traffic_limit_remove "${3-}";;
             *) die "未知 traffic limit 子命令：${2}";;
           esac
@@ -627,6 +621,7 @@ dispatch() {
         rename) rename_inbound "${2-}" "${3-}";;
         modify|edit) modify_inbound_basic "${2-}";;
         security|tls) modify_inbound_security "${2-}";;
+        transport|stream) modify_inbound_transport "${2-}";;
         delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 inbound 子命令：${1}";;
       esac
@@ -654,16 +649,18 @@ dispatch() {
         add) add_client "${2-}";;
         rename) rename_client "${2-}" "${3-}" "${4-}";;
         rotate|reset) rotate_client_credential "${2-}" "${3-}";;
-        delete|remove) delete_client "${2-}" "${3-}";;
+        delete|remove) delete_client "${2-}" "${3-}" "$([[ ${4-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 client 子命令：${1}";;
       esac
       ;;
-    link|share) print_share "${1-}" "${2-}";;
+    link|links|share) print_share "${1-}" "${2-}";;
+    subscription|subscribe|sub) print_subscription "${1-}";;
     config)
       case ${1:-check} in
         check|test) check_config;;
         show) ensure_config; jq . "$CONFIG_FILE";;
         edit) edit_config;;
+        migrate-tags) ensure_config; normalize_config_tags;;
         *) die "未知 config 子命令。";;
       esac
       ;;
@@ -682,8 +679,6 @@ dispatch() {
     backup) backup_all "${1-}";;
     restore) restore_backup "${1-}";;
     bbr) toggle_bbr;;
-    diagnose|doctor) system_diagnostics;;
-    quick-command) repair_quick_command;;
     internal-hy2-hop-restore) internal_hy2_hop_restore;;
     internal-hy2-hop-clear) internal_hy2_hop_clear;;
     internal-traffic-collect) internal_traffic_collect;;

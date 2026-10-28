@@ -214,4 +214,10 @@ run_case socks-auth 5 socks none tcp 1 1 '' '' socks-user
 run_case http-open 6 http none tcp 1 1 '' ''
 run_case http-auth 6 http none tcp 1 1 '' '' http-user
 
+validate_websocket_path /valid-path
+if validate_websocket_path '/bad path'; then
+  printf 'WebSocket path with whitespace was accepted\n' >&2
+  exit 1
+fi
+
 printf 'inbound build matrix passed.\n'

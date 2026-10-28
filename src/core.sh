@@ -63,7 +63,7 @@ confirm() {
   local prompt=${1:-"确定继续吗？"} default=${2:-N} answer suffix
   [[ $default == Y ]] && suffix='[Y/n]' || suffix='[y/N]'
   if [[ ! -t 0 ]]; then [[ $default == Y ]]; return; fi
-  read -r -p "${prompt} ${suffix} " answer || { echo; answer=${default}; }
+  read -r -p "${prompt} ${suffix} " answer || { echo; return 1; }
   answer=${answer:-$default}
   [[ $answer =~ ^[Yy]$ ]]
 }

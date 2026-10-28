@@ -202,10 +202,13 @@ traffic_recorded_backend() {
 }
 
 traffic_set_backend() {
-  local backend=$1 tmp
-  traffic_init_file
-  tmp=$(temp_file); jq --arg backend "$backend" '.backend=$backend' "$TRAFFIC_FILE" >"$tmp"
-  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
+  local backend=$1 tmp rc=0
+  traffic_init_file || return 1
+  tmp=$(temp_file) || return 1
+  jq --arg backend "$backend" '.backend=$backend' "$TRAFFIC_FILE" >"$tmp" || rc=1
+  if ((rc == 0)); then install -m 600 "$tmp" "$TRAFFIC_FILE" || rc=1; fi
+  rm -f "$tmp"
+  return "$rc"
 }
 
 traffic_inventory_json() {
@@ -495,39 +498,53 @@ traffic_limit_is_blocked() {
 }
 
 traffic_restore_nft_rules() {
-  local tag type port protocol count_comment block_comment blocked count=0
+  local tag type port protocol blocked count=0 payload batch comment_count comment_block exists=0 rc=0
   command_exists nft || return 1
-  traffic_clear_nft_rules || return 1
-  nft add table inet "$TRAFFIC_NFT_TABLE" || return 1
-  nft 'add chain inet sbctl_traffic input { type filter hook input priority -5; policy accept; }' || return 1
-  nft 'add chain inet sbctl_traffic output { type filter hook output priority -5; policy accept; }' || return 1
+  if payload=$(nft -j list table inet "$TRAFFIC_NFT_TABLE" 2>/dev/null); then
+    exists=1
+    if ! jq -e '[.nftables[]?.rule | select(. != null) | select(((.comment // "") | startswith("sbctl-traffic:")) | not)] | length==0' <<<"$payload" >/dev/null; then
+      warn "nftables 表 ${TRAFFIC_NFT_TABLE} 含有非 sbctl 规则，拒绝替换。"
+      return 1
+    fi
+  fi
+  batch=$(temp_file) || return 1
+  if ((exists)); then printf 'delete table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"; fi
+  printf 'add table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
+  printf 'add chain inet %s input { type filter hook input priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
+  printf 'add chain inet %s output { type filter hook output priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
   while IFS=$'\t' read -r tag type port; do
     [[ -n $tag ]] && validate_port "$port" || continue
-    count_comment="\"sbctl-traffic:count:${tag}\""
-    block_comment="\"sbctl-traffic:block:${tag}\""
+    comment_count=$(jq -nr --arg s "sbctl-traffic:count:${tag}" '$s|@json')
+    comment_block=$(jq -nr --arg s "sbctl-traffic:block:${tag}" '$s|@json')
     blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
     while IFS= read -r protocol; do
       if ((blocked)); then
-        nft add rule inet "$TRAFFIC_NFT_TABLE" input "$protocol" dport "$port" drop comment "$block_comment" || return 1
-        nft add rule inet "$TRAFFIC_NFT_TABLE" output "$protocol" sport "$port" drop comment "$block_comment" || return 1
+        printf 'add rule inet %s input %s dport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
+        printf 'add rule inet %s output %s sport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
       fi
-      nft add rule inet "$TRAFFIC_NFT_TABLE" input "$protocol" dport "$port" counter comment "$count_comment" || return 1
-      nft add rule inet "$TRAFFIC_NFT_TABLE" output "$protocol" sport "$port" counter comment "$count_comment" || return 1
+      printf 'add rule inet %s input %s dport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
+      printf 'add rule inet %s output %s sport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
       count=$((count + 1))
     done < <(traffic_protocols_for_type "$type")
   done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null || true)
-  ((count > 0)) || traffic_clear_nft_rules
+  if ((count == 0)); then
+    : >"$batch"
+    if ((exists)); then printf 'delete table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"; fi
+  fi
+  if [[ -s $batch ]]; then nft -f "$batch" || rc=1; fi
+  rm -f "$batch"
+  return "$rc"
 }
 
-traffic_restore_iptables_rules() {
+traffic_build_iptables_rules() {
   local command tag type port protocol blocked count=0
   traffic_clear_iptables_rules || return 1
   for command in iptables ip6tables; do
     command_exists "$command" || continue
-    "$command" -t filter -N "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || true
-    "$command" -t filter -N "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || true
-    "$command" -t filter -C INPUT -j "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I INPUT 1 -j "$TRAFFIC_IPTABLES_IN_CHAIN"
-    "$command" -t filter -C OUTPUT -j "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I OUTPUT 1 -j "$TRAFFIC_IPTABLES_OUT_CHAIN"
+    "$command" -t filter -N "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || return 1
+    "$command" -t filter -N "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || return 1
+    "$command" -t filter -C INPUT -j "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I INPUT 1 -j "$TRAFFIC_IPTABLES_IN_CHAIN" || return 1
+    "$command" -t filter -C OUTPUT -j "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I OUTPUT 1 -j "$TRAFFIC_IPTABLES_OUT_CHAIN" || return 1
     while IFS=$'\t' read -r tag type port; do
       [[ -n $tag ]] && validate_port "$port" || continue
       blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
@@ -545,13 +562,84 @@ traffic_restore_iptables_rules() {
   ((count > 0)) || traffic_clear_iptables_rules
 }
 
+# Save only our chains and their parent jumps; never restore the entire filter
+# table, since unrelated rules can change while a rebuild is in progress.
+traffic_restore_iptables_rules() {
+  local command save restore snapshot raw rc=0
+  local -a snapshots=() restores=()
+  for command in iptables ip6tables; do
+    command_exists "$command" || continue
+    save="${command}-save"; restore="${command}-restore"
+    if ! command_exists "$save" || ! command_exists "$restore"; then
+      warn "缺少 ${save} 或 ${restore}，无法安全重建流量规则。"; rc=1; break
+    fi
+    snapshot=$(temp_file) || { rc=1; break; }
+    snapshots+=("$snapshot"); restores+=("$restore")
+    raw=$(temp_file) || { rc=1; break; }
+    if ! "$save" -c -t filter >"$raw"; then rm -f "$raw"; rc=1; break; fi
+    awk -v inch="$TRAFFIC_IPTABLES_IN_CHAIN" -v outch="$TRAFFIC_IPTABLES_OUT_CHAIN" '
+      BEGIN { print "*filter" }
+      $1 == ":" inch || $1 == ":" outch { print; next }
+      { offset = ($1 ~ /^\[[0-9]+:[0-9]+\]$/ ? 1 : 0) }
+      $(1+offset) == "-A" && ($(2+offset) == inch || $(2+offset) == outch) { print; next }
+      $(1+offset) == "-A" && ($(2+offset) == "INPUT" || $(2+offset) == "OUTPUT") {
+        parent=$(2+offset); position[parent]++
+        if ((parent == "INPUT" && $(3+offset) == "-j" && $(4+offset) == inch) || (parent == "OUTPUT" && $(3+offset) == "-j" && $(4+offset) == outch)) {
+          $(1+offset)="-I"; $(2+offset)=parent " " position[parent]; print
+        }
+      }
+      END { print "COMMIT" }
+    ' "$raw" >"$snapshot" || rc=1
+    rm -f "$raw"
+    ((rc == 0)) || break
+  done
+  if ((rc == 0)); then
+    traffic_build_iptables_rules || {
+      rc=1
+      local i
+      if traffic_clear_iptables_rules; then
+        for ((i=0; i<${#snapshots[@]}; i++)); do
+          "${restores[i]}" --noflush -c <"${snapshots[i]}" || warn "iptables 流量规则恢复失败，请立即检查防火墙。"
+        done
+      else
+        warn "iptables 流量规则无法安全清理，未应用快照；请立即检查防火墙。"
+      fi
+    }
+  fi
+  ((${#snapshots[@]} == 0)) || rm -f "${snapshots[@]}"
+  return "$rc"
+}
+
 traffic_rules_restore() {
-  local selected
-  selected=$(traffic_backend)
-  [[ $selected != none ]] || return 1
-  traffic_rules_clear || return 1
-  [[ $(traffic_recorded_backend) == "$selected" ]] || traffic_set_backend "$selected"
+  local selected previous
+  selected=${1:-$(traffic_backend)}
+  case $selected in nft|iptables) :;; *) return 1;; esac
+  previous=$(traffic_recorded_backend)
+  case $previous in ''|nft|iptables) :;; *) return 1;; esac
   [[ -f $CONFIG_FILE ]] || return 0
+  if [[ $previous != "$selected" ]]; then
+    if traffic_backend_conflicts "$selected"; then
+      warn "目标后端存在同名规则，拒绝切换。"; return 1
+    fi
+    # Build the new backend while the recorded backend still protects traffic.
+    if ! "traffic_restore_${selected}_rules"; then
+      "traffic_clear_${selected}_rules" || warn "目标后端清理失败，请检查残留规则。"
+      return 1
+    fi
+    if ! traffic_rules_clear; then
+      if [[ -z $previous ]] || "traffic_restore_${previous}_rules"; then
+        "traffic_clear_${selected}_rules" || warn "目标后端清理失败，请检查残留规则。"
+      else warn "原后端恢复失败，保留目标规则；请检查防火墙。"; fi
+      return 1
+    fi
+    if ! traffic_set_backend "$selected"; then
+      if [[ -z $previous ]] || "traffic_restore_${previous}_rules"; then
+        "traffic_clear_${selected}_rules" || warn "目标后端清理失败，请检查残留规则。"
+      else warn "原后端恢复失败，保留目标规则；请检查防火墙。"; fi
+      return 1
+    fi
+    return 0
+  fi
   case $selected in
     nft) traffic_restore_nft_rules ;;
     iptables) traffic_restore_iptables_rules ;;
@@ -562,7 +650,7 @@ traffic_rules_restore() {
 traffic_rules_restore_serialized() {
   local rc=0
   traffic_lock_acquire || return 1
-  traffic_rules_restore || rc=1
+  traffic_rules_restore "${1:-}" || rc=1
   traffic_lock_release
   return "$rc"
 }
@@ -761,7 +849,9 @@ traffic_limits_disable() {
 }
 
 traffic_limit_set() {
-  local tag=${1-} quota_gb=${2-} reset_day=${3-} quota now anchor_day anchor_time cycle_end tmp rc=0 existing
+  local tag=${1-} quota_gb=${2-} reset_day=${3-} reset_time=${4-} quota now anchor_day anchor_time cycle_end tmp rc=0 existing
+  local interactive=0 default_day default_time old_day old_time schedule_changed=0
+  if [[ -z $quota_gb ]] || { [[ -z $reset_day ]] && [[ -t 0 ]]; }; then interactive=1; fi
   require_root traffic-limit-set; ensure_config
   traffic_is_enabled || { warn "请先开启流量统计。"; return 1; }
   traffic_limits_are_enabled || { warn "请先启用流量限制功能。"; return 1; }
@@ -773,26 +863,54 @@ traffic_limit_set() {
   done
   quota=${quota:-$(traffic_limit_quota_bytes "$quota_gb")} || { warn "流量额度无效。"; return 1; }
   traffic_collect || return 1
-  now=$(traffic_now); anchor_time=${now:11:8}
-  if [[ -z $reset_day && -t 0 ]]; then
-    read -r -p "每月重置日期（1-31）: " reset_day || { echo; return 0; }
+  now=$(traffic_now)
+  existing=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.enabled==true' "$TRAFFIC_FILE")
+  default_day=$((10#${now:8:2})); default_time=${now:11:5}
+  if [[ $existing == true ]]; then
+    old_day=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.resetDay // .inbounds[$tag].limit.anchorDay' "$TRAFFIC_FILE")
+    old_time=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.anchorTime' "$TRAFFIC_FILE")
+    default_day=$old_day; default_time=${old_time:0:5}
   fi
-  reset_day=${reset_day:-$((10#${now:8:2}))}
+  while [[ -z $reset_day && $interactive == 1 ]]; do
+    prompt_value reset_day "每月重置日期（1-31）" || return 0
+    if [[ ! $reset_day =~ ^[0-9]+$ ]] || ((10#$reset_day < 1 || 10#$reset_day > 31)); then
+      warn "重置日期无效，请输入 1 到 31。"; reset_day=""
+    fi
+  done
+  reset_day=${reset_day:-$default_day}
   if ! [[ $reset_day =~ ^[0-9]+$ ]] || ((10#$reset_day < 1 || 10#$reset_day > 31)); then
     warn "重置日期无效，请输入 1 到 31。"; return 1
   fi
-  existing=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.enabled==true' "$TRAFFIC_FILE")
-  if [[ $existing == true ]]; then
-    anchor_time=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.anchorTime // empty' "$TRAFFIC_FILE")
+  reset_day=$((10#$reset_day))
+  while [[ -z $reset_time && $interactive == 1 ]]; do
+    prompt_value reset_time "每月重置时间（HH:MM，服务器本地时间）" "$default_time" || return 0
+    if [[ ! $reset_time =~ ^[0-9]{2}:[0-9]{2}$ ]] || ! traffic_validate_timestamp "2026-01-01 ${reset_time}:00"; then
+      warn "重置时间无效，请输入 HH:MM，例如 18:30。"; reset_time=""
+    fi
+  done
+  if [[ -n $reset_time ]]; then
+    if [[ ! $reset_time =~ ^[0-9]{2}:[0-9]{2}$ ]] || ! traffic_validate_timestamp "2026-01-01 ${reset_time}:00"; then
+      warn "重置时间无效，请输入 HH:MM，例如 18:30。"; return 1
+    fi
+    anchor_time=${reset_time}:00
+  elif [[ $existing == true ]]; then
+    anchor_time=$old_time
+  else
+    anchor_time=${default_time}:00
   fi
   anchor_day=$reset_day
-  cycle_end=$(traffic_limit_first_cycle_end "$now" "$reset_day" "$anchor_time") || return 1
+  if [[ $existing == true && $reset_day == "$old_day" && $anchor_time == "$old_time" ]]; then
+    cycle_end=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.cycleEnd' "$TRAFFIC_FILE")
+  else
+    cycle_end=$(traffic_limit_first_cycle_end "$now" "$reset_day" "$anchor_time") || return 1
+    [[ $existing != true ]] || schedule_changed=1
+  fi
   traffic_lock_acquire || return 1
   tmp=$(temp_file)
   jq --arg tag "$tag" --argjson quota "$quota" --arg now "$now" --argjson resetDay "$reset_day" --argjson anchorDay "$anchor_day" \
     --arg anchorTime "$anchor_time" --arg cycleEnd "$cycle_end" '
       if .inbounds[$tag].limit.enabled==true then
-        .inbounds[$tag].limit.quotaBytes=$quota | .inbounds[$tag].limit.resetDay=$resetDay | .inbounds[$tag].limit.anchorDay=$anchorDay | .inbounds[$tag].limit.cycleEnd=$cycleEnd
+        .inbounds[$tag].limit.quotaBytes=$quota | .inbounds[$tag].limit.resetDay=$resetDay | .inbounds[$tag].limit.anchorDay=$anchorDay | .inbounds[$tag].limit.anchorTime=$anchorTime | .inbounds[$tag].limit.cycleEnd=$cycleEnd
       else
         .inbounds[$tag].limit={enabled:true,quotaBytes:$quota,resetDay:$resetDay,anchorDay:$anchorDay,anchorTime:$anchorTime,
           cycleStart:$now,cycleEnd:$cycleEnd,usedBytes:0}
@@ -802,7 +920,9 @@ traffic_limit_set() {
   rm -f "$tmp"; traffic_lock_release
   ((rc == 0)) || return 1
   traffic_rules_restore_serialized || { warn "额度已保存，但防火墙规则暂未同步，采集任务会自动重试。"; return 1; }
-  if [[ $existing == true ]]; then
+  if ((schedule_changed)); then
+    info "已修改入站 ${tag} 的月度额度和重置时间：每月 ${reset_day} 日 ${anchor_time:0:5}；已用流量保持不变，下次重置：${cycle_end}。"
+  elif [[ $existing == true ]]; then
     info "已修改入站 ${tag} 的月度额度；原周期起止时间和已用流量保持不变。"
   else
     info "已设置入站 ${tag} 的月度额度，当前周期：${now} ～ ${cycle_end}。"
@@ -995,10 +1115,10 @@ traffic_clear_all_records() {
 }
 
 traffic_timer_install() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  [[ -x $QUICK_COMMAND ]] || install_quick_command || return 1
   case $(init_system) in
     systemd)
-      cat >"$TRAFFIC_SYSTEMD_SERVICE" <<EOF_SERVICE
+      cat >"$TRAFFIC_SYSTEMD_SERVICE" <<EOF_SERVICE || return 1
 [Unit]
 Description=Collect sbctl per-inbound traffic counters
 After=network-online.target
@@ -1013,7 +1133,7 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$(dirname "$TRAFFIC_FILE") $(dirname "$TRAFFIC_LOCK")
 EOF_SERVICE
-      cat >"$TRAFFIC_SYSTEMD_TIMER" <<EOF_TIMER
+      cat >"$TRAFFIC_SYSTEMD_TIMER" <<EOF_TIMER || return 1
 [Unit]
 Description=Collect sbctl traffic every minute
 
@@ -1026,13 +1146,13 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-      systemctl daemon-reload
+      systemctl daemon-reload || return 1
       systemctl enable --now sbctl-traffic-collect.timer >/dev/null 2>&1 || return 1
-      meta_resource_register trafficService "$TRAFFIC_SYSTEMD_SERVICE"
-      meta_resource_register trafficTimer "$TRAFFIC_SYSTEMD_TIMER"
+      meta_resource_register trafficService "$TRAFFIC_SYSTEMD_SERVICE" || return 1
+      meta_resource_register trafficTimer "$TRAFFIC_SYSTEMD_TIMER" || return 1
       ;;
     openrc)
-      cat >"$TRAFFIC_OPENRC_SERVICE" <<EOF_RC
+      cat >"$TRAFFIC_OPENRC_SERVICE" <<EOF_RC || return 1
 #!/sbin/openrc-run
 name="sbctl traffic collector"
 description="Collect sbctl per-inbound traffic counters"
@@ -1044,8 +1164,8 @@ respawn_delay=3
 respawn_max=0
 $(printf '%s' 'depend() { need net; after sing-box; }')
 EOF_RC
-      chmod 755 "$TRAFFIC_OPENRC_SERVICE"
-      rc-update add sbctl-traffic-collect default >/dev/null 2>&1 || true
+      chmod 755 "$TRAFFIC_OPENRC_SERVICE" || return 1
+      rc-update add sbctl-traffic-collect default >/dev/null 2>&1 || return 1
       rc-service sbctl-traffic-collect restart >/dev/null 2>&1 || return 1
       meta_resource_register trafficService "$TRAFFIC_OPENRC_SERVICE"
       ;;
@@ -1056,15 +1176,21 @@ EOF_RC
 traffic_timer_remove() {
   case $(init_system) in
     systemd)
-      systemctl disable --now sbctl-traffic-collect.timer >/dev/null 2>&1 || true
-      systemctl stop sbctl-traffic-collect.service >/dev/null 2>&1 || true
-      rm -f "$TRAFFIC_SYSTEMD_SERVICE" "$TRAFFIC_SYSTEMD_TIMER"
-      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -e $TRAFFIC_SYSTEMD_TIMER ]]; then
+        systemctl disable --now sbctl-traffic-collect.timer >/dev/null 2>&1 || return 1
+      fi
+      if [[ -e $TRAFFIC_SYSTEMD_SERVICE ]]; then
+        systemctl stop sbctl-traffic-collect.service >/dev/null 2>&1 || return 1
+      fi
+      rm -f "$TRAFFIC_SYSTEMD_SERVICE" "$TRAFFIC_SYSTEMD_TIMER" || return 1
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
       ;;
     openrc)
-      rc-service sbctl-traffic-collect stop >/dev/null 2>&1 || true
-      rc-update del sbctl-traffic-collect default >/dev/null 2>&1 || true
-      rm -f "$TRAFFIC_OPENRC_SERVICE"
+      if [[ -e $TRAFFIC_OPENRC_SERVICE ]]; then
+        rc-service sbctl-traffic-collect stop >/dev/null 2>&1 || return 1
+        rc-update del sbctl-traffic-collect default >/dev/null 2>&1 || return 1
+        rm -f "$TRAFFIC_OPENRC_SERVICE" || return 1
+      fi
       ;;
   esac
 }
@@ -1078,25 +1204,39 @@ traffic_runtime_ensure() {
 }
 
 traffic_runtime_stop() {
-  traffic_timer_remove
+  traffic_timer_remove || return 1
   traffic_rules_clear
 }
 
 traffic_enable() {
   require_root traffic-enable; ensure_config
-  local selected
+  local selected previous was_enabled=false
   traffic_ensure_backend || return 1
+  previous=$(traffic_recorded_backend)
+  traffic_is_enabled && was_enabled=true
   selected=$(traffic_backend)
   if traffic_backend_conflicts "$selected"; then
     warn "检测到同名 ${selected} 流量规则，但无法确认由 sbctl 管理；拒绝覆盖。"
     return 1
   fi
-  traffic_set_backend "$selected"
-  traffic_set_enabled true
-  traffic_sync_inventory
-  if ! traffic_rules_restore || ! traffic_timer_install; then
-    traffic_set_enabled false; traffic_runtime_stop || true
-    warn "流量统计启动失败，已撤销运行时规则。"; return 1
+  traffic_set_enabled true || return 1
+  if ! traffic_sync_inventory || ! traffic_rules_restore_serialized; then
+    if [[ $was_enabled == false ]]; then
+      traffic_set_enabled false || warn "无法回滚流量统计启用状态，请检查状态文件。"
+    fi
+    warn "流量统计启动失败，请检查防火墙规则。"; return 1
+  fi
+  if ! traffic_timer_install; then
+    if [[ $previous == nft || $previous == iptables ]]; then
+      traffic_rules_restore_serialized "$previous" || warn "原流量后端恢复失败，请检查防火墙。"
+    else
+      traffic_lock_acquire && { traffic_rules_clear || warn "流量规则清理失败，请检查防火墙。"; traffic_lock_release; }
+    fi
+    if [[ $was_enabled == false ]]; then
+      traffic_timer_remove
+      traffic_set_enabled false || warn "无法回滚流量统计启用状态，请检查状态文件。"
+    fi
+    warn "流量采集任务安装失败，请检查任务和防火墙状态。"; return 1
   fi
   meta_resource_register trafficFile "$TRAFFIC_FILE"
   info "流量统计已开启；每分钟保存一次，只保留当前月度周期。"

@@ -223,6 +223,19 @@ done
 )
 
 (
+  prepare_case snapshot-failure
+  make_managed_core 1.13.18
+  write_default_config
+  make_release_archive "$RELEASE_ARCHIVE" 1.13.19 linux-amd64-musl 1.13.19
+  SERVICE_PRESENT=1 SERVICE_ACTIVE=1
+  mock_successful_service
+  cp() { if [[ ${2-} == "$META_FILE" ]]; then return 1; fi; command cp "$@"; }
+  if install_sing_box_release 1.13.19 >/dev/null 2>&1; then fail 'failed metadata snapshot unexpectedly succeeded'; fi
+  [[ $($SING_BOX_RELEASE_INSTALL_PATH version) == 'sing-box version 1.13.18' ]]
+  [[ $(jq -r '.singBox.version' "$META_FILE") == 1.13.18 ]]
+)
+
+(
   prepare_case service-rollback
   make_managed_core 1.13.18
   write_default_config
@@ -238,6 +251,20 @@ done
   [[ $($SING_BOX_RELEASE_INSTALL_PATH version) == 'sing-box version 1.13.18' ]]
   [[ $(jq -r '.singBox.version' "$META_FILE") == 1.13.18 ]]
   [[ $SERVICE_ACTIVE == 1 ]]
+)
+
+(
+  prepare_case rollback-snapshot-retained
+  make_managed_core 1.13.18
+  write_default_config
+  make_release_archive "$RELEASE_ARCHIVE" 1.13.19 linux-amd64-musl 1.13.19
+  SERVICE_PRESENT=1 SERVICE_ACTIVE=1
+  mock_successful_service
+  service_restart() { return 1; }
+  rollback_sing_box_binary() { return 1; }
+  if install_sing_box_release 1.13.19 >"$TEST_ROOT/rollback-snapshot-retained/rollback.log" 2>&1; then fail 'failed rollback unexpectedly succeeded'; fi
+  compgen -G "${SING_BOX_RELEASE_INSTALL_PATH%/*}/.sing-box.backup.*" >/dev/null || fail 'old binary snapshot was deleted after rollback failure'
+  grep -q '自动回滚不完整' "$TEST_ROOT/rollback-snapshot-retained/rollback.log" || fail 'rollback failure was not reported'
 )
 
 (

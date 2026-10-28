@@ -13,7 +13,7 @@ port_in_use_os() {
 prompt_tag() {
   local __var=$1 default=$2 value
   while true; do
-    prompt_value value "入站标签" "$default"
+    prompt_value value "入站标签" "$default" || return 1
     validate_tag "$value" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
     inbound_exists "$value" && { warn "标签已存在。"; continue; }
     printf -v "$__var" '%s' "$value"; return
@@ -43,7 +43,7 @@ _random_port_avoiding_hops() {
 prompt_port() {
   local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value current_port=""
   while true; do
-    prompt_value value "监听端口" "$default"
+    prompt_value value "监听端口" "$default" || return 1
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
     [[ -z $except ]] || current_port=$(jq -r --arg tag "$except" '.inbounds[]?|select(.tag==$tag)|.listen_port // empty' "$CONFIG_FILE")
@@ -57,10 +57,10 @@ prompt_port() {
 
 build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host="" tls="" reality_public="" name="" password="" uuid="" flow="" obfs_choice="" obfs_password="" up="" down="" selected_hop_range="" transport_json="null" ws_path=""
-  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
+  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" || return 1
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; esac
-  prompt_tag tag "${type}-$(random_hex 2)"
-  prompt_value listen "监听地址" "0.0.0.0"
+  prompt_tag tag "${type}-$(random_hex 2)" || return 1
+  prompt_value listen "监听地址" "0.0.0.0" || return 1
 
   # ---- client_host resolution ----
   #   cert TLS   → auto from certificate server_name (no prompt_public_host)
@@ -68,48 +68,50 @@ build_inbound() {
   #   no TLS     → prompt_public_host
   case $type in
     vless)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密"
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密" || return 1
       case $choice in
-        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host ;;
+        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host || return 1 ;;
         2) build_certificate_tls tls client_host || return 1 ;;
-        3) tls=""; prompt_public_host client_host ;;
+        3) tls=""; prompt_public_host client_host || return 1 ;;
       esac
-      prompt_port port
+      prompt_port port || return 1
       # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
       if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws"
+        choose tp_choice "传输方式" "tcp" "ws" || return 1
         if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)" || return 1
+          validate_websocket_path "$ws_path" || return 1
           transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
       fi
       ;;
     anytls)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
-        prompt_public_host client_host
+        prompt_public_host client_host || return 1
       else
         build_certificate_tls tls client_host || return 1
       fi
-      prompt_port port
+      prompt_port port || return 1
       ;;
     trojan)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
-        prompt_public_host client_host
+        prompt_public_host client_host || return 1
       else
         build_certificate_tls tls client_host || return 1
       fi
-      prompt_port port
+      prompt_port port || return 1
       # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
       if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws"
+        choose tp_choice "传输方式" "tcp" "ws" || return 1
         if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)" || return 1
+          validate_websocket_path "$ws_path" || return 1
           transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
       fi
@@ -117,10 +119,10 @@ build_inbound() {
     hysteria2)
       build_certificate_tls tls client_host || return 1
       local hop_choice
-      choose hop_choice "端口模式" "普通端口" "端口跳跃"
+      choose hop_choice "端口模式" "普通端口" "端口跳跃" || return 1
       if [[ $hop_choice == 2 ]]; then
         while true; do
-          prompt_value selected_hop_range "端口跳跃范围" "30000-50000"
+          prompt_value selected_hop_range "端口跳跃范围" "30000-50000" || return 1
           validate_hy2_hop_range "$selected_hop_range" && break
           warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
         done
@@ -129,44 +131,44 @@ build_inbound() {
         fi
         prompt_hy2_internal_port port "$selected_hop_range" || return 1
       else
-        prompt_port port
+        prompt_port port || return 1
       fi
       ;;
     socks|http)
-      prompt_public_host client_host
-      prompt_port port
+      prompt_public_host client_host || return 1
+      prompt_port port || return 1
       ;;
   esac
 
   case $type in
     anytls)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
-      prompt_secret password "AnyTLS 密码" "$(random_password)"
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
+      prompt_secret password "AnyTLS 密码" "$(random_password)" || return 1
       protocol_build_anytls "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls"
       ;;
     vless)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
       uuid=$(generate_uuid)
       if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
       protocol_build_vless "$__json" "$tag" "$listen" "$port" "$name" "$uuid" "$flow" "$tls" "$transport_json"
       ;;
     hysteria2)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
-      prompt_secret password "Hysteria2 密码" "$(random_password)"
-      prompt_optional_positive_int up "上行限制 Mbps（留空=不限）"
-      prompt_optional_positive_int down "下行限制 Mbps（留空=不限）"
-      choose obfs_choice "QUIC 混淆" "关闭" "Salamander"
-      if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)"; fi
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
+      prompt_secret password "Hysteria2 密码" "$(random_password)" || return 1
+      prompt_optional_positive_int up "上行限制 Mbps（留空=不限）" || return 1
+      prompt_optional_positive_int down "下行限制 Mbps（留空=不限）" || return 1
+      choose obfs_choice "QUIC 混淆" "关闭" "Salamander" || return 1
+      if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)" || return 1; fi
       hy2_build "$__json" "$tag" "$listen" "$port" "$name" "$password" "$up" "$down" "$obfs_password" "$tls"
       ;;
     trojan)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
-      prompt_secret password "Trojan 密码" "$(random_password)"
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
+      prompt_secret password "Trojan 密码" "$(random_password)" || return 1
       protocol_build_trojan "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls" "$transport_json"
       ;;
     socks|http)
-      prompt_optional name "用户名（留空=无认证）"
-      if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)"; fi
+      prompt_optional name "用户名（留空=无认证）" || return 1
+      if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)" || return 1; fi
       [[ -n $name || $listen == 127.0.0.1 || $listen == ::1 ]] || warn "公网无认证代理风险很高。"
       protocol_build_proxy "$__json" "$type" "$tag" "$listen" "$port" "$name" "$password"
       ;;
@@ -203,8 +205,11 @@ add_inbound() {
       if hy2_hop_apply_nat; then
         info "Hysteria2 端口跳跃已启用：${hop_range} -> UDP $(jq -r '.listen_port' <<<"$inbound")"
       else
-        warn "端口跳跃 NAT 配置失败，当前使用内部监听端口连接。"
-        hy2_hop_meta_disable "$tag"
+        warn "端口跳跃 NAT 配置失败，正在恢复原跳跃规则。"
+        if ! hy2_hop_meta_disable "$tag" || ! hy2_hop_sync; then
+          warn "端口跳跃回滚不完整，请检查 metadata 和 NAT 规则。"
+          rc=1
+        fi
       fi
     fi
     traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
@@ -284,7 +289,7 @@ delete_inbound() {
     .domainTemplates.managed=[.domainTemplates.managed[]? | select(.inbound!=$tag)]
   ' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync
+    hy2_hop_sync || { warn "入站已删除，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
     traffic_after_config_change "$tag" || warn "流量统计规则未能同步，请在流量信息中刷新。"
     info "已删除入站 ${tag}。"
   else
@@ -299,20 +304,35 @@ modify_inbound_basic() {
   local tag=${1-} listen port host public tmp meta_tmp rc=0
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
-  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")"
-  prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag"
-  prompt_public_host host "$(public_host_for_tag "$tag")"
+  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")" || return 1
+  prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag" || return 1
+  prompt_public_host host "$(public_host_for_tag "$tag")" || return 1
   public=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPublicKey // empty' "$META_FILE" 2>/dev/null || true)
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --arg listen "$listen" --argjson port "$port" '(.inbounds[]|select(.tag==$tag)) |= (.listen=$listen | .listen_port=$port)' "$CONFIG_FILE" >"$tmp"
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync
+    hy2_hop_sync || { warn "入站已修改，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
     traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
   else
     rc=$?
   fi
   rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+modify_inbound_certificate() {
+  ensure_dependencies inbound-security; require_supported_core; ensure_config
+  local tag=$1 tls tmp rc=0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true and (.tls.reality.enabled!=true)' "$CONFIG_FILE" >/dev/null || { error '该入站未使用证书 TLS。'; return 1; }
+  build_certificate_tls tls || return 1
+  tmp=$(temp_file) || return 1
+  if ! jq --arg tag "$tag" --argjson tls "$tls" '(.inbounds[]|select(.tag==$tag)|.tls) |= (.certificate_path=$tls.certificate_path | .key_path=$tls.key_path | .server_name=$tls.server_name)' "$CONFIG_FILE" >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  if apply_candidate "$tmp"; then info "入站 ${tag} 的证书已更新。"; else rc=$?; fi
+  rm -f "$tmp"
   return "$rc"
 }
 
@@ -324,28 +344,58 @@ modify_inbound_security() {
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   case $type in
     anytls|vless|trojan)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls host; fi
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
+      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public || return 1; else build_certificate_tls tls host || return 1; fi
       ;;
     hysteria2)
       info "Hysteria2 必须使用证书 TLS。"
-      build_certificate_tls tls host
+      build_certificate_tls tls host || return 1
       ;;
     *) die "${type} 入站没有 sbctl 可管理的 TLS/REALITY 安全层。";;
   esac
   if [[ -z $host ]]; then
     host=$(public_host_for_tag "$tag" || true)
-    [[ -n $host ]] || prompt_public_host host
+    [[ -n $host ]] || prompt_public_host host || return 1
   fi
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
     (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
+    if $tls.reality.enabled==true then (.inbounds[]|select(.tag==$tag)) |= del(.transport) else . end |
     if $type=="vless" then
       (.inbounds[]|select(.tag==$tag)|.users) |= map(.flow=(if $tls.reality.enabled==true then "xtls-rprx-vision" else "" end))
     else . end' "$CONFIG_FILE" >"$tmp"
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then info "入站 ${tag} 的安全方式已更新。"; else rc=$?; fi
   rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+validate_websocket_path() {
+  [[ $1 != *[[:space:]]* ]] || { error "WebSocket 路径不能包含空白字符。"; return 1; }
+}
+
+modify_inbound_transport() {
+  ensure_dependencies inbound-modify; require_supported_core; ensure_config
+  local tag=${1-} type choice path host transport tmp rc=0
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  [[ $type == vless || $type == trojan ]] || { error "${type} 不支持此传输编辑。"; return 1; }
+  if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+    error "REALITY 入站仅支持 TCP；请先修改安全方式。"; return 1
+  fi
+  choose choice "传输方式" "tcp" "ws" || return 1
+  transport=null
+  if [[ $choice == 2 ]]; then
+    prompt_value path "WebSocket 路径" "/" || return 1
+    validate_websocket_path "$path" || return 1
+    host=$(public_host_for_tag "$tag") || return 1
+    transport=$(jq -n --arg path "$path" --arg host "$host" '{type:"ws",path:$path,headers:{Host:$host}}')
+  fi
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --argjson transport "$transport" '(.inbounds[]|select(.tag==$tag)) |= (if $transport==null then del(.transport) else .transport=$transport end)' "$CONFIG_FILE" >"$tmp"
+  apply_candidate "$tmp" || rc=$?
+  rm -f "$tmp"
   return "$rc"
 }
 
@@ -356,7 +406,7 @@ rename_inbound() {
   inbound_exists "$old" || die "找不到入站：$old"
   if [[ -z $new ]]; then
     while true; do
-      prompt_value new "新入站名称" "$old"
+      prompt_value new "新入站名称" "$old" || return 1
       [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
       validate_tag "$new" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
       if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
@@ -383,7 +433,7 @@ rename_inbound() {
       if .inbound==$old then .inbound=$new else . end]
   ' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync
+    hy2_hop_sync || { warn "入站已重命名，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
     traffic_after_config_change "$old" "$new" || warn "流量统计记录未能迁移，请在流量信息中刷新。"
     info "入站已重命名：${old} -> ${new}"
   else

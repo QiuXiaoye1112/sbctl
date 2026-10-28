@@ -101,4 +101,18 @@ apply_mode=failure
 [[ $(sha256sum "$CONFIG_FILE") == "$before_config" ]]
 [[ $(sha256sum "$META_FILE") == "$before_meta" ]]
 
+seed_config
+apply_mode=success
+if modify_inbound_transport vless-edit; then printf 'REALITY transport edit must fail\n' >&2; exit 1; fi
+security_choice=2
+active_case=security
+modify_inbound_security vless-edit
+apply_candidate() { install -m 600 "$1" "$CONFIG_FILE"; }
+prompt_value() { printf -v "$1" '%s' '/test'; }
+modify_inbound_transport vless-edit
+jq -e '.inbounds[0] | .transport.type=="ws" and .transport.path=="/test" and .users[0].uuid=="00000000-0000-0000-0000-000000000001"' "$CONFIG_FILE" >/dev/null
+security_choice=1
+modify_inbound_transport vless-edit
+jq -e '.inbounds[0] | has("transport")|not' "$CONFIG_FILE" >/dev/null
+
 printf 'inbound modify checks passed.\n'

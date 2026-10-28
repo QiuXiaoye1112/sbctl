@@ -47,8 +47,8 @@ load_cloudflare_credentials() {
 }
 
 cloudflare_dependent_certificates() {
-  init_meta
-  jq -r '.certificates | to_entries[] | select(.value.validation == "dns-cloudflare") | .key' "$META_FILE" 2>/dev/null
+  [[ -f $META_FILE ]] || return 0
+  jq -r '(.certificates // {}) | to_entries[] | select(.value.validation == "dns-cloudflare") | .key' "$META_FILE" 2>/dev/null
 }
 
 cloudflare_dependency_count() {

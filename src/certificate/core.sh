@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Certificate selection, validation, and metadata helpers.
 
-managed_certificate_count() { init_meta; jq -r '.certificates | length' "$META_FILE" 2>/dev/null || printf '0'; }
+managed_certificate_count() { [[ -f $META_FILE ]] || { printf '0'; return; }; jq -r '(.certificates // {}) | length' "$META_FILE" 2>/dev/null || printf '0'; }
 
 select_managed_certificate() {
   local __var=$1 always_choose=${2:-0} id answer
@@ -56,7 +56,7 @@ prompt_certificate_server_name() {
   elif ((${#names[@]} == 1)); then
     selected=${names[0]}
   else
-    choose answer "选择 TLS serverName/SNI" "${names[@]}"
+    choose answer "选择 TLS serverName/SNI" "${names[@]}" || return 1
     selected=${names[$((answer-1))]}
   fi
   printf -v "$__var" '%s' "$selected"
@@ -64,7 +64,7 @@ prompt_certificate_server_name() {
 
 # ---- certificate and managed-resource metadata ----
 meta_cert_exists() {
-  init_meta
+  [[ -f $META_FILE ]] || return 1
   jq -e --arg id "$1" '.certificates[$id] != null' "$META_FILE" >/dev/null 2>&1
 }
 
@@ -88,12 +88,12 @@ meta_cert_delete() {
 }
 
 meta_cert_get_field() {
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] | if . == null then empty else . end' "$META_FILE"
 }
 
-meta_cert_list() { init_meta; jq -r '.certificates | keys[]' "$META_FILE" 2>/dev/null; }
-meta_cert_auto_renew_certs() { init_meta; jq -r '.certificates | to_entries[] | select(.value.autoRenew == true) | .key' "$META_FILE" 2>/dev/null; }
+meta_cert_list() { [[ -f $META_FILE ]] || return 0; jq -r '(.certificates // {}) | keys[]' "$META_FILE" 2>/dev/null; }
+meta_cert_auto_renew_certs() { [[ -f $META_FILE ]] || return 0; jq -r '(.certificates // {}) | to_entries[] | select(.value.autoRenew == true) | .key' "$META_FILE" 2>/dev/null; }
 
 meta_resource_register() {
   local key=$1 value=$2 tmp
@@ -102,7 +102,7 @@ meta_resource_register() {
   install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
 }
 
-meta_resource_get() { init_meta; jq -r --arg key "$1" '.managedResources[$key] // empty' "$META_FILE"; }
+meta_resource_get() { [[ -f $META_FILE ]] || return 0; jq -r --arg key "$1" '.managedResources[$key] // empty' "$META_FILE"; }
 
 meta_resource_remove() {
   local key=$1 tmp

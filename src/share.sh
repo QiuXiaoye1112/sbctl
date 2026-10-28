@@ -44,7 +44,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 1; }
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -55,12 +55,12 @@ print_share() {
         [[ -z $filter || $name == "$filter" ]] || continue
         if [[ $security == reality ]]; then
           link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
-          [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         elif [[ $security == tls ]]; then
           link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
         else
           link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" none "")"
         fi
+        [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.uuid,(.flow//"")]|@tsv' "$CONFIG_FILE")
@@ -71,7 +71,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 1; }
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -112,7 +112,7 @@ print_share() {
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         while IFS= read -r name; do
           [[ -z $filter || $name == "$filter" ]] || continue
-          json=$(client_json_for_anytls "$tag" "$name")
+          json=$(client_json_for_anytls "$tag" "$name") || return 1
           print_share_entry "$name" "客户端 outbound JSON" "$json"
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
       else
@@ -125,13 +125,15 @@ print_share() {
       ;;
 
     socks|http)
+      local scheme=$type
+      [[ $type != socks ]] || scheme=socks5
       if [[ $(jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users//[])|length' "$CONFIG_FILE") == 0 ]]; then
-        link="${type}://${uri_host}:${port}  无认证"
+        link="${scheme}://${uri_host}:${port}#$(url_encode "$tag")"
         print_share_entry "无认证" "链接" "$link"
       else
         while IFS=$'\t' read -r name value; do
           [[ -z $filter || $name == "$filter" ]] || continue
-          link="${type}://$(url_encode "$name"):$(url_encode "$value")@${uri_host}:${port}#$(url_encode "${tag}-${name}")"
+          link="${scheme}://$(url_encode "$name"):$(url_encode "$value")@${uri_host}:${port}#$(url_encode "${tag}-${name}")"
           print_share_entry "$name" "链接" "$link"
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
@@ -142,9 +144,30 @@ print_share() {
 
 print_all_share() {
   ensure_config
-  local tag
+  local tag failed=0
   if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then info "还没有入站。"; return 0; fi
   while IFS= read -r tag; do
-    print_share "$tag" "" || true
+    print_share "$tag" "" || failed=1
   done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+  return "$failed"
+}
+
+# Match xrayctl's subscription scope: only VLESS URIs, one per line.
+print_subscription() {
+  ensure_config
+  local selected=${1-} tag line output links=''
+  if [[ -n $selected ]] && ! jq -e --arg tag "$selected" '.inbounds[] | select(.tag==$tag and .type=="vless")' "$CONFIG_FILE" >/dev/null; then
+    warn "找不到可订阅的 VLESS 入站：$selected"
+    return 1
+  fi
+  while IFS= read -r tag; do
+    output=$(print_share "$tag") || return 1
+    while IFS= read -r line; do
+      [[ $line == '链接: vless://'* ]] || continue
+      links+="${line#链接: }"$'\n'
+    done <<<"$output"
+  done < <(jq -r --arg selected "$selected" '.inbounds[] | select(.type=="vless" and ($selected=="" or .tag==$selected)) | .tag' "$CONFIG_FILE")
+  [[ -n $links ]] || { warn "没有可生成订阅的 VLESS 链接。"; return 1; }
+  printf '%s' "$links" | base64 | tr -d '\n'
+  printf '\n'
 }

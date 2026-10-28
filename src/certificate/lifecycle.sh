@@ -136,6 +136,14 @@ replace_certificate_pair() {
     [[ -z $__changed_var ]] || printf -v "$__changed_var" '%s' "$replace_changed"
     return 0
   fi
+  # Retain administrator-configured ownership and access on renewal. New
+  # files stay private; copying attributes first avoids widening permissions.
+  if [[ -f $cert_target ]]; then
+    cp -p "$cert_target" "$cert_tmp" && cat "$source_cert" >"$cert_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+  fi
+  if [[ -f $key_target ]]; then
+    cp -p "$key_target" "$key_tmp" && cat "$source_key" >"$key_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+  fi
   [[ ! -f $cert_target ]] || { cp -a "$cert_target" "$cert_bak"; had_cert=1; }
   [[ ! -f $key_target ]] || { cp -a "$key_target" "$key_bak"; had_key=1; }
   mv -f "$cert_tmp" "$cert_target" || failed=1
@@ -165,12 +173,12 @@ certificate_transaction_rollback() {
   local snapshot=$1 cert_target=$2 key_target=$3
   [[ -d $snapshot ]] || return 1
   if [[ -f $snapshot/cert ]]; then
-    install -m 600 "$snapshot/cert" "$cert_target" || return 1
+    cp -p "$snapshot/cert" "$cert_target" || return 1
   else
     rm -f "$cert_target"
   fi
   if [[ -f $snapshot/key ]]; then
-    install -m 600 "$snapshot/key" "$key_target" || return 1
+    cp -p "$snapshot/key" "$key_target" || return 1
   else
     rm -f "$key_target"
   fi
@@ -204,10 +212,10 @@ certificate_identifier_for_subject() {
 }
 
 setup_certbot_renewal_timer() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  [[ -x $QUICK_COMMAND ]] || install_quick_command || return 1
   case $(init_system) in
     systemd)
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE || return 1
 [Unit]
 Description=Renew certificates managed by sbctl
 
@@ -215,7 +223,7 @@ Description=Renew certificates managed by sbctl
 Type=oneshot
 ExecStart=${QUICK_COMMAND} cert renew-auto
 EOF_SERVICE
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER'
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER' || return 1
 [Unit]
 Description=Renew certificates managed by sbctl
 
@@ -227,18 +235,18 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-      systemctl daemon-reload
-      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
-      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service"
-      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      systemctl daemon-reload || return 1
+      systemctl enable --now sbctl-certbot-renew.timer >/dev/null || return 1
+      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" || return 1
+      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" || return 1
       ;;
     openrc)
-      mkdir -p /etc/periodic/daily
-      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON
+      mkdir -p /etc/periodic/daily || return 1
+      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON || return 1
 #!/bin/sh
 ${QUICK_COMMAND} cert renew-auto
 EOF_CRON
-      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
+      chmod 755 /etc/periodic/daily/sbctl-certbot-renew || return 1
       meta_resource_register renewPeriodic /etc/periodic/daily/sbctl-certbot-renew
       ;;
     *) die "无法配置证书自动续期：未检测到 systemd/OpenRC。";;
@@ -452,7 +460,6 @@ import_certificate() {
 }
 
 list_certificates() {
-  init_meta
   local id cert found=0 subject source validation auto_renew cert_name
   while IFS= read -r id; do
     [[ -n $id ]] || continue
@@ -483,18 +490,12 @@ certificate_inbound_users() {
 
 # Disable renewal timer if no certs need it
 _disable_renewal_job_if_unused() {
-  local remaining
-  remaining=$(meta_cert_auto_renew_certs | head -1 || true)
-  [[ -z $remaining ]] || return 0
-  case $(init_system) in
-    systemd)
-      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
-      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
-      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      ;;
-    openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
-  esac
+  local remaining identifier=${1-} entry
+  remaining=$(meta_cert_auto_renew_certs) || return 1
+  while IFS= read -r entry; do
+    [[ -z $entry || $entry == "$identifier" ]] || return 0
+  done <<<"$remaining"
+  _remove_renewal_jobs
 }
 
 delete_certificate() {
@@ -518,10 +519,10 @@ delete_certificate() {
       warn "Certbot 环境缺失，无法安全删除 Let's Encrypt lineage。"; return 1;
     fi
   fi
-  rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key"
-  rm -f "$CERTBOT_HOOK_DIR/sbctl-${identifier}" "$CERTBOT_HOOK_DIR/sbctl-${subject}"
-  meta_cert_delete "$identifier"
-  _disable_renewal_job_if_unused
+  rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" || { warn "托管证书文件删除失败；请检查后重试。"; return 1; }
+  rm -f "$CERTBOT_HOOK_DIR/sbctl-${identifier}" "$CERTBOT_HOOK_DIR/sbctl-${subject}" || { warn "证书续期钩子删除失败；请检查后重试。"; return 1; }
+  _disable_renewal_job_if_unused "$identifier" || { warn "续期任务清理失败；证书记录保留，请重试删除。"; return 1; }
+  meta_cert_delete "$identifier" || { warn "证书 metadata 删除失败；请检查后重试。"; return 1; }
   info "托管证书已删除：${identifier}"
 }
 
@@ -577,18 +578,24 @@ renew_one_certificate() {
       ;;
     http-standalone)
       owner=$(detect_port80_owner)
-      case $owner in free) :;; sing-box) service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; };; *) warn "${identifier}: 80 端口被占用，自动续期阻塞。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked; return 0;; esac
+      case $owner in free) :;; sing-box) if service_is_active; then service_stop || { warn "无法停止 sing-box，续期已中止。"; return 1; }; was_active=1; CERT_STOPPED_SERVICE=1; fi;; *) warn "${identifier}: 80 端口被占用，自动续期阻塞。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked; return 0;; esac
       ;;
     nginx) :;;
     *) warn "${identifier}: 未知验证方式 ${validation}。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1;;
   esac
-  [[ -x $CERTBOT_BIN ]] || { warn "Certbot 环境缺失，请重新执行证书签发。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  if [[ ! -x $CERTBOT_BIN ]]; then
+    if ((was_active)) && service_start; then CERT_STOPPED_SERVICE=0; fi
+    warn "Certbot 环境缺失，请重新执行证书签发。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
+  fi
   [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && before_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
   if ! certbot_cmd renew --cert-name "$cert_name" --quiet; then
-    ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }
+    if ((was_active)) && service_start; then CERT_STOPPED_SERVICE=0; fi
     warn "证书续期失败：${identifier}"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
   fi
-  ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
+  if ((was_active)); then
+    if ! service_start; then warn "续期后无法恢复 sing-box 服务。"; return 1; fi
+    CERT_STOPPED_SERVICE=0
+  fi
   [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
   certificate_transaction_snapshot transaction "$cert_target" "$key_target" || return 1
   sync_managed_certificate "$identifier" "$cert_name" changed || {

@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SBCTL_VERSION="0.5.0"
-readonly SBCTL_BUILD_COMMIT="${SBCTL_BUILD_COMMIT:-development}"
+readonly SBCTL_BUILD_COMMIT="ee597ba0edb5"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly SING_BOX_MIN_VERSION="1.12.0"
@@ -118,7 +118,7 @@ confirm() {
   local prompt=${1:-"确定继续吗？"} default=${2:-N} answer suffix
   [[ $default == Y ]] && suffix='[Y/n]' || suffix='[y/N]'
   if [[ ! -t 0 ]]; then [[ $default == Y ]]; return; fi
-  read -r -p "${prompt} ${suffix} " answer || { echo; answer=${default}; }
+  read -r -p "${prompt} ${suffix} " answer || { echo; return 1; }
   answer=${answer:-$default}
   [[ $answer =~ ^[Yy]$ ]]
 }
@@ -635,12 +635,6 @@ ensure_dependencies() {
 ensure_config() {
   [[ -f $CONFIG_FILE ]] || write_default_config
   jq -e 'type=="object" and (.inbounds|type=="array") and (.outbounds|type=="array")' "$CONFIG_FILE" >/dev/null || die "配置不是有效的 sing-box JSON：$CONFIG_FILE"
-  normalize_config_tags
-  jq -e '
-    all(.inbounds[]?; ((.tag // "")|type)=="string" and ((.tag // "")!="")) and
-    all(.outbounds[]?; ((.tag // "")|type)=="string" and ((.tag // "")!=""))
-  ' "$CONFIG_FILE" >/dev/null || die "配置中的入站/出站标签仍不完整。"
-  init_meta
 }
 
 write_default_config() {
@@ -684,6 +678,11 @@ validate_candidate() {
 apply_candidate_with_meta() {
   local candidate=$1 meta_candidate=${2:-} cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0
   ensure_config
+  init_meta
+  if [[ ${SBCTL_TAG_MIGRATION:-0} != 1 ]] && _config_has_missing_tags; then
+    error "配置含未命名入站或出站；请先运行 sbctl config migrate-tags。"
+    return 1
+  fi
   validate_candidate "$candidate" || return 1
   if [[ -n $meta_candidate ]]; then
     validate_metadata_candidate "$meta_candidate" \
@@ -762,7 +761,7 @@ _unique_config_tag() {
 
 normalize_config_tags() {
   _config_has_missing_tags || return 0
-  [[ -w $CONFIG_FILE ]] || die "检测到旧配置中存在未命名入站/出站；请使用 root 运行 sbctl 以自动兼容。"
+  require_root config migrate-tags
   local work next backup idx type base generated changed=0
   work=$(temp_file); next=$(temp_file); cp -a "$CONFIG_FILE" "$work"
   while IFS=$'\t' read -r idx type; do
@@ -783,21 +782,36 @@ normalize_config_tags() {
   rm -f "$next"
   ((changed > 0)) || { rm -f "$work"; return 0; }
   validate_candidate "$work" || { rm -f "$work"; die "旧配置补全标签后未通过 sing-box 检查，原配置未修改。"; }
-  mkdir -p "$BACKUP_DIR"; backup="${BACKUP_DIR}/pre-tag-migration-$(timestamp).json"
-  cp -a "$CONFIG_FILE" "$backup"; chmod 600 "$backup" 2>/dev/null || true
-  install -m 600 "$work" "$CONFIG_FILE"; rm -f "$work"
-  warn "检测到旧配置缺少 tag，已自动补全 ${changed} 个标签；原配置备份：${backup}"
+  mkdir -p "$BACKUP_DIR" || { rm -f "$work"; return 1; }
+  backup=$(mktemp "${BACKUP_DIR}/pre-tag-migration-$(timestamp)-XXXXXX.json") || { rm -f "$work"; return 1; }
+  if ! cp -a "$CONFIG_FILE" "$backup"; then
+    rm -f "$work" "$backup"
+    error "无法备份旧配置，标签迁移已取消。"
+    return 1
+  fi
+  chmod 600 "$backup" 2>/dev/null || true
+  if ! SBCTL_TAG_MIGRATION=1 apply_candidate "$work"; then
+    rm -f "$work"
+    error "标签迁移失败；原配置备份：${backup}"
+    return 1
+  fi
+  rm -f "$work"
+  info "已补全 ${changed} 个标签；原配置备份：${backup}"
 }
 
 # ---- backup and restore ----
 backup_all() {
-  require_root backup; ensure_config
+  require_root backup; ensure_config; init_meta
   local target=${1:-${BACKUP_DIR}/sbctl-$(timestamp).tar.gz} paths=("${CONFIG_FILE#/}" "${META_FILE#/}")
   traffic_is_enabled && traffic_collect || true
-  mkdir -p "$BACKUP_DIR" "$(dirname "$target")"
+  if [[ ! -e $BACKUP_DIR ]]; then
+    mkdir -p "$BACKUP_DIR" || return 1
+    : >"$BACKUP_DIR/.sbctl-owned" || return 1
+  fi
+  mkdir -p "$(dirname "$target")" || return 1
   [[ ! -d $CERT_DIR ]] || paths+=("${CERT_DIR#/}")
   [[ ! -f $TRAFFIC_FILE ]] || paths+=("${TRAFFIC_FILE#/}")
-  tar -czf "$target" -C / "${paths[@]}" || die "备份失败。"
+  tar -czf "$target" -C / "${paths[@]}" || { rm -f "$target"; die "备份失败。"; }
   chmod 600 "$target"; meta_resource_register backupDir "$BACKUP_DIR"
   info "备份已创建：$target"
   info "提示：备份包含配置、metadata、流量记录和证书副本，不包含 Certbot 账户/lineage 数据。"
@@ -808,26 +822,38 @@ restore_backup() {
   local archive=${1-} temp extract_config snapshot had_meta=0 had_certs=0 had_traffic=0 restored_traffic=0
   [[ -n $archive ]] || prompt_value archive "备份文件路径"
   [[ -r $archive ]] || die "无法读取备份。"
-  tar -tzf "$archive" >/dev/null || { warn "不是有效的 tar.gz 备份。"; return 0; }
+  tar -tzf "$archive" >/dev/null || { warn "不是有效的 tar.gz 备份。"; return 1; }
+  # Reject links and special files before extraction, including hard links.
+  if ! LC_ALL=C tar -tvzf "$archive" | awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {bad=1} END{exit bad}'; then
+    die "备份包含链接或特殊文件。"
+  fi
   if tar -tzf "$archive" | awk 'BEGIN{bad=0} /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END{exit !bad}'; then die "备份包含不安全路径。"; fi
   extract_config="${CONFIG_FILE#/}"; temp=$(mktemp -d "${TMPDIR:-/tmp}/sbctl-restore.XXXXXX")
-  tar -xzf "$archive" -C "$temp"
+  tar -xzf "$archive" -C "$temp" || { rm -rf "$temp"; die "备份解包失败。"; }
   [[ -f $temp/$extract_config ]] || { rm -rf "$temp"; die "备份中没有配置文件。"; }
   validate_candidate "$temp/$extract_config" || { rm -rf "$temp"; die "备份配置验证失败。"; }
+  if [[ -f $temp/${META_FILE#/} ]] && ! validate_metadata_candidate "$temp/${META_FILE#/}"; then
+    rm -rf "$temp"; die "备份 metadata 无效。"
+  fi
+  if [[ -f $temp/${TRAFFIC_FILE#/} ]] && ! jq -e 'type=="object" and ((.inbounds // {})|type)=="object"' "$temp/${TRAFFIC_FILE#/}" >/dev/null 2>&1; then
+    rm -rf "$temp"; die "备份流量记录无效。"
+  fi
   confirm "恢复会覆盖当前配置、元数据和托管证书，继续？" N || { rm -rf "$temp"; return; }
-  if traffic_is_enabled; then traffic_collect || true; traffic_runtime_stop; fi
+  if traffic_is_enabled; then traffic_collect || true; traffic_runtime_stop || { rm -rf "$temp"; return 1; }; fi
   snapshot="$temp/.current"; mkdir -p "$snapshot"; cp -a "$CONFIG_FILE" "$snapshot/config.json"
   [[ ! -f $META_FILE ]] || { cp -a "$META_FILE" "$snapshot/meta.json"; had_meta=1; }
   [[ ! -d $CERT_DIR ]] || { cp -a "$CERT_DIR" "$snapshot/certs"; had_certs=1; }
   [[ ! -f $TRAFFIC_FILE ]] || { cp -a "$TRAFFIC_FILE" "$snapshot/traffic.json"; had_traffic=1; }
-  cp -a "$temp/$extract_config" "$CONFIG_FILE"
-  if [[ -f $temp/${META_FILE#/} ]]; then cp -a "$temp/${META_FILE#/}" "$META_FILE"; else rm -f "$META_FILE"; fi
-  init_meta; rm -rf "$CERT_DIR"; mkdir -p "$CERT_DIR"
-  [[ ! -d $temp/${CERT_DIR#/} ]] || cp -a "$temp/${CERT_DIR#/}/." "$CERT_DIR/"
-  if [[ -f $temp/${TRAFFIC_FILE#/} ]]; then
-    mkdir -p "$(dirname "$TRAFFIC_FILE")"; install -m 600 "$temp/${TRAFFIC_FILE#/}" "$TRAFFIC_FILE"; restored_traffic=1
-  fi
-  if ! restart_service_checked || ! hy2_hop_sync || ! traffic_runtime_ensure; then
+  if ! {
+    cp -a "$temp/$extract_config" "$CONFIG_FILE" &&
+    { if [[ -f $temp/${META_FILE#/} ]]; then cp -a "$temp/${META_FILE#/}" "$META_FILE"; else rm -f "$META_FILE"; fi; } &&
+    (init_meta) && rm -rf "$CERT_DIR" && mkdir -p "$CERT_DIR" &&
+    { [[ ! -d $temp/${CERT_DIR#/} ]] || cp -a "$temp/${CERT_DIR#/}/." "$CERT_DIR/"; } &&
+    { if [[ -f $temp/${TRAFFIC_FILE#/} ]]; then
+      restored_traffic=1; mkdir -p "$(dirname "$TRAFFIC_FILE")" && install -m 600 "$temp/${TRAFFIC_FILE#/}" "$TRAFFIC_FILE"
+    fi; } &&
+    restart_service_checked && hy2_hop_sync && traffic_runtime_ensure
+  }; then
     error "恢复后服务、端口跳跃或流量统计运行时失败，正在整体回滚。"
     cp -a "$snapshot/config.json" "$CONFIG_FILE"
     ((had_meta)) && cp -a "$snapshot/meta.json" "$META_FILE" || rm -f "$META_FILE"
@@ -984,11 +1010,9 @@ meta_set_host() {
 }
 public_host_for_tag() {
   local tag=$1 host=""
-  init_meta
-  host=$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE")
+  host=$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE" 2>/dev/null || true)
   if [[ -z $host ]]; then
     prompt_public_host host || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
-    meta_set_host "$tag" "$host"
   fi
   printf '%s' "$host"
 }
@@ -996,7 +1020,7 @@ public_host_for_tag() {
 # ---- module: certificate/core ----
 # Certificate selection, validation, and metadata helpers.
 
-managed_certificate_count() { init_meta; jq -r '.certificates | length' "$META_FILE" 2>/dev/null || printf '0'; }
+managed_certificate_count() { [[ -f $META_FILE ]] || { printf '0'; return; }; jq -r '(.certificates // {}) | length' "$META_FILE" 2>/dev/null || printf '0'; }
 
 select_managed_certificate() {
   local __var=$1 always_choose=${2:-0} id answer
@@ -1051,7 +1075,7 @@ prompt_certificate_server_name() {
   elif ((${#names[@]} == 1)); then
     selected=${names[0]}
   else
-    choose answer "选择 TLS serverName/SNI" "${names[@]}"
+    choose answer "选择 TLS serverName/SNI" "${names[@]}" || return 1
     selected=${names[$((answer-1))]}
   fi
   printf -v "$__var" '%s' "$selected"
@@ -1059,7 +1083,7 @@ prompt_certificate_server_name() {
 
 # ---- certificate and managed-resource metadata ----
 meta_cert_exists() {
-  init_meta
+  [[ -f $META_FILE ]] || return 1
   jq -e --arg id "$1" '.certificates[$id] != null' "$META_FILE" >/dev/null 2>&1
 }
 
@@ -1083,12 +1107,12 @@ meta_cert_delete() {
 }
 
 meta_cert_get_field() {
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r --arg id "$1" --arg field "$2" '.certificates[$id][$field] | if . == null then empty else . end' "$META_FILE"
 }
 
-meta_cert_list() { init_meta; jq -r '.certificates | keys[]' "$META_FILE" 2>/dev/null; }
-meta_cert_auto_renew_certs() { init_meta; jq -r '.certificates | to_entries[] | select(.value.autoRenew == true) | .key' "$META_FILE" 2>/dev/null; }
+meta_cert_list() { [[ -f $META_FILE ]] || return 0; jq -r '(.certificates // {}) | keys[]' "$META_FILE" 2>/dev/null; }
+meta_cert_auto_renew_certs() { [[ -f $META_FILE ]] || return 0; jq -r '(.certificates // {}) | to_entries[] | select(.value.autoRenew == true) | .key' "$META_FILE" 2>/dev/null; }
 
 meta_resource_register() {
   local key=$1 value=$2 tmp
@@ -1097,7 +1121,7 @@ meta_resource_register() {
   install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
 }
 
-meta_resource_get() { init_meta; jq -r --arg key "$1" '.managedResources[$key] // empty' "$META_FILE"; }
+meta_resource_get() { [[ -f $META_FILE ]] || return 0; jq -r --arg key "$1" '.managedResources[$key] // empty' "$META_FILE"; }
 
 meta_resource_remove() {
   local key=$1 tmp
@@ -1118,10 +1142,28 @@ validate_reality_target() {
 }
 
 build_certificate_tls() {
-  local __json=$1 __host=${2-} identifier sni
-  select_managed_certificate identifier || return 1
-  prompt_certificate_server_name sni "$CERT_DIR/${identifier}.crt" || return 1
-  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$CERT_DIR/${identifier}.crt" --arg key "$CERT_DIR/${identifier}.key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
+  local __json=$1 __host=${2-} identifier sni cert key
+  if (( $(managed_certificate_count) > 0 )) && confirm "使用托管证书？" Y; then
+    select_managed_certificate identifier || return 1
+    cert="$CERT_DIR/${identifier}.crt"; key="$CERT_DIR/${identifier}.key"
+  else
+    prompt_value cert "证书文件绝对路径" || return 1
+    prompt_value key "私钥文件绝对路径" || return 1
+    [[ $cert == /* && $key == /* ]] || { warn "证书和私钥必须使用绝对路径。"; return 1; }
+    local managed_path managed_lexical resolved_path lexical_path path
+    managed_path=$(realpath -m -- "$CERT_DIR") || return 1
+    managed_lexical=$(realpath -ms -- "$CERT_DIR") || return 1
+    for path in "$cert" "$key"; do
+      lexical_path=$(realpath -ms -- "$path") || return 1
+      resolved_path=$(realpath -e -- "$path") || return 1
+      if [[ $resolved_path == "$managed_path" || $resolved_path == "$managed_path/"* || $lexical_path == "$managed_lexical" || $lexical_path == "$managed_lexical/"* ]]; then
+        warn "外部证书和私钥不能位于托管证书目录内。"; return 1
+      fi
+    done
+  fi
+  validate_certificate_pair "$cert" "$key" || { warn "证书无效、已过期或与私钥不匹配。"; return 1; }
+  prompt_certificate_server_name sni "$cert" || return 1
+  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$cert" --arg key "$key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
   [[ -z $__host ]] || printf -v "$__host" '%s' "$sni"
 }
 
@@ -1259,7 +1301,6 @@ hy2_port_in_default_hop_range() {
 
 hy2_port_in_any_hop_range() {
   local port=$1 range
-  init_meta 2>/dev/null || true
   while IFS= read -r range; do
     [[ -n $range ]] || continue
     hy2_port_in_range "$port" "$range" && return 0
@@ -1317,7 +1358,7 @@ hy2_build() {
 hy2_hop_check_conflicts() {
   local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
   new_start=${range%-*}; new_end=${range#*-}
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   while IFS=$'\t' read -r tag existing; do
     [[ -n $tag && -n $existing ]] || continue
     [[ $tag != "$except_tag" ]] || continue
@@ -1334,12 +1375,11 @@ hy2_hop_check_conflicts() {
 # Apply NAT rules only (meta must already be set). Called from add_inbound after apply.
 hy2_hop_apply_nat() {
   hy2_hop_sync
-  return 0
 }
 
 hy2_hop_range_for_tag() {
   local tag=$1
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r --arg tag "$tag" '.inbounds[$tag].hysteria2PortHopping.range // empty' "$META_FILE"
 }
 
@@ -1355,8 +1395,8 @@ hy2_hop_meta_set() {
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg range "$range" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
     .inbounds[$tag]=((.inbounds[$tag]//{})+{updatedAt:$now}) |
-    .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"
+    .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
 }
 
@@ -1364,13 +1404,13 @@ hy2_hop_meta_disable() {
   local tag=$1 tmp
   init_meta
   tmp=$(temp_file)
-  jq --arg tag "$tag" 'del(.inbounds[$tag].hysteria2PortHopping)' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"
+  jq --arg tag "$tag" 'del(.inbounds[$tag].hysteria2PortHopping)' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
 }
 
 hy2_hop_enabled_count() {
-  init_meta
+  [[ -f $META_FILE ]] || { printf '0'; return; }
   [[ -f $CONFIG_FILE ]] || { printf '0'; return; }
   jq --slurpfile config "$CONFIG_FILE" '
     [.inbounds|to_entries[]?|.key as $tag|
@@ -1411,10 +1451,10 @@ hy2_hop_boot_service_remove() {
 }
 
 hy2_hop_boot_service_ensure() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  [[ -x $QUICK_COMMAND ]] || install_quick_command || return 1
   case $(init_system) in
     systemd)
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service" <<EOF_UNIT
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service" <<EOF_UNIT || return 1
 [Unit]
 Description=Restore sbctl Hysteria2 port hopping NAT rules
 After=network-online.target
@@ -1428,19 +1468,19 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF_UNIT
-      systemctl daemon-reload
-      systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || true
+      systemctl daemon-reload || return 1
+      systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || return 1
       ;;
     openrc)
-      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC'
+      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC' || return 1
 #!/sbin/openrc-run
 name="sbctl-hy2-hop-restore"
 description="Restore sbctl Hysteria2 port hopping NAT rules"
 $(printf '%s' 'depend() { need net; }')
 $(printf '%s' 'start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }')
 EOF_RC
-      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
-      rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || true
+      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" || return 1
+      rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || return 1
       ;;
   esac
 }
@@ -1449,28 +1489,33 @@ EOF_RC
 
 hy2_hop_restore_all() {
   [[ $(uname -s) == Linux ]] || return 0
-  init_meta
   [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
   local count tag range target start end cmd
   count=$(hy2_hop_enabled_count)
   if ((count == 0)); then hy2_hop_clear_rules; return 0; fi
-  hy2_hop_ensure_backend
+  hy2_hop_ensure_backend || return 1
   if command_exists nft; then
-    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
-    nft add table inet sbctl_hy2_hop
-    nft 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }'
+    local batch rc=0
+    batch=$(temp_file) || return 1
+    if nft list table inet sbctl_hy2_hop >/dev/null 2>&1; then
+      printf '%s\n' 'delete table inet sbctl_hy2_hop' >>"$batch"
+    fi
+    printf '%s\n' 'add table inet sbctl_hy2_hop' 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }' >>"$batch"
     while IFS=$'\t' read -r tag range; do
       [[ -n $tag && -n $range ]] || continue
       target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
-      validate_port "$target" || continue
-      nft add rule inet sbctl_hy2_hop prerouting udp dport "$range" redirect to ":${target}"
+      validate_hy2_hop_range "$range" && validate_port "$target" || { rc=1; break; }
+      printf 'add rule inet sbctl_hy2_hop prerouting udp dport %s redirect to :%s\n' "$range" "$target" >>"$batch"
     done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+    if ((rc == 0)); then nft -f "$batch" || rc=1; fi
+    rm -f "$batch"
+    return "$rc"
   else
     for cmd in iptables ip6tables; do
       command_exists "$cmd" || continue
       "$cmd" -t nat -N SBCTL_HY2_HOP >/dev/null 2>&1 || true
-      "$cmd" -t nat -F SBCTL_HY2_HOP
-      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP
+      "$cmd" -t nat -F SBCTL_HY2_HOP || return 1
+      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP || return 1
     done
     while IFS=$'\t' read -r tag range; do
       [[ -n $tag && -n $range ]] || continue
@@ -1479,7 +1524,7 @@ hy2_hop_restore_all() {
       start=${range%-*}; end=${range#*-}
       for cmd in iptables ip6tables; do
         command_exists "$cmd" || continue
-        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target"
+        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target" || return 1
       done
     done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
   fi
@@ -1487,15 +1532,28 @@ hy2_hop_restore_all() {
 
 # Sync all hop rules after CRUD operations (called from inbound.sh)
 hy2_hop_sync() {
-  hy2_hop_clear_rules
   local count
   count=$(hy2_hop_enabled_count)
   if ((count > 0)); then
-    hy2_hop_restore_all
-    hy2_hop_boot_service_ensure
+    hy2_hop_restore_all || return 1
+    hy2_hop_boot_service_ensure || return 1
   else
+    hy2_hop_clear_rules
     hy2_hop_boot_service_remove
   fi
+}
+
+# Restore the pre-change state and its runtime rules after a failed update.
+hy2_hop_rollback() {
+  local cfg=$1 meta=$2 changed=$3 had_meta=${4:-1} failed=0
+  if ((changed)); then
+    apply_candidate "$cfg" || failed=1
+  fi
+  if ((had_meta)); then install -m 600 "$meta" "$META_FILE" || failed=1
+  else rm -f "$META_FILE" || failed=1; fi
+  hy2_hop_sync || failed=1
+  ((failed == 0)) || warn "端口跳跃回滚不完整，请检查配置、metadata 和 NAT 规则。"
+  return "$failed"
 }
 
 hy2_hop_configure() {
@@ -1513,7 +1571,16 @@ hy2_hop_configure() {
       read -r -p "请选择: " choice || { echo; return; }
       case $choice in
         1) :;;
-        2) hy2_hop_meta_disable "$tag"; hy2_hop_sync; info "端口跳跃已关闭。"; return 0;;
+        2)
+          local old_meta old_cfg
+          old_meta=$(temp_file); old_cfg=$(temp_file)
+          cp -a "$META_FILE" "$old_meta" && cp -a "$CONFIG_FILE" "$old_cfg" || { rm -f "$old_meta" "$old_cfg"; return 1; }
+          if ! hy2_hop_meta_disable "$tag" || ! hy2_hop_sync; then
+            hy2_hop_rollback "$old_cfg" "$old_meta" 0 || true
+            rm -f "$old_meta" "$old_cfg"; return 1
+          fi
+          rm -f "$old_meta" "$old_cfg"
+          info "端口跳跃已关闭。"; return 0;;
         0) return 0;;
         *) warn "无效选项。"; return 1;;
       esac
@@ -1521,37 +1588,40 @@ hy2_hop_configure() {
   fi
 
   while true; do
-    prompt_value range "端口跳跃范围" "${current:-30000-50000}"
+    prompt_value range "端口跳跃范围" "${current:-30000-50000}" || return 1
     validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
     hy2_hop_check_conflicts "$range" "$tag" || continue
     break
   done
 
-  local listen_port internal_port
+  local listen_port internal_port tmp old_meta old_cfg changed=0 had_meta=0
+  old_meta=$(temp_file); old_cfg=$(temp_file)
+  if [[ -f $META_FILE ]]; then
+    cp -a "$META_FILE" "$old_meta" || { rm -f "$old_meta" "$old_cfg"; return 1; }
+    had_meta=1
+  fi
+  cp -a "$CONFIG_FILE" "$old_cfg" || { rm -f "$old_meta" "$old_cfg"; return 1; }
   listen_port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   if hy2_port_in_range "$listen_port" "$range"; then
     warn "listen_port ${listen_port} 在跳跃范围内，需要重新选择内部端口。"
-    hy2_pick_internal_port internal_port "$range" || { warn "无法分配可用端口。"; return 1; }
-    local tmp
+    hy2_pick_internal_port internal_port "$range" || { rm -f "$old_meta" "$old_cfg"; warn "无法分配可用端口。"; return 1; }
     tmp=$(temp_file)
-    jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp"
-    if apply_candidate "$tmp"; then
-      hy2_hop_meta_set "$tag" "$range"
-      hy2_hop_sync
-      traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
-      info "Hysteria2 端口跳跃已启用：${range} -> UDP ${internal_port}（外部端口通过 NAT 重定向）"
-    else
-      rm -f "$tmp"
-      return 1
+    if ! jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp" || ! apply_candidate "$tmp"; then
+      rm -f "$tmp" "$old_meta" "$old_cfg"; return 1
     fi
     rm -f "$tmp"
-    return 0
+    changed=1
+    listen_port=$internal_port
   fi
-
-  hy2_hop_meta_set "$tag" "$range"
-  hy2_hop_sync
+  if ! hy2_hop_meta_set "$tag" "$range" || ! hy2_hop_sync; then
+    warn "端口跳跃 NAT 同步失败，正在恢复原状态。"
+    hy2_hop_rollback "$old_cfg" "$old_meta" "$changed" "$had_meta" || true
+    rm -f "$old_meta" "$old_cfg"; return 1
+  fi
+  rm -f "$old_meta" "$old_cfg"
   traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
   info "Hysteria2 端口跳跃已启用：${range} -> UDP ${listen_port}"
+
 }
 
 # Internal commands (called via dispatch)
@@ -1580,7 +1650,7 @@ port_in_use_os() {
 prompt_tag() {
   local __var=$1 default=$2 value
   while true; do
-    prompt_value value "入站标签" "$default"
+    prompt_value value "入站标签" "$default" || return 1
     validate_tag "$value" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
     inbound_exists "$value" && { warn "标签已存在。"; continue; }
     printf -v "$__var" '%s' "$value"; return
@@ -1610,7 +1680,7 @@ _random_port_avoiding_hops() {
 prompt_port() {
   local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value current_port=""
   while true; do
-    prompt_value value "监听端口" "$default"
+    prompt_value value "监听端口" "$default" || return 1
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
     port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
     [[ -z $except ]] || current_port=$(jq -r --arg tag "$except" '.inbounds[]?|select(.tag==$tag)|.listen_port // empty' "$CONFIG_FILE")
@@ -1624,10 +1694,10 @@ prompt_port() {
 
 build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host="" tls="" reality_public="" name="" password="" uuid="" flow="" obfs_choice="" obfs_password="" up="" down="" selected_hop_range="" transport_json="null" ws_path=""
-  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP"
+  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" || return 1
   case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; esac
-  prompt_tag tag "${type}-$(random_hex 2)"
-  prompt_value listen "监听地址" "0.0.0.0"
+  prompt_tag tag "${type}-$(random_hex 2)" || return 1
+  prompt_value listen "监听地址" "0.0.0.0" || return 1
 
   # ---- client_host resolution ----
   #   cert TLS   → auto from certificate server_name (no prompt_public_host)
@@ -1635,48 +1705,50 @@ build_inbound() {
   #   no TLS     → prompt_public_host
   case $type in
     vless)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密"
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密" || return 1
       case $choice in
-        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host ;;
+        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host || return 1 ;;
         2) build_certificate_tls tls client_host || return 1 ;;
-        3) tls=""; prompt_public_host client_host ;;
+        3) tls=""; prompt_public_host client_host || return 1 ;;
       esac
-      prompt_port port
+      prompt_port port || return 1
       # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
       if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws"
+        choose tp_choice "传输方式" "tcp" "ws" || return 1
         if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)" || return 1
+          validate_websocket_path "$ws_path" || return 1
           transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
       fi
       ;;
     anytls)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
-        prompt_public_host client_host
+        prompt_public_host client_host || return 1
       else
         build_certificate_tls tls client_host || return 1
       fi
-      prompt_port port
+      prompt_port port || return 1
       ;;
     trojan)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
-        prompt_public_host client_host
+        prompt_public_host client_host || return 1
       else
         build_certificate_tls tls client_host || return 1
       fi
-      prompt_port port
+      prompt_port port || return 1
       # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
       if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
         local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws"
+        choose tp_choice "传输方式" "tcp" "ws" || return 1
         if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)"
+          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)" || return 1
+          validate_websocket_path "$ws_path" || return 1
           transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
         fi
       fi
@@ -1684,10 +1756,10 @@ build_inbound() {
     hysteria2)
       build_certificate_tls tls client_host || return 1
       local hop_choice
-      choose hop_choice "端口模式" "普通端口" "端口跳跃"
+      choose hop_choice "端口模式" "普通端口" "端口跳跃" || return 1
       if [[ $hop_choice == 2 ]]; then
         while true; do
-          prompt_value selected_hop_range "端口跳跃范围" "30000-50000"
+          prompt_value selected_hop_range "端口跳跃范围" "30000-50000" || return 1
           validate_hy2_hop_range "$selected_hop_range" && break
           warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
         done
@@ -1696,44 +1768,44 @@ build_inbound() {
         fi
         prompt_hy2_internal_port port "$selected_hop_range" || return 1
       else
-        prompt_port port
+        prompt_port port || return 1
       fi
       ;;
     socks|http)
-      prompt_public_host client_host
-      prompt_port port
+      prompt_public_host client_host || return 1
+      prompt_port port || return 1
       ;;
   esac
 
   case $type in
     anytls)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
-      prompt_secret password "AnyTLS 密码" "$(random_password)"
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
+      prompt_secret password "AnyTLS 密码" "$(random_password)" || return 1
       protocol_build_anytls "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls"
       ;;
     vless)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
       uuid=$(generate_uuid)
       if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
       protocol_build_vless "$__json" "$tag" "$listen" "$port" "$name" "$uuid" "$flow" "$tls" "$transport_json"
       ;;
     hysteria2)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
-      prompt_secret password "Hysteria2 密码" "$(random_password)"
-      prompt_optional_positive_int up "上行限制 Mbps（留空=不限）"
-      prompt_optional_positive_int down "下行限制 Mbps（留空=不限）"
-      choose obfs_choice "QUIC 混淆" "关闭" "Salamander"
-      if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)"; fi
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
+      prompt_secret password "Hysteria2 密码" "$(random_password)" || return 1
+      prompt_optional_positive_int up "上行限制 Mbps（留空=不限）" || return 1
+      prompt_optional_positive_int down "下行限制 Mbps（留空=不限）" || return 1
+      choose obfs_choice "QUIC 混淆" "关闭" "Salamander" || return 1
+      if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)" || return 1; fi
       hy2_build "$__json" "$tag" "$listen" "$port" "$name" "$password" "$up" "$down" "$obfs_password" "$tls"
       ;;
     trojan)
-      prompt_value name "用户名称" "user-$(random_hex 2)"
-      prompt_secret password "Trojan 密码" "$(random_password)"
+      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
+      prompt_secret password "Trojan 密码" "$(random_password)" || return 1
       protocol_build_trojan "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls" "$transport_json"
       ;;
     socks|http)
-      prompt_optional name "用户名（留空=无认证）"
-      if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)"; fi
+      prompt_optional name "用户名（留空=无认证）" || return 1
+      if [[ -n $name ]]; then prompt_secret password "密码" "$(random_password)" || return 1; fi
       [[ -n $name || $listen == 127.0.0.1 || $listen == ::1 ]] || warn "公网无认证代理风险很高。"
       protocol_build_proxy "$__json" "$type" "$tag" "$listen" "$port" "$name" "$password"
       ;;
@@ -1770,8 +1842,11 @@ add_inbound() {
       if hy2_hop_apply_nat; then
         info "Hysteria2 端口跳跃已启用：${hop_range} -> UDP $(jq -r '.listen_port' <<<"$inbound")"
       else
-        warn "端口跳跃 NAT 配置失败，当前使用内部监听端口连接。"
-        hy2_hop_meta_disable "$tag"
+        warn "端口跳跃 NAT 配置失败，正在恢复原跳跃规则。"
+        if ! hy2_hop_meta_disable "$tag" || ! hy2_hop_sync; then
+          warn "端口跳跃回滚不完整，请检查 metadata 和 NAT 规则。"
+          rc=1
+        fi
       fi
     fi
     traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
@@ -1851,7 +1926,7 @@ delete_inbound() {
     .domainTemplates.managed=[.domainTemplates.managed[]? | select(.inbound!=$tag)]
   ' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync
+    hy2_hop_sync || { warn "入站已删除，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
     traffic_after_config_change "$tag" || warn "流量统计规则未能同步，请在流量信息中刷新。"
     info "已删除入站 ${tag}。"
   else
@@ -1866,20 +1941,35 @@ modify_inbound_basic() {
   local tag=${1-} listen port host public tmp meta_tmp rc=0
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
-  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")"
-  prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag"
-  prompt_public_host host "$(public_host_for_tag "$tag")"
+  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")" || return 1
+  prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag" || return 1
+  prompt_public_host host "$(public_host_for_tag "$tag")" || return 1
   public=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPublicKey // empty' "$META_FILE" 2>/dev/null || true)
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --arg listen "$listen" --argjson port "$port" '(.inbounds[]|select(.tag==$tag)) |= (.listen=$listen | .listen_port=$port)' "$CONFIG_FILE" >"$tmp"
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync
+    hy2_hop_sync || { warn "入站已修改，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
     traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
   else
     rc=$?
   fi
   rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+modify_inbound_certificate() {
+  ensure_dependencies inbound-security; require_supported_core; ensure_config
+  local tag=$1 tls tmp rc=0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true and (.tls.reality.enabled!=true)' "$CONFIG_FILE" >/dev/null || { error '该入站未使用证书 TLS。'; return 1; }
+  build_certificate_tls tls || return 1
+  tmp=$(temp_file) || return 1
+  if ! jq --arg tag "$tag" --argjson tls "$tls" '(.inbounds[]|select(.tag==$tag)|.tls) |= (.certificate_path=$tls.certificate_path | .key_path=$tls.key_path | .server_name=$tls.server_name)' "$CONFIG_FILE" >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  if apply_candidate "$tmp"; then info "入站 ${tag} 的证书已更新。"; else rc=$?; fi
+  rm -f "$tmp"
   return "$rc"
 }
 
@@ -1891,28 +1981,58 @@ modify_inbound_security() {
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   case $type in
     anytls|vless|trojan)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS"
-      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public; else build_certificate_tls tls host; fi
+      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
+      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public || return 1; else build_certificate_tls tls host || return 1; fi
       ;;
     hysteria2)
       info "Hysteria2 必须使用证书 TLS。"
-      build_certificate_tls tls host
+      build_certificate_tls tls host || return 1
       ;;
     *) die "${type} 入站没有 sbctl 可管理的 TLS/REALITY 安全层。";;
   esac
   if [[ -z $host ]]; then
     host=$(public_host_for_tag "$tag" || true)
-    [[ -n $host ]] || prompt_public_host host
+    [[ -n $host ]] || prompt_public_host host || return 1
   fi
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
     (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
+    if $tls.reality.enabled==true then (.inbounds[]|select(.tag==$tag)) |= del(.transport) else . end |
     if $type=="vless" then
       (.inbounds[]|select(.tag==$tag)|.users) |= map(.flow=(if $tls.reality.enabled==true then "xtls-rprx-vision" else "" end))
     else . end' "$CONFIG_FILE" >"$tmp"
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then info "入站 ${tag} 的安全方式已更新。"; else rc=$?; fi
   rm -f "$tmp" "$meta_tmp"
+  return "$rc"
+}
+
+validate_websocket_path() {
+  [[ $1 != *[[:space:]]* ]] || { error "WebSocket 路径不能包含空白字符。"; return 1; }
+}
+
+modify_inbound_transport() {
+  ensure_dependencies inbound-modify; require_supported_core; ensure_config
+  local tag=${1-} type choice path host transport tmp rc=0
+  [[ -n $tag ]] || select_inbound tag || return 0
+  inbound_exists "$tag" || die "找不到入站：$tag"
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+  [[ $type == vless || $type == trojan ]] || { error "${type} 不支持此传输编辑。"; return 1; }
+  if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
+    error "REALITY 入站仅支持 TCP；请先修改安全方式。"; return 1
+  fi
+  choose choice "传输方式" "tcp" "ws" || return 1
+  transport=null
+  if [[ $choice == 2 ]]; then
+    prompt_value path "WebSocket 路径" "/" || return 1
+    validate_websocket_path "$path" || return 1
+    host=$(public_host_for_tag "$tag") || return 1
+    transport=$(jq -n --arg path "$path" --arg host "$host" '{type:"ws",path:$path,headers:{Host:$host}}')
+  fi
+  tmp=$(temp_file)
+  jq --arg tag "$tag" --argjson transport "$transport" '(.inbounds[]|select(.tag==$tag)) |= (if $transport==null then del(.transport) else .transport=$transport end)' "$CONFIG_FILE" >"$tmp"
+  apply_candidate "$tmp" || rc=$?
+  rm -f "$tmp"
   return "$rc"
 }
 
@@ -1923,7 +2043,7 @@ rename_inbound() {
   inbound_exists "$old" || die "找不到入站：$old"
   if [[ -z $new ]]; then
     while true; do
-      prompt_value new "新入站名称" "$old"
+      prompt_value new "新入站名称" "$old" || return 1
       [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
       validate_tag "$new" || { warn "标签只能包含字母、数字、点、下划线和横线。"; continue; }
       if inbound_exists "$new" || outbound_exists "$new"; then warn "标签已存在，请重新输入。"; continue; fi
@@ -1950,7 +2070,7 @@ rename_inbound() {
       if .inbound==$old then .inbound=$new else . end]
   ' "$META_FILE" >"$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync
+    hy2_hop_sync || { warn "入站已重命名，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
     traffic_after_config_change "$old" "$new" || warn "流量统计记录未能迁移，请在流量信息中刷新。"
     info "入站已重命名：${old} -> ${new}"
   else
@@ -1978,7 +2098,7 @@ add_client() {
   [[ -n $tag ]] || select_inbound tag '^(anytls|vless|hysteria2|trojan|socks|http|mixed)$' || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   while true; do
-    prompt_value name "用户名称" "user-$(random_hex 2)"
+    prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
     client_exists "$tag" "$name" && { warn "用户名称已存在。"; continue; }
     break
   done
@@ -1988,16 +2108,16 @@ add_client() {
       flow=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[0].flow // empty' "$CONFIG_FILE")
       user=$(jq -n --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" '{name:$name,uuid:$uuid,flow:$flow}') ;;
     anytls|hysteria2|trojan)
-      prompt_secret password "密码" "$(random_password)"
+      prompt_secret password "密码" "$(random_password)" || return 1
       user=$(jq -n --arg name "$name" --arg password "$password" '{name:$name,password:$password}') ;;
     socks|http|mixed)
-      prompt_secret password "密码" "$(random_password)"
+      prompt_secret password "密码" "$(random_password)" || return 1
       user=$(jq -n --arg username "$name" --arg password "$password" '{username:$username,password:$password}') ;;
     *) warn "该协议不支持用户管理。"; return 0;;
   esac
   tmp=$(temp_file)
   jq --arg tag "$tag" --argjson user "$user" '(.inbounds[]|select(.tag==$tag)|.users) += [$user]' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "用户 ${name} 已添加。"; print_share "$tag" "$name" || true; fi
+  if apply_candidate "$tmp"; then info "用户 ${name} 已添加。"; print_share "$tag" "$name" || true; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -2051,7 +2171,7 @@ select_client() {
 
 delete_client() {
   ensure_dependencies client-delete; ensure_config
-  local tag=${1-} name=${2-} type field tmp
+  local tag=${1-} name=${2-} assume_yes=${3:-0} type field tmp count
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
@@ -2059,10 +2179,15 @@ delete_client() {
     select_client name "$tag" || return 0
   fi
   client_exists "$tag" "$name" || die "找不到用户：${name}"
-  confirm "删除用户 ${name}？" N || return 0
+  count=$(jq --arg tag "$tag" '[.inbounds[]|select(.tag==$tag)|.users[]?]|length' "$CONFIG_FILE")
+  if ((count <= 1)) && [[ $type == socks || $type == http || $type == mixed ]]; then
+    warn "不能删除最后一个代理用户，否则入站会变为无认证。"; return 1
+  fi
+  [[ $assume_yes == 1 ]] || confirm "删除用户 ${name}？" N || return 0
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg name "$name" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users) |= map(select(.[$field]!=$name))' "$CONFIG_FILE" >"$tmp"
-  apply_candidate "$tmp"; rm -f "$tmp"
+  if ! apply_candidate "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
 }
 
 rotate_client_credential() {
@@ -2081,7 +2206,7 @@ rotate_client_credential() {
     value=$(random_password)
     jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
   fi
-  if apply_candidate "$tmp"; then info "新凭据：${value}"; fi
+  if apply_candidate "$tmp"; then info "新凭据：${value}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -2093,7 +2218,7 @@ client_json_for_anytls() {
   sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
   jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"; return 0; }
   if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-    public=$(reality_public_key "$tag") || warn "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"
+    public=$(reality_public_key "$tag") || { warn "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"; return 1; }
     sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
     jq -n --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg public "$public" --arg sid "$sid" '{type:"anytls",tag:"proxy",server:$host,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$public,short_id:$sid}}}'
   else
@@ -2110,12 +2235,12 @@ rename_client() {
   field=$(client_label_field "$type")
   if [[ -z $old ]]; then select_client old "$tag" || return 0; fi
   client_exists "$tag" "$old" || die "找不到用户：$old"
-  if [[ -z $new ]]; then prompt_value new "新用户名称" "$old"; fi
+  if [[ -z $new ]]; then prompt_value new "新用户名称" "$old" || return 1; fi
   [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
   client_exists "$tag" "$new" && die "用户名称已存在：$new"
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg old "$old" --arg new "$new" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$old)|.[$field])=$new' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "用户已重命名：${old} -> ${new}"; fi
+  if apply_candidate "$tmp"; then info "用户已重命名：${old} -> ${new}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -2599,18 +2724,18 @@ _meta_template_set_outbound() {
 }
 
 list_domain_templates() {
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r '.domainTemplates.templates[]? |
     [.name,((.exact // [])|length),((.suffix // [])|length)] | @tsv' "$META_FILE"
 }
 
 domain_template_exists() {
-  init_meta
+  [[ -f $META_FILE ]] || return 1
   jq -e --arg name "$1" 'any(.domainTemplates.templates[]?; .name==$name)' "$META_FILE" >/dev/null
 }
 
 list_inbound_template_bindings() {
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r --arg inbound "$1" '.domainTemplates.bindings[]? |
     select(.inbound==$inbound) | [.template,.outbound] | @tsv' "$META_FILE"
 }
@@ -2940,16 +3065,16 @@ prompt_outbound_tag() {
 add_outbound() {
   ensure_dependencies outbound-add; require_supported_core; ensure_config
   local choice type tag server port auth username="" password="" outbound tmp
-  choose choice "选择出站协议" "SOCKS5" "HTTP"
+  choose choice "选择出站协议" "SOCKS5" "HTTP" || return 1
   [[ $choice == 1 ]] && type=socks || type=http
-  prompt_outbound_tag tag "${type}-out-$(random_hex 2)"
-  prompt_value server "代理服务器地址"
-  prompt_value port "代理服务器端口"
+  prompt_outbound_tag tag "${type}-out-$(random_hex 2)" || return 1
+  prompt_value server "代理服务器地址" || return 1
+  prompt_value port "代理服务器端口" || return 1
   validate_port "$port" || die "端口必须为 1-65535。"
-  choose auth "认证方式" "无认证" "用户名密码"
+  choose auth "认证方式" "无认证" "用户名密码" || return 1
   if [[ $auth == 2 ]]; then
-    prompt_value username "用户名"
-    prompt_secret password "密码"
+    prompt_value username "用户名" || return 1
+    prompt_secret password "密码" || return 1
   fi
   if [[ $type == socks ]]; then
     outbound=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg user "$username" --arg pass "$password" '
@@ -2962,7 +3087,7 @@ add_outbound() {
   fi
   tmp=$(temp_file)
   jq --argjson outbound "$outbound" '.outbounds += [$outbound]' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "出站 ${tag} 已添加。"; fi
+  if apply_candidate "$tmp"; then info "出站 ${tag} 已添加。"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -2999,7 +3124,7 @@ select_outbound() {
       display_labels+=("$t")
     fi
   done
-  choose answer "选择出站" "${display_labels[@]}"
+  choose answer "选择出站" "${display_labels[@]}" || return 1
   selected=${tags[$((answer-1))]}
   if [[ $selected =~ ^local- ]]; then
     local ip=""
@@ -3261,6 +3386,15 @@ delete_outbound() {
   fi
   [[ $tag != direct ]] || { warn "direct 出站不能删除。"; return 0; }
   outbound_exists "$tag" || die "找不到出站：$tag"
+  if jq -e --arg tag "$tag" '
+    (.route.final == $tag) or
+    ((del(.route.rules) | [.. | objects | to_entries[] |
+      select((.key == "detour" or .key == "download_detour" or .key == "outbound") and .value == $tag)] | length) > 0) or
+    ([.route.rules[]? | .. | objects | select(.rules? != null) | .. | objects | select(.outbound? == $tag)] | length > 0)
+  ' "$CONFIG_FILE" >/dev/null; then
+    warn "该出站被其他配置引用，请先修改配置。"
+    return 1
+  fi
   manual_refs=$(jq -r --arg tag "$tag" "$(_sbctl_managed_domain_rule_filter)
     $(_sbctl_canonical_default_rule_filter)
     [.route.rules[]? | select(.outbound==\$tag) |
@@ -3356,7 +3490,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 1; }
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -3367,12 +3501,12 @@ print_share() {
         [[ -z $filter || $name == "$filter" ]] || continue
         if [[ $security == reality ]]; then
           link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
-          [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         elif [[ $security == tls ]]; then
           link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
         else
           link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" none "")"
         fi
+        [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
         link+="#$(url_encode "${tag}-${name}")"
         print_share_entry "$name" "链接" "$link"
       done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.uuid,(.flow//"")]|@tsv' "$CONFIG_FILE")
@@ -3383,7 +3517,7 @@ print_share() {
       tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         security=reality
-        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 0; }
+        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 1; }
         sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
       elif [[ $tls_enabled == true ]]; then
         security=tls
@@ -3424,7 +3558,7 @@ print_share() {
       if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
         while IFS= read -r name; do
           [[ -z $filter || $name == "$filter" ]] || continue
-          json=$(client_json_for_anytls "$tag" "$name")
+          json=$(client_json_for_anytls "$tag" "$name") || return 1
           print_share_entry "$name" "客户端 outbound JSON" "$json"
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[].name' "$CONFIG_FILE")
       else
@@ -3437,13 +3571,15 @@ print_share() {
       ;;
 
     socks|http)
+      local scheme=$type
+      [[ $type != socks ]] || scheme=socks5
       if [[ $(jq --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|(.users//[])|length' "$CONFIG_FILE") == 0 ]]; then
-        link="${type}://${uri_host}:${port}  无认证"
+        link="${scheme}://${uri_host}:${port}#$(url_encode "$tag")"
         print_share_entry "无认证" "链接" "$link"
       else
         while IFS=$'\t' read -r name value; do
           [[ -z $filter || $name == "$filter" ]] || continue
-          link="${type}://$(url_encode "$name"):$(url_encode "$value")@${uri_host}:${port}#$(url_encode "${tag}-${name}")"
+          link="${scheme}://$(url_encode "$name"):$(url_encode "$value")@${uri_host}:${port}#$(url_encode "${tag}-${name}")"
           print_share_entry "$name" "链接" "$link"
         done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.username,.password]|@tsv' "$CONFIG_FILE")
       fi
@@ -3454,11 +3590,32 @@ print_share() {
 
 print_all_share() {
   ensure_config
-  local tag
+  local tag failed=0
   if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then info "还没有入站。"; return 0; fi
   while IFS= read -r tag; do
-    print_share "$tag" "" || true
+    print_share "$tag" "" || failed=1
   done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+  return "$failed"
+}
+
+# Match xrayctl's subscription scope: only VLESS URIs, one per line.
+print_subscription() {
+  ensure_config
+  local selected=${1-} tag line output links=''
+  if [[ -n $selected ]] && ! jq -e --arg tag "$selected" '.inbounds[] | select(.tag==$tag and .type=="vless")' "$CONFIG_FILE" >/dev/null; then
+    warn "找不到可订阅的 VLESS 入站：$selected"
+    return 1
+  fi
+  while IFS= read -r tag; do
+    output=$(print_share "$tag") || return 1
+    while IFS= read -r line; do
+      [[ $line == '链接: vless://'* ]] || continue
+      links+="${line#链接: }"$'\n'
+    done <<<"$output"
+  done < <(jq -r --arg selected "$selected" '.inbounds[] | select(.type=="vless" and ($selected=="" or .tag==$selected)) | .tag' "$CONFIG_FILE")
+  [[ -n $links ]] || { warn "没有可生成订阅的 VLESS 链接。"; return 1; }
+  printf '%s' "$links" | base64 | tr -d '\n'
+  printf '\n'
 }
 
 # ---- module: traffic ----
@@ -3665,10 +3822,13 @@ traffic_recorded_backend() {
 }
 
 traffic_set_backend() {
-  local backend=$1 tmp
-  traffic_init_file
-  tmp=$(temp_file); jq --arg backend "$backend" '.backend=$backend' "$TRAFFIC_FILE" >"$tmp"
-  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
+  local backend=$1 tmp rc=0
+  traffic_init_file || return 1
+  tmp=$(temp_file) || return 1
+  jq --arg backend "$backend" '.backend=$backend' "$TRAFFIC_FILE" >"$tmp" || rc=1
+  if ((rc == 0)); then install -m 600 "$tmp" "$TRAFFIC_FILE" || rc=1; fi
+  rm -f "$tmp"
+  return "$rc"
 }
 
 traffic_inventory_json() {
@@ -3958,39 +4118,53 @@ traffic_limit_is_blocked() {
 }
 
 traffic_restore_nft_rules() {
-  local tag type port protocol count_comment block_comment blocked count=0
+  local tag type port protocol blocked count=0 payload batch comment_count comment_block exists=0 rc=0
   command_exists nft || return 1
-  traffic_clear_nft_rules || return 1
-  nft add table inet "$TRAFFIC_NFT_TABLE" || return 1
-  nft 'add chain inet sbctl_traffic input { type filter hook input priority -5; policy accept; }' || return 1
-  nft 'add chain inet sbctl_traffic output { type filter hook output priority -5; policy accept; }' || return 1
+  if payload=$(nft -j list table inet "$TRAFFIC_NFT_TABLE" 2>/dev/null); then
+    exists=1
+    if ! jq -e '[.nftables[]?.rule | select(. != null) | select(((.comment // "") | startswith("sbctl-traffic:")) | not)] | length==0' <<<"$payload" >/dev/null; then
+      warn "nftables 表 ${TRAFFIC_NFT_TABLE} 含有非 sbctl 规则，拒绝替换。"
+      return 1
+    fi
+  fi
+  batch=$(temp_file) || return 1
+  if ((exists)); then printf 'delete table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"; fi
+  printf 'add table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
+  printf 'add chain inet %s input { type filter hook input priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
+  printf 'add chain inet %s output { type filter hook output priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
   while IFS=$'\t' read -r tag type port; do
     [[ -n $tag ]] && validate_port "$port" || continue
-    count_comment="\"sbctl-traffic:count:${tag}\""
-    block_comment="\"sbctl-traffic:block:${tag}\""
+    comment_count=$(jq -nr --arg s "sbctl-traffic:count:${tag}" '$s|@json')
+    comment_block=$(jq -nr --arg s "sbctl-traffic:block:${tag}" '$s|@json')
     blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
     while IFS= read -r protocol; do
       if ((blocked)); then
-        nft add rule inet "$TRAFFIC_NFT_TABLE" input "$protocol" dport "$port" drop comment "$block_comment" || return 1
-        nft add rule inet "$TRAFFIC_NFT_TABLE" output "$protocol" sport "$port" drop comment "$block_comment" || return 1
+        printf 'add rule inet %s input %s dport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
+        printf 'add rule inet %s output %s sport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
       fi
-      nft add rule inet "$TRAFFIC_NFT_TABLE" input "$protocol" dport "$port" counter comment "$count_comment" || return 1
-      nft add rule inet "$TRAFFIC_NFT_TABLE" output "$protocol" sport "$port" counter comment "$count_comment" || return 1
+      printf 'add rule inet %s input %s dport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
+      printf 'add rule inet %s output %s sport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
       count=$((count + 1))
     done < <(traffic_protocols_for_type "$type")
   done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null || true)
-  ((count > 0)) || traffic_clear_nft_rules
+  if ((count == 0)); then
+    : >"$batch"
+    if ((exists)); then printf 'delete table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"; fi
+  fi
+  if [[ -s $batch ]]; then nft -f "$batch" || rc=1; fi
+  rm -f "$batch"
+  return "$rc"
 }
 
-traffic_restore_iptables_rules() {
+traffic_build_iptables_rules() {
   local command tag type port protocol blocked count=0
   traffic_clear_iptables_rules || return 1
   for command in iptables ip6tables; do
     command_exists "$command" || continue
-    "$command" -t filter -N "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || true
-    "$command" -t filter -N "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || true
-    "$command" -t filter -C INPUT -j "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I INPUT 1 -j "$TRAFFIC_IPTABLES_IN_CHAIN"
-    "$command" -t filter -C OUTPUT -j "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I OUTPUT 1 -j "$TRAFFIC_IPTABLES_OUT_CHAIN"
+    "$command" -t filter -N "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || return 1
+    "$command" -t filter -N "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || return 1
+    "$command" -t filter -C INPUT -j "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I INPUT 1 -j "$TRAFFIC_IPTABLES_IN_CHAIN" || return 1
+    "$command" -t filter -C OUTPUT -j "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I OUTPUT 1 -j "$TRAFFIC_IPTABLES_OUT_CHAIN" || return 1
     while IFS=$'\t' read -r tag type port; do
       [[ -n $tag ]] && validate_port "$port" || continue
       blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
@@ -4008,13 +4182,84 @@ traffic_restore_iptables_rules() {
   ((count > 0)) || traffic_clear_iptables_rules
 }
 
+# Save only our chains and their parent jumps; never restore the entire filter
+# table, since unrelated rules can change while a rebuild is in progress.
+traffic_restore_iptables_rules() {
+  local command save restore snapshot raw rc=0
+  local -a snapshots=() restores=()
+  for command in iptables ip6tables; do
+    command_exists "$command" || continue
+    save="${command}-save"; restore="${command}-restore"
+    if ! command_exists "$save" || ! command_exists "$restore"; then
+      warn "缺少 ${save} 或 ${restore}，无法安全重建流量规则。"; rc=1; break
+    fi
+    snapshot=$(temp_file) || { rc=1; break; }
+    snapshots+=("$snapshot"); restores+=("$restore")
+    raw=$(temp_file) || { rc=1; break; }
+    if ! "$save" -c -t filter >"$raw"; then rm -f "$raw"; rc=1; break; fi
+    awk -v inch="$TRAFFIC_IPTABLES_IN_CHAIN" -v outch="$TRAFFIC_IPTABLES_OUT_CHAIN" '
+      BEGIN { print "*filter" }
+      $1 == ":" inch || $1 == ":" outch { print; next }
+      { offset = ($1 ~ /^\[[0-9]+:[0-9]+\]$/ ? 1 : 0) }
+      $(1+offset) == "-A" && ($(2+offset) == inch || $(2+offset) == outch) { print; next }
+      $(1+offset) == "-A" && ($(2+offset) == "INPUT" || $(2+offset) == "OUTPUT") {
+        parent=$(2+offset); position[parent]++
+        if ((parent == "INPUT" && $(3+offset) == "-j" && $(4+offset) == inch) || (parent == "OUTPUT" && $(3+offset) == "-j" && $(4+offset) == outch)) {
+          $(1+offset)="-I"; $(2+offset)=parent " " position[parent]; print
+        }
+      }
+      END { print "COMMIT" }
+    ' "$raw" >"$snapshot" || rc=1
+    rm -f "$raw"
+    ((rc == 0)) || break
+  done
+  if ((rc == 0)); then
+    traffic_build_iptables_rules || {
+      rc=1
+      local i
+      if traffic_clear_iptables_rules; then
+        for ((i=0; i<${#snapshots[@]}; i++)); do
+          "${restores[i]}" --noflush -c <"${snapshots[i]}" || warn "iptables 流量规则恢复失败，请立即检查防火墙。"
+        done
+      else
+        warn "iptables 流量规则无法安全清理，未应用快照；请立即检查防火墙。"
+      fi
+    }
+  fi
+  ((${#snapshots[@]} == 0)) || rm -f "${snapshots[@]}"
+  return "$rc"
+}
+
 traffic_rules_restore() {
-  local selected
-  selected=$(traffic_backend)
-  [[ $selected != none ]] || return 1
-  traffic_rules_clear || return 1
-  [[ $(traffic_recorded_backend) == "$selected" ]] || traffic_set_backend "$selected"
+  local selected previous
+  selected=${1:-$(traffic_backend)}
+  case $selected in nft|iptables) :;; *) return 1;; esac
+  previous=$(traffic_recorded_backend)
+  case $previous in ''|nft|iptables) :;; *) return 1;; esac
   [[ -f $CONFIG_FILE ]] || return 0
+  if [[ $previous != "$selected" ]]; then
+    if traffic_backend_conflicts "$selected"; then
+      warn "目标后端存在同名规则，拒绝切换。"; return 1
+    fi
+    # Build the new backend while the recorded backend still protects traffic.
+    if ! "traffic_restore_${selected}_rules"; then
+      "traffic_clear_${selected}_rules" || warn "目标后端清理失败，请检查残留规则。"
+      return 1
+    fi
+    if ! traffic_rules_clear; then
+      if [[ -z $previous ]] || "traffic_restore_${previous}_rules"; then
+        "traffic_clear_${selected}_rules" || warn "目标后端清理失败，请检查残留规则。"
+      else warn "原后端恢复失败，保留目标规则；请检查防火墙。"; fi
+      return 1
+    fi
+    if ! traffic_set_backend "$selected"; then
+      if [[ -z $previous ]] || "traffic_restore_${previous}_rules"; then
+        "traffic_clear_${selected}_rules" || warn "目标后端清理失败，请检查残留规则。"
+      else warn "原后端恢复失败，保留目标规则；请检查防火墙。"; fi
+      return 1
+    fi
+    return 0
+  fi
   case $selected in
     nft) traffic_restore_nft_rules ;;
     iptables) traffic_restore_iptables_rules ;;
@@ -4025,7 +4270,7 @@ traffic_rules_restore() {
 traffic_rules_restore_serialized() {
   local rc=0
   traffic_lock_acquire || return 1
-  traffic_rules_restore || rc=1
+  traffic_rules_restore "${1:-}" || rc=1
   traffic_lock_release
   return "$rc"
 }
@@ -4224,7 +4469,9 @@ traffic_limits_disable() {
 }
 
 traffic_limit_set() {
-  local tag=${1-} quota_gb=${2-} reset_day=${3-} quota now anchor_day anchor_time cycle_end tmp rc=0 existing
+  local tag=${1-} quota_gb=${2-} reset_day=${3-} reset_time=${4-} quota now anchor_day anchor_time cycle_end tmp rc=0 existing
+  local interactive=0 default_day default_time old_day old_time schedule_changed=0
+  if [[ -z $quota_gb ]] || { [[ -z $reset_day ]] && [[ -t 0 ]]; }; then interactive=1; fi
   require_root traffic-limit-set; ensure_config
   traffic_is_enabled || { warn "请先开启流量统计。"; return 1; }
   traffic_limits_are_enabled || { warn "请先启用流量限制功能。"; return 1; }
@@ -4236,26 +4483,54 @@ traffic_limit_set() {
   done
   quota=${quota:-$(traffic_limit_quota_bytes "$quota_gb")} || { warn "流量额度无效。"; return 1; }
   traffic_collect || return 1
-  now=$(traffic_now); anchor_time=${now:11:8}
-  if [[ -z $reset_day && -t 0 ]]; then
-    read -r -p "每月重置日期（1-31）: " reset_day || { echo; return 0; }
+  now=$(traffic_now)
+  existing=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.enabled==true' "$TRAFFIC_FILE")
+  default_day=$((10#${now:8:2})); default_time=${now:11:5}
+  if [[ $existing == true ]]; then
+    old_day=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.resetDay // .inbounds[$tag].limit.anchorDay' "$TRAFFIC_FILE")
+    old_time=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.anchorTime' "$TRAFFIC_FILE")
+    default_day=$old_day; default_time=${old_time:0:5}
   fi
-  reset_day=${reset_day:-$((10#${now:8:2}))}
+  while [[ -z $reset_day && $interactive == 1 ]]; do
+    prompt_value reset_day "每月重置日期（1-31）" || return 0
+    if [[ ! $reset_day =~ ^[0-9]+$ ]] || ((10#$reset_day < 1 || 10#$reset_day > 31)); then
+      warn "重置日期无效，请输入 1 到 31。"; reset_day=""
+    fi
+  done
+  reset_day=${reset_day:-$default_day}
   if ! [[ $reset_day =~ ^[0-9]+$ ]] || ((10#$reset_day < 1 || 10#$reset_day > 31)); then
     warn "重置日期无效，请输入 1 到 31。"; return 1
   fi
-  existing=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.enabled==true' "$TRAFFIC_FILE")
-  if [[ $existing == true ]]; then
-    anchor_time=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.anchorTime // empty' "$TRAFFIC_FILE")
+  reset_day=$((10#$reset_day))
+  while [[ -z $reset_time && $interactive == 1 ]]; do
+    prompt_value reset_time "每月重置时间（HH:MM，服务器本地时间）" "$default_time" || return 0
+    if [[ ! $reset_time =~ ^[0-9]{2}:[0-9]{2}$ ]] || ! traffic_validate_timestamp "2026-01-01 ${reset_time}:00"; then
+      warn "重置时间无效，请输入 HH:MM，例如 18:30。"; reset_time=""
+    fi
+  done
+  if [[ -n $reset_time ]]; then
+    if [[ ! $reset_time =~ ^[0-9]{2}:[0-9]{2}$ ]] || ! traffic_validate_timestamp "2026-01-01 ${reset_time}:00"; then
+      warn "重置时间无效，请输入 HH:MM，例如 18:30。"; return 1
+    fi
+    anchor_time=${reset_time}:00
+  elif [[ $existing == true ]]; then
+    anchor_time=$old_time
+  else
+    anchor_time=${default_time}:00
   fi
   anchor_day=$reset_day
-  cycle_end=$(traffic_limit_first_cycle_end "$now" "$reset_day" "$anchor_time") || return 1
+  if [[ $existing == true && $reset_day == "$old_day" && $anchor_time == "$old_time" ]]; then
+    cycle_end=$(jq -r --arg tag "$tag" '.inbounds[$tag].limit.cycleEnd' "$TRAFFIC_FILE")
+  else
+    cycle_end=$(traffic_limit_first_cycle_end "$now" "$reset_day" "$anchor_time") || return 1
+    [[ $existing != true ]] || schedule_changed=1
+  fi
   traffic_lock_acquire || return 1
   tmp=$(temp_file)
   jq --arg tag "$tag" --argjson quota "$quota" --arg now "$now" --argjson resetDay "$reset_day" --argjson anchorDay "$anchor_day" \
     --arg anchorTime "$anchor_time" --arg cycleEnd "$cycle_end" '
       if .inbounds[$tag].limit.enabled==true then
-        .inbounds[$tag].limit.quotaBytes=$quota | .inbounds[$tag].limit.resetDay=$resetDay | .inbounds[$tag].limit.anchorDay=$anchorDay | .inbounds[$tag].limit.cycleEnd=$cycleEnd
+        .inbounds[$tag].limit.quotaBytes=$quota | .inbounds[$tag].limit.resetDay=$resetDay | .inbounds[$tag].limit.anchorDay=$anchorDay | .inbounds[$tag].limit.anchorTime=$anchorTime | .inbounds[$tag].limit.cycleEnd=$cycleEnd
       else
         .inbounds[$tag].limit={enabled:true,quotaBytes:$quota,resetDay:$resetDay,anchorDay:$anchorDay,anchorTime:$anchorTime,
           cycleStart:$now,cycleEnd:$cycleEnd,usedBytes:0}
@@ -4265,7 +4540,9 @@ traffic_limit_set() {
   rm -f "$tmp"; traffic_lock_release
   ((rc == 0)) || return 1
   traffic_rules_restore_serialized || { warn "额度已保存，但防火墙规则暂未同步，采集任务会自动重试。"; return 1; }
-  if [[ $existing == true ]]; then
+  if ((schedule_changed)); then
+    info "已修改入站 ${tag} 的月度额度和重置时间：每月 ${reset_day} 日 ${anchor_time:0:5}；已用流量保持不变，下次重置：${cycle_end}。"
+  elif [[ $existing == true ]]; then
     info "已修改入站 ${tag} 的月度额度；原周期起止时间和已用流量保持不变。"
   else
     info "已设置入站 ${tag} 的月度额度，当前周期：${now} ～ ${cycle_end}。"
@@ -4458,10 +4735,10 @@ traffic_clear_all_records() {
 }
 
 traffic_timer_install() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  [[ -x $QUICK_COMMAND ]] || install_quick_command || return 1
   case $(init_system) in
     systemd)
-      cat >"$TRAFFIC_SYSTEMD_SERVICE" <<EOF_SERVICE
+      cat >"$TRAFFIC_SYSTEMD_SERVICE" <<EOF_SERVICE || return 1
 [Unit]
 Description=Collect sbctl per-inbound traffic counters
 After=network-online.target
@@ -4476,7 +4753,7 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$(dirname "$TRAFFIC_FILE") $(dirname "$TRAFFIC_LOCK")
 EOF_SERVICE
-      cat >"$TRAFFIC_SYSTEMD_TIMER" <<EOF_TIMER
+      cat >"$TRAFFIC_SYSTEMD_TIMER" <<EOF_TIMER || return 1
 [Unit]
 Description=Collect sbctl traffic every minute
 
@@ -4489,13 +4766,13 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-      systemctl daemon-reload
+      systemctl daemon-reload || return 1
       systemctl enable --now sbctl-traffic-collect.timer >/dev/null 2>&1 || return 1
-      meta_resource_register trafficService "$TRAFFIC_SYSTEMD_SERVICE"
-      meta_resource_register trafficTimer "$TRAFFIC_SYSTEMD_TIMER"
+      meta_resource_register trafficService "$TRAFFIC_SYSTEMD_SERVICE" || return 1
+      meta_resource_register trafficTimer "$TRAFFIC_SYSTEMD_TIMER" || return 1
       ;;
     openrc)
-      cat >"$TRAFFIC_OPENRC_SERVICE" <<EOF_RC
+      cat >"$TRAFFIC_OPENRC_SERVICE" <<EOF_RC || return 1
 #!/sbin/openrc-run
 name="sbctl traffic collector"
 description="Collect sbctl per-inbound traffic counters"
@@ -4507,8 +4784,8 @@ respawn_delay=3
 respawn_max=0
 $(printf '%s' 'depend() { need net; after sing-box; }')
 EOF_RC
-      chmod 755 "$TRAFFIC_OPENRC_SERVICE"
-      rc-update add sbctl-traffic-collect default >/dev/null 2>&1 || true
+      chmod 755 "$TRAFFIC_OPENRC_SERVICE" || return 1
+      rc-update add sbctl-traffic-collect default >/dev/null 2>&1 || return 1
       rc-service sbctl-traffic-collect restart >/dev/null 2>&1 || return 1
       meta_resource_register trafficService "$TRAFFIC_OPENRC_SERVICE"
       ;;
@@ -4519,15 +4796,21 @@ EOF_RC
 traffic_timer_remove() {
   case $(init_system) in
     systemd)
-      systemctl disable --now sbctl-traffic-collect.timer >/dev/null 2>&1 || true
-      systemctl stop sbctl-traffic-collect.service >/dev/null 2>&1 || true
-      rm -f "$TRAFFIC_SYSTEMD_SERVICE" "$TRAFFIC_SYSTEMD_TIMER"
-      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -e $TRAFFIC_SYSTEMD_TIMER ]]; then
+        systemctl disable --now sbctl-traffic-collect.timer >/dev/null 2>&1 || return 1
+      fi
+      if [[ -e $TRAFFIC_SYSTEMD_SERVICE ]]; then
+        systemctl stop sbctl-traffic-collect.service >/dev/null 2>&1 || return 1
+      fi
+      rm -f "$TRAFFIC_SYSTEMD_SERVICE" "$TRAFFIC_SYSTEMD_TIMER" || return 1
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
       ;;
     openrc)
-      rc-service sbctl-traffic-collect stop >/dev/null 2>&1 || true
-      rc-update del sbctl-traffic-collect default >/dev/null 2>&1 || true
-      rm -f "$TRAFFIC_OPENRC_SERVICE"
+      if [[ -e $TRAFFIC_OPENRC_SERVICE ]]; then
+        rc-service sbctl-traffic-collect stop >/dev/null 2>&1 || return 1
+        rc-update del sbctl-traffic-collect default >/dev/null 2>&1 || return 1
+        rm -f "$TRAFFIC_OPENRC_SERVICE" || return 1
+      fi
       ;;
   esac
 }
@@ -4541,25 +4824,39 @@ traffic_runtime_ensure() {
 }
 
 traffic_runtime_stop() {
-  traffic_timer_remove
+  traffic_timer_remove || return 1
   traffic_rules_clear
 }
 
 traffic_enable() {
   require_root traffic-enable; ensure_config
-  local selected
+  local selected previous was_enabled=false
   traffic_ensure_backend || return 1
+  previous=$(traffic_recorded_backend)
+  traffic_is_enabled && was_enabled=true
   selected=$(traffic_backend)
   if traffic_backend_conflicts "$selected"; then
     warn "检测到同名 ${selected} 流量规则，但无法确认由 sbctl 管理；拒绝覆盖。"
     return 1
   fi
-  traffic_set_backend "$selected"
-  traffic_set_enabled true
-  traffic_sync_inventory
-  if ! traffic_rules_restore || ! traffic_timer_install; then
-    traffic_set_enabled false; traffic_runtime_stop || true
-    warn "流量统计启动失败，已撤销运行时规则。"; return 1
+  traffic_set_enabled true || return 1
+  if ! traffic_sync_inventory || ! traffic_rules_restore_serialized; then
+    if [[ $was_enabled == false ]]; then
+      traffic_set_enabled false || warn "无法回滚流量统计启用状态，请检查状态文件。"
+    fi
+    warn "流量统计启动失败，请检查防火墙规则。"; return 1
+  fi
+  if ! traffic_timer_install; then
+    if [[ $previous == nft || $previous == iptables ]]; then
+      traffic_rules_restore_serialized "$previous" || warn "原流量后端恢复失败，请检查防火墙。"
+    else
+      traffic_lock_acquire && { traffic_rules_clear || warn "流量规则清理失败，请检查防火墙。"; traffic_lock_release; }
+    fi
+    if [[ $was_enabled == false ]]; then
+      traffic_timer_remove
+      traffic_set_enabled false || warn "无法回滚流量统计启用状态，请检查状态文件。"
+    fi
+    warn "流量采集任务安装失败，请检查任务和防火墙状态。"; return 1
   fi
   meta_resource_register trafficFile "$TRAFFIC_FILE"
   info "流量统计已开启；每分钟保存一次，只保留当前月度周期。"
@@ -4733,6 +5030,14 @@ replace_certificate_pair() {
     [[ -z $__changed_var ]] || printf -v "$__changed_var" '%s' "$replace_changed"
     return 0
   fi
+  # Retain administrator-configured ownership and access on renewal. New
+  # files stay private; copying attributes first avoids widening permissions.
+  if [[ -f $cert_target ]]; then
+    cp -p "$cert_target" "$cert_tmp" && cat "$source_cert" >"$cert_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+  fi
+  if [[ -f $key_target ]]; then
+    cp -p "$key_target" "$key_tmp" && cat "$source_key" >"$key_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+  fi
   [[ ! -f $cert_target ]] || { cp -a "$cert_target" "$cert_bak"; had_cert=1; }
   [[ ! -f $key_target ]] || { cp -a "$key_target" "$key_bak"; had_key=1; }
   mv -f "$cert_tmp" "$cert_target" || failed=1
@@ -4762,12 +5067,12 @@ certificate_transaction_rollback() {
   local snapshot=$1 cert_target=$2 key_target=$3
   [[ -d $snapshot ]] || return 1
   if [[ -f $snapshot/cert ]]; then
-    install -m 600 "$snapshot/cert" "$cert_target" || return 1
+    cp -p "$snapshot/cert" "$cert_target" || return 1
   else
     rm -f "$cert_target"
   fi
   if [[ -f $snapshot/key ]]; then
-    install -m 600 "$snapshot/key" "$key_target" || return 1
+    cp -p "$snapshot/key" "$key_target" || return 1
   else
     rm -f "$key_target"
   fi
@@ -4801,10 +5106,10 @@ certificate_identifier_for_subject() {
 }
 
 setup_certbot_renewal_timer() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  [[ -x $QUICK_COMMAND ]] || install_quick_command || return 1
   case $(init_system) in
     systemd)
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" <<EOF_SERVICE || return 1
 [Unit]
 Description=Renew certificates managed by sbctl
 
@@ -4812,7 +5117,7 @@ Description=Renew certificates managed by sbctl
 Type=oneshot
 ExecStart=${QUICK_COMMAND} cert renew-auto
 EOF_SERVICE
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER'
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" <<'EOF_TIMER' || return 1
 [Unit]
 Description=Renew certificates managed by sbctl
 
@@ -4824,18 +5129,18 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-      systemctl daemon-reload
-      systemctl enable --now sbctl-certbot-renew.timer >/dev/null
-      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service"
-      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
+      systemctl daemon-reload || return 1
+      systemctl enable --now sbctl-certbot-renew.timer >/dev/null || return 1
+      meta_resource_register renewService "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" || return 1
+      meta_resource_register renewTimer "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" || return 1
       ;;
     openrc)
-      mkdir -p /etc/periodic/daily
-      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON
+      mkdir -p /etc/periodic/daily || return 1
+      cat >/etc/periodic/daily/sbctl-certbot-renew <<EOF_CRON || return 1
 #!/bin/sh
 ${QUICK_COMMAND} cert renew-auto
 EOF_CRON
-      chmod 755 /etc/periodic/daily/sbctl-certbot-renew
+      chmod 755 /etc/periodic/daily/sbctl-certbot-renew || return 1
       meta_resource_register renewPeriodic /etc/periodic/daily/sbctl-certbot-renew
       ;;
     *) die "无法配置证书自动续期：未检测到 systemd/OpenRC。";;
@@ -5049,7 +5354,6 @@ import_certificate() {
 }
 
 list_certificates() {
-  init_meta
   local id cert found=0 subject source validation auto_renew cert_name
   while IFS= read -r id; do
     [[ -n $id ]] || continue
@@ -5080,18 +5384,12 @@ certificate_inbound_users() {
 
 # Disable renewal timer if no certs need it
 _disable_renewal_job_if_unused() {
-  local remaining
-  remaining=$(meta_cert_auto_renew_certs | head -1 || true)
-  [[ -z $remaining ]] || return 0
-  case $(init_system) in
-    systemd)
-      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
-      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
-      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      ;;
-    openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
-  esac
+  local remaining identifier=${1-} entry
+  remaining=$(meta_cert_auto_renew_certs) || return 1
+  while IFS= read -r entry; do
+    [[ -z $entry || $entry == "$identifier" ]] || return 0
+  done <<<"$remaining"
+  _remove_renewal_jobs
 }
 
 delete_certificate() {
@@ -5115,10 +5413,10 @@ delete_certificate() {
       warn "Certbot 环境缺失，无法安全删除 Let's Encrypt lineage。"; return 1;
     fi
   fi
-  rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key"
-  rm -f "$CERTBOT_HOOK_DIR/sbctl-${identifier}" "$CERTBOT_HOOK_DIR/sbctl-${subject}"
-  meta_cert_delete "$identifier"
-  _disable_renewal_job_if_unused
+  rm -f "$CERT_DIR/${identifier}.crt" "$CERT_DIR/${identifier}.key" || { warn "托管证书文件删除失败；请检查后重试。"; return 1; }
+  rm -f "$CERTBOT_HOOK_DIR/sbctl-${identifier}" "$CERTBOT_HOOK_DIR/sbctl-${subject}" || { warn "证书续期钩子删除失败；请检查后重试。"; return 1; }
+  _disable_renewal_job_if_unused "$identifier" || { warn "续期任务清理失败；证书记录保留，请重试删除。"; return 1; }
+  meta_cert_delete "$identifier" || { warn "证书 metadata 删除失败；请检查后重试。"; return 1; }
   info "托管证书已删除：${identifier}"
 }
 
@@ -5174,18 +5472,24 @@ renew_one_certificate() {
       ;;
     http-standalone)
       owner=$(detect_port80_owner)
-      case $owner in free) :;; sing-box) service_is_active && { was_active=1; service_stop; CERT_STOPPED_SERVICE=1; };; *) warn "${identifier}: 80 端口被占用，自动续期阻塞。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked; return 0;; esac
+      case $owner in free) :;; sing-box) if service_is_active; then service_stop || { warn "无法停止 sing-box，续期已中止。"; return 1; }; was_active=1; CERT_STOPPED_SERVICE=1; fi;; *) warn "${identifier}: 80 端口被占用，自动续期阻塞。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' blocked; return 0;; esac
       ;;
     nginx) :;;
     *) warn "${identifier}: 未知验证方式 ${validation}。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1;;
   esac
-  [[ -x $CERTBOT_BIN ]] || { warn "Certbot 环境缺失，请重新执行证书签发。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1; }
+  if [[ ! -x $CERTBOT_BIN ]]; then
+    if ((was_active)) && service_start; then CERT_STOPPED_SERVICE=0; fi
+    warn "Certbot 环境缺失，请重新执行证书签发。"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
+  fi
   [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && before_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
   if ! certbot_cmd renew --cert-name "$cert_name" --quiet; then
-    ((was_active)) && { service_start || true; CERT_STOPPED_SERVICE=0; }
+    if ((was_active)) && service_start; then CERT_STOPPED_SERVICE=0; fi
     warn "证书续期失败：${identifier}"; [[ -z $__result_var ]] || printf -v "$__result_var" '%s' failed; return 1
   fi
-  ((was_active)) && { service_start; CERT_STOPPED_SERVICE=0; }
+  if ((was_active)); then
+    if ! service_start; then warn "续期后无法恢复 sing-box 服务。"; return 1; fi
+    CERT_STOPPED_SERVICE=0
+  fi
   [[ -r $CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem ]] && after_serial=$(openssl x509 -in "$CERTBOT_CONFIG_DIR/live/${cert_name}/fullchain.pem" -noout -serial 2>/dev/null || true)
   certificate_transaction_snapshot transaction "$cert_target" "$key_target" || return 1
   sync_managed_certificate "$identifier" "$cert_name" changed || {
@@ -5271,8 +5575,8 @@ load_cloudflare_credentials() {
 }
 
 cloudflare_dependent_certificates() {
-  init_meta
-  jq -r '.certificates | to_entries[] | select(.value.validation == "dns-cloudflare") | .key' "$META_FILE" 2>/dev/null
+  [[ -f $META_FILE ]] || return 0
+  jq -r '(.certificates // {}) | to_entries[] | select(.value.validation == "dns-cloudflare") | .key' "$META_FILE" 2>/dev/null
 }
 
 cloudflare_dependency_count() {
@@ -5691,49 +5995,6 @@ disable_bbr() {
 # Canonical _remove_bbr_settings lives in uninstall.sh
 # Canonical _scan_sbctl_residuals lives in uninstall.sh
 
-system_diagnostics() {
-  ensure_dependencies diagnose
-  local v4="" v6="" virt=unknown certs=0 auto=0 account_count=0 unit="" hardening=不适用
-  command_exists systemd-detect-virt && virt=$(systemd-detect-virt 2>/dev/null || printf none)
-  v4=$(detect_public_ipv4 || true)
-  v6=$(detect_public_ipv6 || true)
-  init_meta
-  certs=$(managed_certificate_count 2>/dev/null || printf 0)
-  auto=$(meta_cert_auto_renew_certs 2>/dev/null | awk 'NF{n++} END{print n+0}')
-  account_count=$(certbot_account_ids 2>/dev/null | awk 'NF{n++} END{print n+0}')
-  case $(init_system) in
-    systemd)
-      unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
-      if [[ -r $unit ]] && grep -q '^NoNewPrivileges=true$' "$unit" && grep -q '^ProtectSystem=strict$' "$unit"; then hardening=已启用; else hardening=缺失; fi
-      ;;
-    openrc)
-      unit="${OPENRC_INIT_DIR}/${SERVICE_NAME}"
-      if [[ -r $unit ]] && grep -q '^supervisor="supervise-daemon"$' "$unit"; then hardening=supervise-daemon; else hardening=缺失; fi
-      ;;
-  esac
-  heading "系统诊断"
-  printf '系统: %s %s\n' "$(uname -s)" "$(uname -r)"
-  printf '虚拟化: %s\n' "$virt"
-  printf '初始化: %s\n' "$(init_system)"
-  printf 'sing-box: %s\n' "$(sing_box_version_summary)"
-  printf '服务: %s  |  开机自启: %s\n' "$(service_state_summary)" "$(startup_state_summary)"
-  printf '服务硬化: %s\n' "$hardening"
-  printf '公网 IPv4: %s\n' "${v4:-未检测到}"
-  printf '公网 IPv6: %s\n' "${v6:-未检测到}"
-  printf 'BBR: %s\n' "$(bbr_state_summary)"
-  printf 'BBR 持久化来源: %s\n' "$(bbr_manager)"
-  printf '配置: %s\n' "$CONFIG_FILE"
-  printf 'metadata schema: %s\n' "$(jq -r '.schema // "?"' "$META_FILE" 2>/dev/null || printf '?')"
-  if traffic_is_enabled; then printf '流量统计: 运行中（%s）\n' "$(traffic_backend)"; else printf '流量统计: 已停止\n'; fi
-  if traffic_limits_are_enabled; then printf '流量限制: 已启用（%s 个入站）\n' "$(traffic_limit_count)"; else printf '流量限制: 未启用\n'; fi
-  printf '托管证书: %s  |  自动续期: %s  |  Certbot 账户: %s\n' "$certs" "$auto" "$account_count"
-  if load_cloudflare_credentials 2>/dev/null; then printf 'Cloudflare DNS: 已配置\n'; else printf 'Cloudflare DNS: 未配置\n'; fi
-  if [[ -f $CONFIG_FILE ]]; then
-    printf '入站: %s  |  出站: %s\n' "$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?')" "$(jq '.outbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?')"
-    if validate_candidate "$CONFIG_FILE"; then printf '配置检查: 通过\n'; else printf '配置检查: 失败\n'; fi
-  fi
-}
-
 bbr_state_summary() {
   if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
     [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]] && printf '已启用' || printf '未启用'
@@ -5749,14 +6010,6 @@ toggle_bbr() {
     enable_bbr
   fi
 }
-
-repair_quick_command() {
-  ensure_dependencies quick-command
-  install_quick_command
-  [[ -x $QUICK_COMMAND ]] || die "快捷命令修复失败。"
-  info "快捷命令已修复：${QUICK_SYMLINK}"
-}
-
 
 # ---- sing-box lifecycle ----
 version_ge() {
@@ -5782,53 +6035,6 @@ _sing_box_binary_sha256() {
   local binary=$1
   [[ -f $binary ]] || return 1
   openssl dgst -sha256 "$binary" 2>/dev/null | awk '{print $NF}'
-}
-
-detect_sing_box_arch() {
-  local machine=${1:-$(uname -m)}
-  case $machine in
-    x86_64|amd64) printf 'amd64' ;;
-    aarch64|arm64) printf 'arm64' ;;
-    armv7l) printf 'armv7' ;;
-    armv6l) printf 'armv6' ;;
-    i386|i486|i586|i686) printf '386' ;;
-    s390x) printf 's390x' ;;
-    riscv64) printf 'riscv64' ;;
-    *) error "不支持的 sing-box Release 架构：${machine}"; return 1 ;;
-  esac
-}
-
-sing_box_release_platform() {
-  local version=$1 arch=$2
-  # Modern generic archives can depend on a companion libcronet.so. Prefer
-  # the official static musl build where it exists so the managed core remains
-  # a single, portable binary on every distribution.
-  if version_ge "$version" 1.13.3; then
-    case $arch in
-      amd64|arm64|armv7|386|riscv64) printf 'linux-%s-musl' "$arch"; return 0 ;;
-    esac
-  fi
-  printf 'linux-%s' "$arch"
-}
-
-resolve_sing_box_version() {
-  local requested=${1-} payload resolved
-  if [[ -n $requested ]]; then
-    resolved=${requested#v}
-  else
-    payload=$(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
-      --connect-timeout 10 --max-time 60 "$SING_BOX_RELEASE_API") || {
-      error "无法获取 sing-box 最新 stable Release。"
-      return 1
-    }
-    resolved=$(jq -r 'select(.draft==false and .prerelease==false) | .tag_name // empty' <<<"$payload")
-    resolved=${resolved#v}
-  fi
-  [[ $resolved =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-    error "无效或非 stable 的 sing-box 版本：${resolved:-未知}"
-    return 1
-  }
-  printf '%s' "$resolved"
 }
 
 _record_sing_box_install() {
@@ -5861,6 +6067,20 @@ _sing_box_meta_get() {
   jq -r --arg field "$field" '.singBox[$field] // empty' "$META_FILE" 2>/dev/null
 }
 
+detect_sing_box_arch() {
+  local machine=${1:-$(uname -m)}
+  case $machine in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    armv7l) printf 'armv7' ;;
+    armv6l) printf 'armv6' ;;
+    i386|i486|i586|i686) printf '386' ;;
+    s390x) printf 's390x' ;;
+    riscv64) printf 'riscv64' ;;
+    *) error "不支持的 sing-box Release 架构：${machine}"; return 1 ;;
+  esac
+}
+
 _migrate_legacy_release_metadata() {
   [[ -f $META_FILE ]] || return 1
   [[ $(_sing_box_meta_get managed) == true ]] && return 0
@@ -5882,184 +6102,7 @@ _sing_box_target_is_managed() {
   [[ $(_sing_box_meta_get binary) == "$SING_BOX_RELEASE_INSTALL_PATH" ]] || return 1
 }
 
-find_external_sing_box() {
-  command -v sing-box 2>/dev/null || true
-}
-
-create_sing_box_work_dir() {
-  local base=${SBCTL_TMP_DIR:-/var/tmp}
-  mkdir -p "$base" || return 1
-  mktemp -d "$base/sbctl-sing-box.XXXXXX"
-}
-
-ensure_sing_box_install_target_safe() {
-  local target=$SING_BOX_RELEASE_INSTALL_PATH expected actual external
-  [[ $target == /usr/local/bin/sing-box || ${SBCTL_TESTING:-0} == 1 ]] || {
-    error "sing-box 受管安装路径必须是 /usr/local/bin/sing-box。"
-    return 1
-  }
-  [[ ! -d $target && ! -L $target ]] || { error "拒绝覆盖非普通文件：${target}"; return 1; }
-  if [[ -e $target ]]; then
-    _sing_box_target_is_managed || {
-      error "${target} 已存在，但 metadata 无法确认由 sbctl 管理；拒绝覆盖。"
-      return 1
-    }
-    expected=$(_sing_box_meta_get sha256)
-    actual=$(_sing_box_binary_sha256 "$target") || true
-    [[ -n $expected && $actual == "$expected" ]] || {
-      error "${target} 已被修改，与 sbctl metadata 不一致；拒绝覆盖。"
-      return 1
-    }
-    return 0
-  fi
-  external=$(find_external_sing_box)
-  if [[ -n $external && $external != "$target" ]]; then
-    error "检测到外部 sing-box：${external}；请先明确迁移或移除后再由 sbctl 管理。"
-    return 1
-  fi
-}
-
-download_sing_box_release() {
-  local version=$1 arch=$2 work_dir=$3 platform archive_name archive_url archive member
-  platform=$(sing_box_release_platform "$version" "$arch")
-  archive_name="sing-box-${version}-${platform}.tar.gz"
-  archive_url="${SING_BOX_RELEASE_DOWNLOAD_BASE}/v${version}/${archive_name}"
-  archive="${work_dir}/${archive_name}"
-  member="sing-box-${version}-${platform}/sing-box"
-  if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
-    --connect-timeout 10 --max-time 120 "$archive_url" -o "$archive"; then
-    error "sing-box 官方 Release 不存在或下载失败：${archive_url}"
-    return 1
-  fi
-  if ! tar -tzf "$archive" "$member" >/dev/null 2>&1 || ! tar -xzf "$archive" -C "$work_dir" "$member"; then
-    error "sing-box 官方 Release 压缩包损坏或缺少 binary。"
-    return 1
-  fi
-  SING_BOX_DOWNLOADED_BINARY="${work_dir}/${member}"
-  SING_BOX_DOWNLOADED_PLATFORM=$platform
-}
-
-verify_sing_box_binary() {
-  local candidate=$1 expected_version=$2 output status=0 actual_version
-  [[ -f $candidate && ! -L $candidate ]] || { error "sing-box Release 候选 binary 无效。"; return 1; }
-  chmod 755 "$candidate" || return 1
-  if output=$("$candidate" version 2>&1); then :; else status=$?; fi
-  actual_version=$(printf '%s\n' "$output" \
-    | sed -n 's/^sing-box version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
-    | head -n 1)
-  if ((status != 0)) || [[ -z $actual_version || $actual_version != "$expected_version" ]]; then
-    error "sing-box Release binary 校验失败（期望 ${expected_version}，实际 ${actual_version:-无法识别}，退出码 ${status}）。"
-    [[ -z $output ]] || error "候选 binary 输出：$(printf '%s' "$output" | head -n 1)"
-    return 1
-  fi
-  version_ge "$actual_version" "$SING_BOX_MIN_VERSION" || {
-    error "sbctl 需要 sing-box >= ${SING_BOX_MIN_VERSION}，当前候选版本为 ${actual_version}。"
-    return 1
-  }
-  SING_BOX_VERIFIED_VERSION=$actual_version
-  SING_BOX_VERIFIED_SHA256=$(_sing_box_binary_sha256 "$candidate") || return 1
-}
-
-rollback_sing_box_binary() {
-  local target=$1 backup=${2-} had_old=${3:-0} staged
-  if ((had_old)); then
-    [[ -f $backup ]] || { error "旧 sing-box binary 备份丢失，无法回滚。"; return 1; }
-    staged=$(mktemp "${target%/*}/.sing-box.rollback.XXXXXX") || return 1
-    install -m 755 "$backup" "$staged" && mv -f -- "$staged" "$target" || { rm -f -- "$staged"; return 1; }
-  else
-    rm -f -- "$target"
-  fi
-  sbc_invalidate_install_cache
-  refresh_binary_path
-}
-
-wait_for_sing_box_service() {
-  local attempt
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    service_is_active && return 0
-    sleep 0.25
-  done
-  return 1
-}
-
-install_sing_box_release() {
-  local requested=${1-} version arch work_dir target target_dir candidate staged backup="" meta_snapshot config_snapshot
-  local service_definition="" service_snapshot=""
-  local had_old=0 had_meta=0 had_config=0 old_service_exists=0 old_active=0 old_enabled=0 had_service_definition=0 failed=0
-
-  ensure_sing_box_install_target_safe || return 1
-  version=$(resolve_sing_box_version "$requested") || return 1
-  arch=$(detect_sing_box_arch) || return 1
-  work_dir=$(create_sing_box_work_dir) || { error "无法创建 sing-box 临时目录。"; return 1; }
-  SING_BOX_DOWNLOADED_BINARY=""; SING_BOX_DOWNLOADED_PLATFORM=""
-  if ! download_sing_box_release "$version" "$arch" "$work_dir"; then rm -rf -- "$work_dir"; return 1; fi
-  candidate=$SING_BOX_DOWNLOADED_BINARY
-  if ! verify_sing_box_binary "$candidate" "$version"; then rm -rf -- "$work_dir"; return 1; fi
-  if [[ -f $CONFIG_FILE ]] && ! "$candidate" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-    rm -rf -- "$work_dir"; error "新 sing-box 核心无法通过当前配置检查，未替换旧核心。"; return 1
-  fi
-
-  target=$SING_BOX_RELEASE_INSTALL_PATH; target_dir=${target%/*}
-  mkdir -p "$target_dir" || { rm -rf -- "$work_dir"; return 1; }
-  if [[ -f $target ]]; then
-    had_old=1; backup=$(mktemp "${target_dir}/.sing-box.backup.XXXXXX") || { rm -rf -- "$work_dir"; return 1; }
-    cp -p "$target" "$backup" || { rm -f -- "$backup"; rm -rf -- "$work_dir"; return 1; }
-  fi
-  meta_snapshot=$(temp_file)
-  if [[ -f $META_FILE ]]; then cp -p "$META_FILE" "$meta_snapshot"; had_meta=1; fi
-  config_snapshot=$(temp_file)
-  if [[ -f $CONFIG_FILE ]]; then cp -p "$CONFIG_FILE" "$config_snapshot"; had_config=1; fi
-  service_exists && old_service_exists=1
-  service_is_active && old_active=1
-  service_is_enabled && old_enabled=1
-  case $(init_system) in
-    systemd) service_definition="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" ;;
-    openrc) service_definition="${OPENRC_INIT_DIR}/${SERVICE_NAME}" ;;
-  esac
-  if [[ -n $service_definition && -f $service_definition ]]; then
-    service_snapshot=$(temp_file); cp -p "$service_definition" "$service_snapshot"; had_service_definition=1
-  fi
-
-  staged=$(mktemp "${target_dir}/.sing-box.install.XXXXXX") || failed=1
-  if ((failed == 0)); then install -m 755 "$candidate" "$staged" || failed=1; fi
-  if ((failed == 0)); then mv -f -- "$staged" "$target" || failed=1; fi
-  rm -f -- "$staged" 2>/dev/null || true
-  if ((failed == 0)); then
-    sbc_invalidate_install_cache; refresh_binary_path
-    if ((had_config)); then ensure_config; else write_default_config; fi
-    validate_candidate "$CONFIG_FILE" || failed=1
-  fi
-  if ((failed == 0)); then _record_sing_box_install "$version" "$arch" "$SING_BOX_VERIFIED_SHA256" "$SING_BOX_DOWNLOADED_PLATFORM" || failed=1; fi
-  if ((failed == 0)); then create_service_definition || failed=1; fi
-  if ((failed == 0)); then install_quick_command || failed=1; fi
-  if ((failed == 0)); then service_enable || failed=1; fi
-  if ((failed == 0)); then
-    if ((old_active)); then service_restart || failed=1; else service_start || failed=1; fi
-  fi
-  if ((failed == 0)) && ! wait_for_sing_box_service; then failed=1; fi
-
-  if ((failed)); then
-    error "新 sing-box 核心未能正常接管服务，正在回滚。"
-    rollback_sing_box_binary "$target" "$backup" "$had_old" || error "sing-box binary 自动回滚失败。"
-    if ((had_meta)); then install -m 600 "$meta_snapshot" "$META_FILE"; else rm -f "$META_FILE"; fi
-    if ((had_config)); then install -m 600 "$config_snapshot" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
-    if ((had_service_definition)); then
-      cp -p "$service_snapshot" "$service_definition"
-      [[ $(init_system) != systemd ]] || systemctl daemon-reload >/dev/null 2>&1 || true
-    else
-      _remove_sbctl_service_definition
-    fi
-    if ((old_service_exists && old_active)); then service_restart >/dev/null 2>&1 || true; else service_stop >/dev/null 2>&1 || true; fi
-    if ((old_enabled)); then service_enable >/dev/null 2>&1 || true; else service_disable >/dev/null 2>&1 || true; fi
-    rm -f -- "$backup" "$meta_snapshot" "$config_snapshot" "$service_snapshot"; rm -rf -- "$work_dir"
-    return 1
-  fi
-
-  rm -f -- "$backup" "$meta_snapshot" "$config_snapshot" "$service_snapshot"; rm -rf -- "$work_dir"
-  info "已通过 SagerNet 官方 GitHub Release 安装 sing-box ${version}（${arch}）。"
-}
-
-require_sing_box() { refresh_binary_path; sing_box_installed || die "sing-box 尚未安装，请先运行 sbctl install。"; }
+require_sing_box() { refresh_binary_path; sing_box_installed || die "sing-box 尚未安装，请先自行安装 sing-box。"; }
 
 require_supported_core() {
   local version
@@ -6077,73 +6120,6 @@ restart_service_checked() {
 }
 
 # Hardened service definition.
-create_service_definition() {
-  refresh_binary_path
-  mkdir -p "$DATA_DIR" "$CONFIG_DIR"
-  case $(init_system) in
-    systemd)
-      mkdir -p "$SYSTEMD_UNIT_DIR"
-      cat >"${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" <<EOF_UNIT
-[Unit]
-Description=sing-box service managed by sbctl
-Documentation=https://sing-box.sagernet.org/
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-ExecStart=${SING_BOX_BIN} run -D ${DATA_DIR} -c ${CONFIG_FILE}
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=infinity
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectHostname=true
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictRealtime=true
-ReadWritePaths=${DATA_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF_UNIT
-      systemctl daemon-reload
-      meta_resource_register serviceDefinition "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
-      ;;
-    openrc)
-      mkdir -p "$OPENRC_INIT_DIR"
-      cat >"${OPENRC_INIT_DIR}/$SERVICE_NAME" <<EOF_RC
-#!/sbin/openrc-run
-name="sing-box"
-description="sing-box service managed by sbctl"
-command="${SING_BOX_BIN}"
-command_args="run -D ${DATA_DIR} -c ${CONFIG_FILE}"
-command_user="root:root"
-supervisor="supervise-daemon"
-respawn_delay=3
-respawn_max=0
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.log"
-umask 077
-$(printf '%s' 'depend() { need net; }')
-EOF_RC
-      chmod 755 "${OPENRC_INIT_DIR}/$SERVICE_NAME"
-      meta_resource_register serviceDefinition "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
-      ;;
-    *) die "未检测到 systemd 或 OpenRC。";;
-  esac
-  meta_resource_register dataDir "$DATA_DIR"
-}
-
 install_quick_command() {
   local source=${SBCTL_ENTRYPOINT:-${BASH_SOURCE[0]:-}} downloaded=""
   mkdir -p "$(dirname "$QUICK_COMMAND")" "$(dirname "$QUICK_SYMLINK")"
@@ -6165,16 +6141,6 @@ install_quick_command() {
   [[ $LIB_DIR != /usr/local/lib/sbctl ]] || meta_resource_register libDir "$LIB_DIR"
 }
 
-install_or_update_sing_box() {
-  ensure_dependencies install
-  install_sing_box_release "${1-}" || die "sing-box 官方 Release 安装/更新失败；原核心与服务已保留。"
-  if traffic_is_enabled; then
-    traffic_runtime_ensure || warn "sing-box 已安装，但流量统计运行时恢复失败。"
-  fi
-  info "sing-box 已就绪：$($SING_BOX_BIN version | sed -n '1p')"
-}
-
-# ---- status / ops ----
 show_status() {
   heading "sing-box 状态"
   if sing_box_installed; then "$SING_BOX_BIN" version | sed -n '1,2p'; else printf 'sing-box: 未安装\n'; fi
@@ -6199,7 +6165,7 @@ service_action() {
 }
 
 # ---- module: uninstall ----
-# Three-level uninstall model aligned with xrayctl, adapted to sing-box/systemd/OpenRC.
+# Complete removal and resource ownership safeguards.
 
 cleanup_step() {
   local description=$1; shift
@@ -6263,68 +6229,77 @@ _safe_remove_sbctl_dir() {
   [[ -n $path && $path == /* ]] || return 1
   case $path in /|/etc|/usr|/usr/local|/var|/var/lib|/var/log|/opt|/home|/root) warn "拒绝删除危险路径：$path"; return 1;; esac
   [[ -z $key ]] || recorded=$(_snapshot_meta_resource_get "$key")
-  case $path in
-    /opt/sbctl/certbot|/var/lib/sbctl/letsencrypt|/var/lib/sbctl/certbot-work|/var/log/sbctl/certbot|/var/backups/sbctl|/usr/local/lib/sbctl|/etc/sing-box/certs) :;;
-    *) [[ -n $recorded && $recorded == "$path" ]] || { warn "未确认目录归 sbctl 所有，跳过：$path"; return 1; };;
-  esac
+  [[ -n $recorded && $recorded == "$path" && ! -L $path ]] || { warn "未确认目录归 sbctl 所有，跳过：$path"; return 1; }
   [[ ! -e $path ]] || rm -rf -- "$path"
 }
 
 _remove_renewal_jobs() {
   case $(init_system) in
     systemd)
-      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
-      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
-      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
-      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -e ${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer ]]; then
+        systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || return 1
+      fi
+      if [[ -e ${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service ]]; then
+        systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || return 1
+      fi
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" || return 1
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
       ;;
     openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
   esac
 }
 
 _remove_legacy_certbot_assets() {
-  local hook name
+  local hook name rc=0
   for hook in "$CERTBOT_HOOK_DIR"/sbctl-*; do
     [[ -e $hook ]] || continue
     name=$(basename "$hook"); name=${name#sbctl-}
     if [[ -n $name && -f /etc/letsencrypt/renewal/${name}.conf ]] && command_exists certbot; then
-      certbot delete --cert-name "$name" --non-interactive >/dev/null 2>&1 || warn "旧版 Certbot lineage 删除失败：$name"
+      certbot delete --cert-name "$name" --non-interactive >/dev/null 2>&1 || { warn "旧版 Certbot lineage 删除失败：$name"; rc=1; continue; }
     fi
-    rm -f "$hook"
+    rm -f "$hook" || rc=1
   done
+  return "$rc"
 }
 
 _remove_managed_certificates() {
-  local id source cert_name
+  local id source cert_name rc=0
   while IFS= read -r id; do
     [[ -n $id ]] || continue
+    if ! validate_certificate_identifier "$id" || [[ $id == . || $id == .. ]]; then
+      warn "无效证书标识，已保留：$id"; rc=1; continue
+    fi
     source=$(_snapshot_meta_cert_get_field "$id" source); cert_name=$(_snapshot_meta_cert_get_field "$id" certName)
     if [[ $source == letsencrypt && -n $cert_name && -x $CERTBOT_BIN && -f $CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf ]]; then
-      certbot_cmd delete --cert-name "$cert_name" --non-interactive >/dev/null 2>&1 || warn "Certbot lineage 删除失败：$cert_name"
+      certbot_cmd delete --cert-name "$cert_name" --non-interactive >/dev/null 2>&1 || { warn "Certbot lineage 删除失败：$cert_name"; rc=1; continue; }
     fi
-    rm -f "$CERT_DIR/${id}.crt" "$CERT_DIR/${id}.key"
+    rm -f -- "$CERT_DIR/${id}.crt" "$CERT_DIR/${id}.key" || rc=1
   done < <(_snapshot_meta_cert_list)
-  _remove_legacy_certbot_assets
+  _remove_legacy_certbot_assets || rc=1
+  return "$rc"
 }
 
 _remove_certbot_environment() {
-  _safe_remove_sbctl_dir "$CERTBOT_CONFIG_DIR" certbotConfigDir || true
-  _safe_remove_sbctl_dir "$CERTBOT_WORK_DIR" certbotWorkDir || true
-  _safe_remove_sbctl_dir "$CERTBOT_LOGS_DIR" certbotLogsDir || true
-  _safe_remove_sbctl_dir "$CERTBOT_VENV" certbotVenv || true
+  local path key rc=0
+  for key in certbotConfigDir certbotWorkDir certbotLogsDir certbotVenv; do
+    case $key in certbotConfigDir) path=$CERTBOT_CONFIG_DIR;; certbotWorkDir) path=$CERTBOT_WORK_DIR;; certbotLogsDir) path=$CERTBOT_LOGS_DIR;; certbotVenv) path=$CERTBOT_VENV;; esac
+    [[ -e $path || -L $path ]] || continue
+    _safe_remove_sbctl_dir "$path" "$key" || rc=1
+  done
   rmdir /var/log/sbctl /opt/sbctl 2>/dev/null || true
+  return "$rc"
 }
 
 _remove_sbctl_service_definition() {
   case $(init_system) in
     systemd)
       local unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
-      if [[ -f $unit ]] && grep -q 'managed by sbctl' "$unit" 2>/dev/null; then rm -f "$unit"; fi
-      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -f $unit ]] && grep -q 'managed by sbctl' "$unit" 2>/dev/null; then rm -f "$unit" || return 1; fi
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
       ;;
     openrc)
       local init="${OPENRC_INIT_DIR}/${SERVICE_NAME}"
-      if [[ -f $init ]] && grep -q 'managed by sbctl' "$init" 2>/dev/null; then rm -f "$init"; fi
+      if [[ -f $init ]] && grep -q 'managed by sbctl' "$init" 2>/dev/null; then rm -f "$init" || return 1; fi
       ;;
   esac
 }
@@ -6343,37 +6318,46 @@ _remove_sing_box_core() {
   if ! _sing_box_target_is_managed; then
     warn "未确认 sing-box 核心归 sbctl 管理；不会删除任何 sing-box binary 或系统软件包。"
     if _sbctl_service_definition_is_managed; then
-      service_stop >/dev/null 2>&1 || true
-      service_disable >/dev/null 2>&1 || true
-      _remove_sbctl_service_definition
+      service_stop >/dev/null 2>&1 || return 1
+      service_disable >/dev/null 2>&1 || return 1
+      _remove_sbctl_service_definition || return 1
     fi
     return 0
   fi
-  service_stop >/dev/null 2>&1 || true
-  service_disable >/dev/null 2>&1 || true
+  service_stop >/dev/null 2>&1 || return 1
+  service_disable >/dev/null 2>&1 || return 1
   _remove_managed_sing_box_release_binary || rc=1
-  ((rc != 0)) || _clear_sing_box_install_metadata
-  _remove_sbctl_service_definition
+  ((rc != 0)) || _clear_sing_box_install_metadata || rc=1
+  _remove_sbctl_service_definition || rc=1
   return "$rc"
 }
 
 _remove_quick_command_and_libs() {
-  if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then rm -f "$QUICK_SYMLINK"; fi
-  if [[ -f $QUICK_COMMAND ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then rm -f "$QUICK_COMMAND"; fi
-  if [[ $LIB_DIR == /usr/local/lib/sbctl ]]; then _safe_remove_sbctl_dir "$LIB_DIR" libDir || true; fi
+  local rc=0
+  if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then rm -f "$QUICK_SYMLINK" || rc=1; fi
+  if [[ -f $QUICK_COMMAND ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then rm -f "$QUICK_COMMAND" || rc=1; fi
+  if [[ $LIB_DIR == /usr/local/lib/sbctl && -e $LIB_DIR ]]; then _safe_remove_sbctl_dir "$LIB_DIR" libDir || rc=1; fi
   hash -r 2>/dev/null || true
+  return "$rc"
 }
 
 _remove_config_and_metadata() {
-  rm -f "$CONFIG_FILE"
-  _safe_remove_sbctl_dir "$CERT_DIR" certDir || true
+  if [[ -d $CERT_DIR ]]; then
+    rmdir -- "$CERT_DIR" || { warn "证书目录非空，已保留：$CERT_DIR"; return 1; }
+  fi
+  if [[ -d $DATA_DIR ]] && [[ -n $(ls -A "$DATA_DIR" 2>/dev/null) ]]; then
+    warn "数据目录非空，已保留配置和 metadata：$DATA_DIR"; return 1
+  fi
+  rm -f "$CONFIG_FILE" || return 1
   [[ ! -d $CONFIG_DIR ]] || rmdir "$CONFIG_DIR" 2>/dev/null || true
   rm -f "$META_FILE"
   rmdir "$(dirname "$META_FILE")" 2>/dev/null || true
   if [[ -d $DATA_DIR ]]; then
     local recorded_data
     recorded_data=$(_snapshot_meta_resource_get dataDir)
-    if [[ -n $recorded_data && $recorded_data == "$DATA_DIR" ]]; then _safe_remove_sbctl_dir "$DATA_DIR" dataDir || true; else rmdir "$DATA_DIR" 2>/dev/null || true; fi
+    if [[ -n $recorded_data && $recorded_data == "$DATA_DIR" ]]; then
+      rmdir "$DATA_DIR" 2>/dev/null || { warn "数据目录非空，已保留：$DATA_DIR"; return 1; }
+    else rmdir "$DATA_DIR" 2>/dev/null || true; fi
   fi
   rm -f /var/log/sing-box.log 2>/dev/null || true
 }
@@ -6398,6 +6382,10 @@ _remove_bbr_settings() {
 }
 
 _remove_backups() {
+  [[ -f $BACKUP_DIR/.sbctl-owned && ! -L $BACKUP_DIR && ! -L $BACKUP_DIR/.sbctl-owned ]] || { warn "备份目录没有 sbctl 所有权标记，已保留：$BACKUP_DIR"; return 1; }
+  if [[ $(_snapshot_meta_resource_get backupDir) != "$BACKUP_DIR" ]]; then
+    warn "备份目录未登记，已保留：$BACKUP_DIR"; return 1
+  fi
   _safe_remove_sbctl_dir "$BACKUP_DIR" backupDir
 }
 
@@ -6415,47 +6403,8 @@ _scan_sbctl_residuals() {
   printf -v "$__count_var" '%s' "$count"
 }
 
-_sbctl_uninstall_level_0() {
-  heading "卸载程序"
-  confirm "卸载 sing-box 核心，但保留配置、证书、备份、sbctl 和自动续期？" N || return 0
-  if [[ -f $CONFIG_FILE ]]; then
-    local backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
-    backup_all "$backup" >/dev/null 2>&1 && info "卸载前备份：$backup" || warn "卸载前备份失败，仍继续仅卸载核心。"
-  fi
-  if ! _remove_sing_box_core; then
-    warn "sing-box 核心未完全卸载；未确认归 sbctl 管理的 binary 已保留。"
-    return 1
-  fi
-  info "sing-box 核心已卸载；配置、证书、sbctl、续期任务和备份已保留。"
-  info "需要时运行 sbctl install 可重新安装。"
-}
-
-_sbctl_uninstall_level_1() {
-  heading "完全卸载"
-  confirm "将卸载 sing-box/sbctl，并删除配置、托管证书和 Certbot 数据；备份保留。确定吗？" N || return 0
-  local backup residual=0 failures=0
-  if [[ -f $CONFIG_FILE ]]; then
-    backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
-    backup_all "$backup" >/dev/null 2>&1 || { warn "最终备份失败，已取消完全卸载。"; return 1; }
-    info "最终备份已创建：$backup"
-  fi
-  _uninstall_snapshot_metadata
-  cleanup_step "停止并删除流量统计" traffic_remove_all || ((failures+=1))
-  cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
-  cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
-  cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
-  cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1))
-  cleanup_step "删除配置与元数据" _remove_config_and_metadata || ((failures+=1))
-  cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
-  heading "残留检查"; _scan_sbctl_residuals residual 0
-  rm -f "$SNAPSHOT_META"
-  ((failures == 0)) || warn "有 ${failures} 个清理步骤未完全成功。"
-  ((residual == 0)) || warn "检测到 ${residual} 项残留。"
-  info "完全卸载完成；备份保留在 ${BACKUP_DIR}。"
-}
-
 _sbctl_uninstall_level_2() {
-  heading "彻底删除"
+  heading "删除"
   cat <<'EOF_ERASE'
 
 ⚠ 即将永久删除 sbctl 管理的全部数据：
@@ -6473,32 +6422,39 @@ EOF_ERASE
   local answer failures=0 residual=0
   read -r answer || { echo; return 0; }
   [[ $answer == DELETE ]] || { info "已取消彻底删除。"; return 0; }
+  uninstall_confirmed=1
+  echo
   _uninstall_snapshot_metadata
   cleanup_step "停止并删除流量统计" traffic_remove_all || ((failures+=1))
   cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
-  cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
-  cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
-  cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1))
-  cleanup_step "撤销 BBR 配置" _remove_bbr_settings || ((failures+=1))
-  cleanup_step "删除配置与元数据" _remove_config_and_metadata || ((failures+=1))
+  if ((failures == 0)); then cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1)); fi
+  if ((failures == 0)); then cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1)); fi
+  if ((failures == 0)); then cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1)); fi
+  if ((failures == 0)); then cleanup_step "撤销 BBR 配置" _remove_bbr_settings || ((failures+=1)); fi
+  if ((failures > 0)); then
+    rm -f "$SNAPSHOT_META"
+    warn "清理未完成，保留配置、元数据和 sbctl 命令以便重试。"
+    return 1
+  fi
+  if ! cleanup_step "删除配置与元数据" _remove_config_and_metadata; then
+    rm -f "$SNAPSHOT_META"
+    warn "配置清理未完成，保留 sbctl 命令以便重试。"
+    return 1
+  fi
   cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
   cleanup_step "删除所有备份" _remove_backups || ((failures+=1))
   heading "残留检查"; _scan_sbctl_residuals residual 1
   rm -f "$SNAPSHOT_META"
   printf '执行结果：失败步骤 %d，检测残留 %d\n' "$failures" "$residual"
+  ((failures == 0))
 }
 
 uninstall_sing_box() {
   ensure_dependencies uninstall
-  local level=${1:-0}
-  case $level in
-    0) _sbctl_uninstall_level_0;;
-    1) _sbctl_uninstall_level_1;;
-    2) _sbctl_uninstall_level_2;;
-    *) die "无效卸载级别：$level";;
-  esac
+  local uninstall_confirmed=0
+  _sbctl_uninstall_level_2 || return $?
   # Clean up Hysteria2 port hopping rules if sing-box was removed
-  if ! sing_box_installed; then
+  if ((uninstall_confirmed)) && ! sing_box_installed; then
     traffic_runtime_stop || warn "流量统计运行时未能完全停止。"
     hy2_hop_clear_rules
     hy2_hop_boot_service_remove
@@ -6511,7 +6467,7 @@ uninstall_sing_box() {
 
 # ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
 manage_inbound_menu() {
-  local tag=$1 choice row
+  local tag=$1 choice row type port security user_count
   while inbound_exists "$tag"; do
     clear_screen
     # Single-jq: fetch type, port, security, user_count in one call
@@ -6522,24 +6478,30 @@ manage_inbound_menu() {
 
     case $type in
       anytls|vless|trojan|hysteria2)
-        printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        if [[ $security == tls ]]; then
+          printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 证书管理\n5) 查看 JSON\n0) 返回列表\n'
+        else
+          printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+        fi
         read -r -p "请选择: " choice || { echo; return; }
         case $choice in
           1) run_menu_action print_share "$tag"; pause;;
           2) client_menu "$tag";;
-          3) modify_inbound_menu "$tag";;
-          4) run_menu_action show_inbound "$tag"; pause;;
+          3) modify_inbound_menu tag;;
+          4) if [[ $security == tls ]]; then inbound_certificate_menu "$tag"; else run_menu_action show_inbound "$tag"; pause; fi;;
+          5) if [[ $security == tls ]]; then run_menu_action show_inbound "$tag"; else warn "无效选项。"; fi; pause;;
           0) return;; *) warn "无效选项。"; pause;;
         esac
         ;;
       socks|http)
+        if ((user_count > 0)); then printf '认证: 已启用\n\n'; else printf '认证: 无\n\n'; fi
         if ((user_count > 0)); then
           printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
           read -r -p "请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
             2) client_menu "$tag";;
-            3) modify_inbound_menu "$tag";;
+            3) modify_inbound_menu tag;;
             4) run_menu_action show_inbound "$tag"; pause;;
             0) return;; *) warn "无效选项。"; pause;;
           esac
@@ -6548,7 +6510,7 @@ manage_inbound_menu() {
           read -r -p "请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
-            2) modify_inbound_menu "$tag";;
+            2) modify_inbound_menu tag;;
             3) run_menu_action show_inbound "$tag"; pause;;
             0) return;; *) warn "无效选项。"; pause;;
           esac
@@ -6559,24 +6521,48 @@ manage_inbound_menu() {
   done
 }
 
+inbound_certificate_menu() {
+  local tag=$1 choice row cert key sni
+  while inbound_exists "$tag" && jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true and (.tls.reality.enabled!=true)' "$CONFIG_FILE" >/dev/null; do
+    row=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|[.tls.certificate_path // "未设置",.tls.key_path // "未设置",.tls.server_name // "未设置"]|@tsv' "$CONFIG_FILE")
+    IFS=$'\t' read -r cert key sni <<<"$row"
+    clear_screen; heading "证书管理 · ${tag}"
+    printf '证书: %s\n私钥: %s\nSNI: %s\n\n1) 更换证书\n0) 返回入站\n' "$cert" "$key" "$sni"
+    read -r -p '请选择: ' choice || { echo; return; }
+    case $choice in
+      1) run_menu_action modify_inbound_certificate "$tag"; pause;;
+      0) return;; *) warn '无效选项。'; pause;;
+    esac
+  done
+}
+
 # ---- modify inbound menu (from hy2_hop.sh — adds port hopping for hysteria2) ----
 modify_inbound_menu() {
-  local tag=$1 choice type
-  while inbound_exists "$tag"; do
+  local -n current_tag=$1
+  local choice type new_tag
+  while inbound_exists "$current_tag"; do
     clear_screen
-    type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
+    type=$(jq -r --arg tag "$current_tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
     heading "修改入站信息 · ${tag}"
     if [[ $type == hysteria2 ]]; then
       printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
     else
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n'
+      [[ $type == vless || $type == trojan ]] && printf '4) 修改传输方式\n'
+      printf '0) 返回\n'
     fi
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
-      1) run_menu_action rename_inbound "$tag"; pause; inbound_exists "$tag" || return 0;;
-      2) run_menu_action modify_inbound_basic "$tag"; pause;;
-      3) run_menu_action modify_inbound_security "$tag"; pause;;
-      4) [[ $type == hysteria2 ]] && { run_menu_action hy2_hop_configure "$tag"; pause; } || { warn "无效选项。"; pause; };;
+      1) prompt_value new_tag "新入站名称" "$current_tag" || continue
+         if [[ $new_tag == "$current_tag" ]]; then info "名称未更改。"
+         else
+           run_menu_action rename_inbound "$current_tag" "$new_tag"
+           if ! inbound_exists "$current_tag" && inbound_exists "$new_tag"; then current_tag=$new_tag; fi
+         fi
+         pause;;
+      2) run_menu_action modify_inbound_basic "$current_tag"; pause;;
+      3) run_menu_action modify_inbound_security "$current_tag"; pause;;
+      4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; vless|trojan) run_menu_action modify_inbound_transport "$current_tag";; *) warn "无效选项。";; esac; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac
@@ -6591,7 +6577,7 @@ inbound_menu() {
     heading "入站管理"
     list_inbounds
     printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
-    printf '1) 新增入站\n2) 管理已有入站\n3) 订阅链接\n4) 删除入站\n0) 返回\n'
+    printf '1) 新增入站\n2) 管理已有入站\n3) 全部分享信息\n4) 删除入站\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_inbound; pause;;
@@ -6671,11 +6657,9 @@ domain_rule_menu() {
     heading '域名分流'
     printf '入站列表\n\n'
     tags=()
-    while IFS= read -r tag; do [[ -n $tag ]] && tags+=("$tag"); done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
+    while IFS= read -r tag; do [[ -n $tag ]] && tags+=("$tag"); done < <(jq -r '.inbounds[].tag // empty' "$CONFIG_FILE")
     if ((${#tags[@]} == 0)); then
       info '没有可选入站。'
-      pause
-      return 0
     fi
     for ((number=0; number<${#tags[@]}; number++)); do
       tag=${tags[$number]}
@@ -6877,7 +6861,9 @@ toggle_service_running() {
 }
 
 toggle_service_startup() {
-  if service_is_enabled; then service_disable; info "开机自启已关闭；当前运行状态未改变。"; else service_enable; info "开机自启已开启。"; fi
+  ensure_dependencies service
+  service_exists || die "sing-box 服务不存在。"
+  if service_is_enabled; then service_disable || return; info "开机自启已关闭；当前服务运行状态未改变。"; else service_enable || return; info "开机自启已开启。"; fi
 }
 
 service_menu() {
@@ -6887,35 +6873,13 @@ service_menu() {
     # Single _service_summary_all call, parse with read — no repeated awk/systemctl
     read -r svc_summary boot_summary ver_summary <<< "$(_service_summary_all)"
     printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$svc_summary" "$boot_summary" "$ver_summary"
-    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装/更新/修复 sing-box\n6) 系统诊断\n7) 修复快捷命令\n0) 返回\n'
+    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action toggle_service_running; pause;;
       2) run_menu_action service_action restart; pause;;
       3) run_menu_action toggle_service_startup; pause;;
       4) run_menu_action service_logs 100; pause;;
-      5) run_menu_action install_or_update_sing_box; pause;;
-      6) run_menu_action system_diagnostics; pause;;
-      7) run_menu_action repair_quick_command; pause;;
-      0) return;; *) warn "无效选项。"; pause;;
-    esac
-  done
-}
-
-# ---- three-level uninstall menu ----
-uninstall_menu() {
-  local choice
-  while true; do
-    clear_screen; heading "卸载"
-    printf '1) 卸载程序 — 仅删除 sing-box 核心，保留配置/证书/sbctl\n'
-    printf '2) 完全卸载 — 删除 sing-box/sbctl/配置/证书，保留备份\n'
-    printf '3) 彻底删除 — 清除全部 sbctl 数据和备份\n'
-    printf '0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
-    case $choice in
-      1) run_menu_action uninstall_sing_box 0; pause;;
-      2) run_menu_action uninstall_sing_box 1; return;;
-      3) run_menu_action uninstall_sing_box 2; return;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -6997,7 +6961,7 @@ main_menu() {
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) inbound_menu;; 2) outbound_menu;; 3) certificate_menu;; 4) traffic_menu;;
-      5) run_menu_action toggle_bbr; pause;; 6) service_menu;; 7) uninstall_menu;;
+      5) run_menu_action toggle_bbr; pause;; 6) service_menu;; 7) clear_screen; run_menu_action uninstall_sing_box; pause;;
       0) return;; *) warn "无效选项。"; pause;;
     esac
   done
@@ -7010,10 +6974,6 @@ sbctl - sing-box Linux 管理器
 
 用法:
   sbctl                              打开交互菜单
-  sbctl install [版本]               安装/更新 sing-box
-  sbctl uninstall                    仅卸载 sing-box 核心，保留配置
-  sbctl uninstall --purge            完全卸载，保留备份
-  sbctl uninstall --erase            彻底删除全部 sbctl 数据和备份
   sbctl status                       查看状态
   sbctl start|stop|restart           服务控制
   sbctl enable|disable               开关开机自启
@@ -7023,7 +6983,7 @@ sbctl - sing-box Linux 管理器
   sbctl traffic period set <日> <时:分> 设置统一统计起点
   sbctl traffic enable|disable       开启/停止流量统计
   sbctl traffic limit show|enable|disable
-  sbctl traffic limit set <标签> <GB> <重置日>
+  sbctl traffic limit set <标签> <GB> <重置日> [HH:MM]
   sbctl traffic limit remove <标签>
 
   sbctl inbound list                 列出入站
@@ -7032,8 +6992,7 @@ sbctl - sing-box Linux 管理器
   sbctl inbound rename <旧标签> <新标签>
   sbctl inbound modify [标签]        修改监听地址/端口
   sbctl inbound security [标签]      修改 TLS/REALITY
-  sbctl inbound disable <标签> [--yes] 禁用入站
-  sbctl inbound enable <标签> [--yes] 启用入站
+  sbctl inbound transport [标签]     修改 TCP/WS 传输
   sbctl inbound delete [标签] [--yes]
 
   sbctl outbound list
@@ -7048,10 +7007,11 @@ sbctl - sing-box Linux 管理器
   sbctl client add [标签]
   sbctl client rename [标签] [旧名称] [新名称]
   sbctl client rotate [标签] [用户]
-  sbctl client delete [标签] [用户]
+  sbctl client delete [标签] [用户] [--yes]
 
   sbctl link [标签] [用户]           输出分享信息/客户端 JSON
-  sbctl config check|show|edit
+  sbctl subscription [标签]          输出 Base64 VLESS 订阅
+  sbctl config check|show|edit|migrate-tags
   sbctl cert list
   sbctl cert issue [域名/IP] [邮箱]
   sbctl cert import [标识] [证书] [私钥]
@@ -7062,7 +7022,6 @@ sbctl - sing-box Linux 管理器
   sbctl backup [文件.tar.gz]
   sbctl restore [文件.tar.gz]
   sbctl bbr                           启用/关闭 BBR（交互式）
-  sbctl diagnose
   sbctl version
 
 证书说明:
@@ -7083,16 +7042,7 @@ dispatch() {
   case $cmd in
     menu) main_menu;;
     help|-h|--help) show_help;;
-    version|-v|--version) printf 'sbctl %s\n' "$SBCTL_VERSION";;
-    install|update|upgrade) install_or_update_sing_box "${1-}";;
-    uninstall)
-      case ${1-} in
-        "") uninstall_sing_box 0;;
-        --purge) uninstall_sing_box 1;;
-        --erase) uninstall_sing_box 2;;
-        *) die "未知卸载选项：${1}";;
-      esac
-      ;;
+    version|-v|--version) printf 'sbctl %s' "$SBCTL_VERSION"; [[ $SBCTL_BUILD_COMMIT == development ]] || printf ' (commit %s)' "$SBCTL_BUILD_COMMIT"; printf '\n';;
     status) show_status;;
     start|stop|restart|enable|disable) service_action "$cmd";;
     logs) service_logs "${1:-100}";;
@@ -7117,7 +7067,7 @@ dispatch() {
             show) traffic_limits_show;;
             enable|start) traffic_limits_enable;;
             disable|stop) traffic_limits_disable;;
-            set) traffic_limit_set "${3-}" "${4-}" "${5-}";;
+            set) traffic_limit_set "${3-}" "${4-}" "${5-}" "${6-}";;
             remove|delete) traffic_limit_remove "${3-}";;
             *) die "未知 traffic limit 子命令：${2}";;
           esac
@@ -7134,6 +7084,7 @@ dispatch() {
         rename) rename_inbound "${2-}" "${3-}";;
         modify|edit) modify_inbound_basic "${2-}";;
         security|tls) modify_inbound_security "${2-}";;
+        transport|stream) modify_inbound_transport "${2-}";;
         delete|remove) delete_inbound "${2-}" "$([[ ${3-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 inbound 子命令：${1}";;
       esac
@@ -7161,16 +7112,18 @@ dispatch() {
         add) add_client "${2-}";;
         rename) rename_client "${2-}" "${3-}" "${4-}";;
         rotate|reset) rotate_client_credential "${2-}" "${3-}";;
-        delete|remove) delete_client "${2-}" "${3-}";;
+        delete|remove) delete_client "${2-}" "${3-}" "$([[ ${4-} == --yes ]] && printf 1 || printf 0)";;
         *) die "未知 client 子命令：${1}";;
       esac
       ;;
-    link|share) print_share "${1-}" "${2-}";;
+    link|links|share) print_share "${1-}" "${2-}";;
+    subscription|subscribe|sub) print_subscription "${1-}";;
     config)
       case ${1:-check} in
         check|test) check_config;;
         show) ensure_config; jq . "$CONFIG_FILE";;
         edit) edit_config;;
+        migrate-tags) ensure_config; normalize_config_tags;;
         *) die "未知 config 子命令。";;
       esac
       ;;
@@ -7189,8 +7142,6 @@ dispatch() {
     backup) backup_all "${1-}";;
     restore) restore_backup "${1-}";;
     bbr) toggle_bbr;;
-    diagnose|doctor) system_diagnostics;;
-    quick-command) repair_quick_command;;
     internal-hy2-hop-restore) internal_hy2_hop_restore;;
     internal-hy2-hop-clear) internal_hy2_hop_clear;;
     internal-traffic-collect) internal_traffic_collect;;

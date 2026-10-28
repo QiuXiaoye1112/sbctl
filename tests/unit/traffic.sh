@@ -249,6 +249,12 @@ jq -e '
   .inbounds.vless.limit.cycleEnd=="2026-09-07 18:00:00"
 ' "$TRAFFIC_FILE" >/dev/null
 
+# Changing the schedule keeps usage while updating the next reset.
+traffic_limit_set vless 2 31 09:30 >/dev/null
+jq -e '.inbounds.vless.limit | .usedBytes==1073741824 and .anchorTime=="09:30:00" and .cycleEnd=="2026-08-31 09:30:00"' "$TRAFFIC_FILE" >/dev/null
+! traffic_limit_set vless 2 31 25:00 >/dev/null 2>&1
+traffic_limit_set vless 2 7 18:00 >/dev/null
+
 SBCTL_TRAFFIC_NOW='2026-09-07 17:59:59'
 SBCTL_TRAFFIC_TODAY=2026-09-07
 traffic_sync_inventory
@@ -342,7 +348,9 @@ set -Eeuo pipefail
 source ./sbctl.sh
 trap - ERR
 mkdir -p "$CASE_DIR"
-command_exists() { [[ ${1-} == iptables ]]; }
+command_exists() { [[ ${1-} == iptables || ${1-} == iptables-save || ${1-} == iptables-restore ]]; }
+iptables-save() { printf "*filter\nCOMMIT\n"; }
+iptables-restore() { cat >/dev/null; }
 write_default_config
 tmp=$(temp_file)
 jq '.inbounds=[{"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
@@ -415,6 +423,7 @@ install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 
 nft() {
   if [[ $1 == -j ]]; then printf '%s\n' '{"nftables":[]}'; return 0; fi
+  if [[ $1 == -f ]]; then cat "$2" >>"$CASE_DIR/nft-calls"; return 0; fi
   local IFS=' '; printf '%s\n' "$*" >>"$CASE_DIR/nft-calls"
 }
 traffic_rules_restore
@@ -426,6 +435,17 @@ grep -Fq 'add rule inet sbctl_traffic input udp dport 5000 counter comment "sbct
 grep -Fq 'add rule inet sbctl_traffic input udp dport 24443 counter comment "sbctl-traffic:count:hy2"' "$CASE_DIR/nft-calls"
 ! grep -Fq 'sbctl-traffic:block:socks' "$CASE_DIR/nft-calls"
 ! grep -Fq 'udp dport 17225' "$CASE_DIR/nft-calls"
+# A rejected batch must not issue a separate destructive delete command.
+nft() {
+  if [[ $1 == -j ]]; then printf '%s\n' '{"nftables":[]}'; return 0; fi
+  if [[ $1 == -f ]]; then cp "$2" "$CASE_DIR/failed-batch"; return 1; fi
+  printf 'unexpected operation\n' >>"$CASE_DIR/nft-unexpected"
+  return 1
+}
+if traffic_rules_restore; then exit 1; fi
+[[ ! -e $CASE_DIR/nft-unexpected ]]
+grep -Fq 'delete table inet sbctl_traffic' "$CASE_DIR/failed-batch"
+grep -Fq 'add rule inet sbctl_traffic input tcp dport 17225 drop' "$CASE_DIR/failed-batch"
 
 init_system() { printf systemd; }
 systemctl() { local IFS=' '; printf '%s\n' "$*" >>"$CASE_DIR/systemctl-calls"; }
@@ -507,5 +527,21 @@ traffic_period_set 31 00:00 >/dev/null
 [[ $(traffic_period_bounds '2028-02-29 12:00:00') == $'2028-02-29 00:00:00\t2028-03-31 00:00:00' ]]
 [[ $(traffic_period_bounds '2026-04-30 12:00:00') == $'2026-04-30 00:00:00\t2026-05-31 00:00:00' ]]
 BASH_PERIOD
+
+# Failures must remain visible even when functions are invoked in conditionals.
+SBCTL_TESTING=1 SBCTL_TRAFFIC_FILE="$TMP/failure/traffic.json" bash <<'BASH_FAILURE'
+set -Eeuo pipefail
+source ./sbctl.sh
+mkdir -p "$(dirname "$TRAFFIC_FILE")"
+printf '{"backend":"nft"}\n' >"$TRAFFIC_FILE"
+traffic_init_file() { :; }
+install() { return 1; }
+if traffic_set_backend iptables; then exit 1; fi
+[[ $(jq -r .backend "$TRAFFIC_FILE") == nft ]]
+command_exists() { [[ $1 == iptables ]]; }
+traffic_clear_iptables_rules() { :; }
+iptables() { return 1; }
+if traffic_restore_iptables_rules; then exit 1; fi
+BASH_FAILURE
 
 printf 'traffic accounting unit checks passed.\n'

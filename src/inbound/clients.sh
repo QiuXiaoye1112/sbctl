@@ -15,7 +15,7 @@ add_client() {
   [[ -n $tag ]] || select_inbound tag '^(anytls|vless|hysteria2|trojan|socks|http|mixed)$' || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   while true; do
-    prompt_value name "用户名称" "user-$(random_hex 2)"
+    prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
     client_exists "$tag" "$name" && { warn "用户名称已存在。"; continue; }
     break
   done
@@ -25,16 +25,16 @@ add_client() {
       flow=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[0].flow // empty' "$CONFIG_FILE")
       user=$(jq -n --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" '{name:$name,uuid:$uuid,flow:$flow}') ;;
     anytls|hysteria2|trojan)
-      prompt_secret password "密码" "$(random_password)"
+      prompt_secret password "密码" "$(random_password)" || return 1
       user=$(jq -n --arg name "$name" --arg password "$password" '{name:$name,password:$password}') ;;
     socks|http|mixed)
-      prompt_secret password "密码" "$(random_password)"
+      prompt_secret password "密码" "$(random_password)" || return 1
       user=$(jq -n --arg username "$name" --arg password "$password" '{username:$username,password:$password}') ;;
     *) warn "该协议不支持用户管理。"; return 0;;
   esac
   tmp=$(temp_file)
   jq --arg tag "$tag" --argjson user "$user" '(.inbounds[]|select(.tag==$tag)|.users) += [$user]' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "用户 ${name} 已添加。"; print_share "$tag" "$name" || true; fi
+  if apply_candidate "$tmp"; then info "用户 ${name} 已添加。"; print_share "$tag" "$name" || true; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -88,7 +88,7 @@ select_client() {
 
 delete_client() {
   ensure_dependencies client-delete; ensure_config
-  local tag=${1-} name=${2-} type field tmp
+  local tag=${1-} name=${2-} assume_yes=${3:-0} type field tmp count
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   field=$(client_label_field "$type")
@@ -96,10 +96,15 @@ delete_client() {
     select_client name "$tag" || return 0
   fi
   client_exists "$tag" "$name" || die "找不到用户：${name}"
-  confirm "删除用户 ${name}？" N || return 0
+  count=$(jq --arg tag "$tag" '[.inbounds[]|select(.tag==$tag)|.users[]?]|length' "$CONFIG_FILE")
+  if ((count <= 1)) && [[ $type == socks || $type == http || $type == mixed ]]; then
+    warn "不能删除最后一个代理用户，否则入站会变为无认证。"; return 1
+  fi
+  [[ $assume_yes == 1 ]] || confirm "删除用户 ${name}？" N || return 0
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg name "$name" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users) |= map(select(.[$field]!=$name))' "$CONFIG_FILE" >"$tmp"
-  apply_candidate "$tmp"; rm -f "$tmp"
+  if ! apply_candidate "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
 }
 
 rotate_client_credential() {
@@ -118,7 +123,7 @@ rotate_client_credential() {
     value=$(random_password)
     jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
   fi
-  if apply_candidate "$tmp"; then info "新凭据：${value}"; fi
+  if apply_candidate "$tmp"; then info "新凭据：${value}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -130,7 +135,7 @@ client_json_for_anytls() {
   sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
   jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "AnyTLS 入站未启用 TLS，sbctl 不生成不受支持的客户端配置。"; return 0; }
   if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-    public=$(reality_public_key "$tag") || warn "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"
+    public=$(reality_public_key "$tag") || { warn "REALITY 公钥元数据缺失或与当前私钥不匹配；请重新创建该 REALITY 入站。"; return 1; }
     sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
     jq -n --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$sni" --arg public "$public" --arg sid "$sid" '{type:"anytls",tag:"proxy",server:$host,server_port:$port,password:$password,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$public,short_id:$sid}}}'
   else
@@ -147,12 +152,12 @@ rename_client() {
   field=$(client_label_field "$type")
   if [[ -z $old ]]; then select_client old "$tag" || return 0; fi
   client_exists "$tag" "$old" || die "找不到用户：$old"
-  if [[ -z $new ]]; then prompt_value new "新用户名称" "$old"; fi
+  if [[ -z $new ]]; then prompt_value new "新用户名称" "$old" || return 1; fi
   [[ $new == "$old" ]] && { info "名称未更改。"; return 0; }
   client_exists "$tag" "$new" && die "用户名称已存在：$new"
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg old "$old" --arg new "$new" --arg field "$field" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$old)|.[$field])=$new' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "用户已重命名：${old} -> ${new}"; fi
+  if apply_candidate "$tmp"; then info "用户已重命名：${old} -> ${new}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 

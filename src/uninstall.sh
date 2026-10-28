@@ -1,4 +1,4 @@
-# Three-level uninstall model aligned with xrayctl, adapted to sing-box/systemd/OpenRC.
+# Complete removal and resource ownership safeguards.
 
 cleanup_step() {
   local description=$1; shift
@@ -62,68 +62,77 @@ _safe_remove_sbctl_dir() {
   [[ -n $path && $path == /* ]] || return 1
   case $path in /|/etc|/usr|/usr/local|/var|/var/lib|/var/log|/opt|/home|/root) warn "拒绝删除危险路径：$path"; return 1;; esac
   [[ -z $key ]] || recorded=$(_snapshot_meta_resource_get "$key")
-  case $path in
-    /opt/sbctl/certbot|/var/lib/sbctl/letsencrypt|/var/lib/sbctl/certbot-work|/var/log/sbctl/certbot|/var/backups/sbctl|/usr/local/lib/sbctl|/etc/sing-box/certs) :;;
-    *) [[ -n $recorded && $recorded == "$path" ]] || { warn "未确认目录归 sbctl 所有，跳过：$path"; return 1; };;
-  esac
+  [[ -n $recorded && $recorded == "$path" && ! -L $path ]] || { warn "未确认目录归 sbctl 所有，跳过：$path"; return 1; }
   [[ ! -e $path ]] || rm -rf -- "$path"
 }
 
 _remove_renewal_jobs() {
   case $(init_system) in
     systemd)
-      systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || true
-      systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || true
-      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer"
-      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -e ${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer ]]; then
+        systemctl disable --now sbctl-certbot-renew.timer >/dev/null 2>&1 || return 1
+      fi
+      if [[ -e ${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service ]]; then
+        systemctl stop sbctl-certbot-renew.service >/dev/null 2>&1 || return 1
+      fi
+      rm -f "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" || return 1
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
       ;;
     openrc) rm -f /etc/periodic/daily/sbctl-certbot-renew;;
   esac
 }
 
 _remove_legacy_certbot_assets() {
-  local hook name
+  local hook name rc=0
   for hook in "$CERTBOT_HOOK_DIR"/sbctl-*; do
     [[ -e $hook ]] || continue
     name=$(basename "$hook"); name=${name#sbctl-}
     if [[ -n $name && -f /etc/letsencrypt/renewal/${name}.conf ]] && command_exists certbot; then
-      certbot delete --cert-name "$name" --non-interactive >/dev/null 2>&1 || warn "旧版 Certbot lineage 删除失败：$name"
+      certbot delete --cert-name "$name" --non-interactive >/dev/null 2>&1 || { warn "旧版 Certbot lineage 删除失败：$name"; rc=1; continue; }
     fi
-    rm -f "$hook"
+    rm -f "$hook" || rc=1
   done
+  return "$rc"
 }
 
 _remove_managed_certificates() {
-  local id source cert_name
+  local id source cert_name rc=0
   while IFS= read -r id; do
     [[ -n $id ]] || continue
+    if ! validate_certificate_identifier "$id" || [[ $id == . || $id == .. ]]; then
+      warn "无效证书标识，已保留：$id"; rc=1; continue
+    fi
     source=$(_snapshot_meta_cert_get_field "$id" source); cert_name=$(_snapshot_meta_cert_get_field "$id" certName)
     if [[ $source == letsencrypt && -n $cert_name && -x $CERTBOT_BIN && -f $CERTBOT_CONFIG_DIR/renewal/${cert_name}.conf ]]; then
-      certbot_cmd delete --cert-name "$cert_name" --non-interactive >/dev/null 2>&1 || warn "Certbot lineage 删除失败：$cert_name"
+      certbot_cmd delete --cert-name "$cert_name" --non-interactive >/dev/null 2>&1 || { warn "Certbot lineage 删除失败：$cert_name"; rc=1; continue; }
     fi
-    rm -f "$CERT_DIR/${id}.crt" "$CERT_DIR/${id}.key"
+    rm -f -- "$CERT_DIR/${id}.crt" "$CERT_DIR/${id}.key" || rc=1
   done < <(_snapshot_meta_cert_list)
-  _remove_legacy_certbot_assets
+  _remove_legacy_certbot_assets || rc=1
+  return "$rc"
 }
 
 _remove_certbot_environment() {
-  _safe_remove_sbctl_dir "$CERTBOT_CONFIG_DIR" certbotConfigDir || true
-  _safe_remove_sbctl_dir "$CERTBOT_WORK_DIR" certbotWorkDir || true
-  _safe_remove_sbctl_dir "$CERTBOT_LOGS_DIR" certbotLogsDir || true
-  _safe_remove_sbctl_dir "$CERTBOT_VENV" certbotVenv || true
+  local path key rc=0
+  for key in certbotConfigDir certbotWorkDir certbotLogsDir certbotVenv; do
+    case $key in certbotConfigDir) path=$CERTBOT_CONFIG_DIR;; certbotWorkDir) path=$CERTBOT_WORK_DIR;; certbotLogsDir) path=$CERTBOT_LOGS_DIR;; certbotVenv) path=$CERTBOT_VENV;; esac
+    [[ -e $path || -L $path ]] || continue
+    _safe_remove_sbctl_dir "$path" "$key" || rc=1
+  done
   rmdir /var/log/sbctl /opt/sbctl 2>/dev/null || true
+  return "$rc"
 }
 
 _remove_sbctl_service_definition() {
   case $(init_system) in
     systemd)
       local unit="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
-      if [[ -f $unit ]] && grep -q 'managed by sbctl' "$unit" 2>/dev/null; then rm -f "$unit"; fi
-      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ -f $unit ]] && grep -q 'managed by sbctl' "$unit" 2>/dev/null; then rm -f "$unit" || return 1; fi
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
       ;;
     openrc)
       local init="${OPENRC_INIT_DIR}/${SERVICE_NAME}"
-      if [[ -f $init ]] && grep -q 'managed by sbctl' "$init" 2>/dev/null; then rm -f "$init"; fi
+      if [[ -f $init ]] && grep -q 'managed by sbctl' "$init" 2>/dev/null; then rm -f "$init" || return 1; fi
       ;;
   esac
 }
@@ -142,37 +151,46 @@ _remove_sing_box_core() {
   if ! _sing_box_target_is_managed; then
     warn "未确认 sing-box 核心归 sbctl 管理；不会删除任何 sing-box binary 或系统软件包。"
     if _sbctl_service_definition_is_managed; then
-      service_stop >/dev/null 2>&1 || true
-      service_disable >/dev/null 2>&1 || true
-      _remove_sbctl_service_definition
+      service_stop >/dev/null 2>&1 || return 1
+      service_disable >/dev/null 2>&1 || return 1
+      _remove_sbctl_service_definition || return 1
     fi
     return 0
   fi
-  service_stop >/dev/null 2>&1 || true
-  service_disable >/dev/null 2>&1 || true
+  service_stop >/dev/null 2>&1 || return 1
+  service_disable >/dev/null 2>&1 || return 1
   _remove_managed_sing_box_release_binary || rc=1
-  ((rc != 0)) || _clear_sing_box_install_metadata
-  _remove_sbctl_service_definition
+  ((rc != 0)) || _clear_sing_box_install_metadata || rc=1
+  _remove_sbctl_service_definition || rc=1
   return "$rc"
 }
 
 _remove_quick_command_and_libs() {
-  if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then rm -f "$QUICK_SYMLINK"; fi
-  if [[ -f $QUICK_COMMAND ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then rm -f "$QUICK_COMMAND"; fi
-  if [[ $LIB_DIR == /usr/local/lib/sbctl ]]; then _safe_remove_sbctl_dir "$LIB_DIR" libDir || true; fi
+  local rc=0
+  if [[ -L $QUICK_SYMLINK ]] && [[ $(readlink "$QUICK_SYMLINK" 2>/dev/null) == "$QUICK_COMMAND" ]]; then rm -f "$QUICK_SYMLINK" || rc=1; fi
+  if [[ -f $QUICK_COMMAND ]] && grep -q '^# sbctl - sing-box Linux terminal manager' "$QUICK_COMMAND" 2>/dev/null; then rm -f "$QUICK_COMMAND" || rc=1; fi
+  if [[ $LIB_DIR == /usr/local/lib/sbctl && -e $LIB_DIR ]]; then _safe_remove_sbctl_dir "$LIB_DIR" libDir || rc=1; fi
   hash -r 2>/dev/null || true
+  return "$rc"
 }
 
 _remove_config_and_metadata() {
-  rm -f "$CONFIG_FILE"
-  _safe_remove_sbctl_dir "$CERT_DIR" certDir || true
+  if [[ -d $CERT_DIR ]]; then
+    rmdir -- "$CERT_DIR" || { warn "证书目录非空，已保留：$CERT_DIR"; return 1; }
+  fi
+  if [[ -d $DATA_DIR ]] && [[ -n $(ls -A "$DATA_DIR" 2>/dev/null) ]]; then
+    warn "数据目录非空，已保留配置和 metadata：$DATA_DIR"; return 1
+  fi
+  rm -f "$CONFIG_FILE" || return 1
   [[ ! -d $CONFIG_DIR ]] || rmdir "$CONFIG_DIR" 2>/dev/null || true
   rm -f "$META_FILE"
   rmdir "$(dirname "$META_FILE")" 2>/dev/null || true
   if [[ -d $DATA_DIR ]]; then
     local recorded_data
     recorded_data=$(_snapshot_meta_resource_get dataDir)
-    if [[ -n $recorded_data && $recorded_data == "$DATA_DIR" ]]; then _safe_remove_sbctl_dir "$DATA_DIR" dataDir || true; else rmdir "$DATA_DIR" 2>/dev/null || true; fi
+    if [[ -n $recorded_data && $recorded_data == "$DATA_DIR" ]]; then
+      rmdir "$DATA_DIR" 2>/dev/null || { warn "数据目录非空，已保留：$DATA_DIR"; return 1; }
+    else rmdir "$DATA_DIR" 2>/dev/null || true; fi
   fi
   rm -f /var/log/sing-box.log 2>/dev/null || true
 }
@@ -197,6 +215,10 @@ _remove_bbr_settings() {
 }
 
 _remove_backups() {
+  [[ -f $BACKUP_DIR/.sbctl-owned && ! -L $BACKUP_DIR && ! -L $BACKUP_DIR/.sbctl-owned ]] || { warn "备份目录没有 sbctl 所有权标记，已保留：$BACKUP_DIR"; return 1; }
+  if [[ $(_snapshot_meta_resource_get backupDir) != "$BACKUP_DIR" ]]; then
+    warn "备份目录未登记，已保留：$BACKUP_DIR"; return 1
+  fi
   _safe_remove_sbctl_dir "$BACKUP_DIR" backupDir
 }
 
@@ -214,47 +236,8 @@ _scan_sbctl_residuals() {
   printf -v "$__count_var" '%s' "$count"
 }
 
-_sbctl_uninstall_level_0() {
-  heading "卸载程序"
-  confirm "卸载 sing-box 核心，但保留配置、证书、备份、sbctl 和自动续期？" N || return 0
-  if [[ -f $CONFIG_FILE ]]; then
-    local backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
-    backup_all "$backup" >/dev/null 2>&1 && info "卸载前备份：$backup" || warn "卸载前备份失败，仍继续仅卸载核心。"
-  fi
-  if ! _remove_sing_box_core; then
-    warn "sing-box 核心未完全卸载；未确认归 sbctl 管理的 binary 已保留。"
-    return 1
-  fi
-  info "sing-box 核心已卸载；配置、证书、sbctl、续期任务和备份已保留。"
-  info "需要时运行 sbctl install 可重新安装。"
-}
-
-_sbctl_uninstall_level_1() {
-  heading "完全卸载"
-  confirm "将卸载 sing-box/sbctl，并删除配置、托管证书和 Certbot 数据；备份保留。确定吗？" N || return 0
-  local backup residual=0 failures=0
-  if [[ -f $CONFIG_FILE ]]; then
-    backup="$BACKUP_DIR/pre-uninstall-$(timestamp).tar.gz"
-    backup_all "$backup" >/dev/null 2>&1 || { warn "最终备份失败，已取消完全卸载。"; return 1; }
-    info "最终备份已创建：$backup"
-  fi
-  _uninstall_snapshot_metadata
-  cleanup_step "停止并删除流量统计" traffic_remove_all || ((failures+=1))
-  cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
-  cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
-  cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
-  cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1))
-  cleanup_step "删除配置与元数据" _remove_config_and_metadata || ((failures+=1))
-  cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
-  heading "残留检查"; _scan_sbctl_residuals residual 0
-  rm -f "$SNAPSHOT_META"
-  ((failures == 0)) || warn "有 ${failures} 个清理步骤未完全成功。"
-  ((residual == 0)) || warn "检测到 ${residual} 项残留。"
-  info "完全卸载完成；备份保留在 ${BACKUP_DIR}。"
-}
-
 _sbctl_uninstall_level_2() {
-  heading "彻底删除"
+  heading "删除"
   cat <<'EOF_ERASE'
 
 ⚠ 即将永久删除 sbctl 管理的全部数据：
@@ -272,32 +255,39 @@ EOF_ERASE
   local answer failures=0 residual=0
   read -r answer || { echo; return 0; }
   [[ $answer == DELETE ]] || { info "已取消彻底删除。"; return 0; }
+  uninstall_confirmed=1
+  echo
   _uninstall_snapshot_metadata
   cleanup_step "停止并删除流量统计" traffic_remove_all || ((failures+=1))
   cleanup_step "停止自动续期" _remove_renewal_jobs || ((failures+=1))
-  cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1))
-  cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1))
-  cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1))
-  cleanup_step "撤销 BBR 配置" _remove_bbr_settings || ((failures+=1))
-  cleanup_step "删除配置与元数据" _remove_config_and_metadata || ((failures+=1))
+  if ((failures == 0)); then cleanup_step "删除托管证书" _remove_managed_certificates || ((failures+=1)); fi
+  if ((failures == 0)); then cleanup_step "删除独立 Certbot 环境" _remove_certbot_environment || ((failures+=1)); fi
+  if ((failures == 0)); then cleanup_step "卸载 sing-box 核心" _remove_sing_box_core || ((failures+=1)); fi
+  if ((failures == 0)); then cleanup_step "撤销 BBR 配置" _remove_bbr_settings || ((failures+=1)); fi
+  if ((failures > 0)); then
+    rm -f "$SNAPSHOT_META"
+    warn "清理未完成，保留配置、元数据和 sbctl 命令以便重试。"
+    return 1
+  fi
+  if ! cleanup_step "删除配置与元数据" _remove_config_and_metadata; then
+    rm -f "$SNAPSHOT_META"
+    warn "配置清理未完成，保留 sbctl 命令以便重试。"
+    return 1
+  fi
   cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
   cleanup_step "删除所有备份" _remove_backups || ((failures+=1))
   heading "残留检查"; _scan_sbctl_residuals residual 1
   rm -f "$SNAPSHOT_META"
   printf '执行结果：失败步骤 %d，检测残留 %d\n' "$failures" "$residual"
+  ((failures == 0))
 }
 
 uninstall_sing_box() {
   ensure_dependencies uninstall
-  local level=${1:-0}
-  case $level in
-    0) _sbctl_uninstall_level_0;;
-    1) _sbctl_uninstall_level_1;;
-    2) _sbctl_uninstall_level_2;;
-    *) die "无效卸载级别：$level";;
-  esac
+  local uninstall_confirmed=0
+  _sbctl_uninstall_level_2 || return $?
   # Clean up Hysteria2 port hopping rules if sing-box was removed
-  if ! sing_box_installed; then
+  if ((uninstall_confirmed)) && ! sing_box_installed; then
     traffic_runtime_stop || warn "流量统计运行时未能完全停止。"
     hy2_hop_clear_rules
     hy2_hop_boot_service_remove

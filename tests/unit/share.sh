@@ -23,7 +23,7 @@ cat >"$CONFIG_FILE" <<'JSON'
       "users":[{"name":"reality-user","uuid":"11111111-1111-4111-8111-111111111111","flow":"xtls-rprx-vision"}],
       "tls":{"enabled":true,"server_name":"reality.example.com","reality":{"enabled":true,"handshake":{"server":"target.example.com","server_port":8443},"private_key":"reality-private","short_id":["ab12"]}}},
     {"type":"vless","tag":"vless-tls","listen":"0.0.0.0","listen_port":8443,
-      "users":[{"name":"tls-user","uuid":"22222222-2222-4222-8222-222222222222","flow":""}],
+      "users":[{"name":"tls-user","uuid":"22222222-2222-4222-8222-222222222222","flow":"xtls-rprx-vision"}],
       "tls":{"enabled":true,"server_name":"tls.example.com","certificate_path":"/tmp/c.crt","key_path":"/tmp/c.key"}},
     {"type":"vless","tag":"vless-tls-ws","listen":"0.0.0.0","listen_port":9443,
       "users":[{"name":"ws user","uuid":"33333333-3333-4333-8333-333333333333","flow":""}],
@@ -97,7 +97,7 @@ output=$(print_share vless-reality)
 assert_contains "$output" 'vless://11111111-1111-4111-8111-111111111111@reality.example.com:443?type=tcp&security=reality&sni=reality.example.com&fp=chrome&pbk=PUB%2B%2F%3D&sid=ab12&spx=%2F&flow=xtls-rprx-vision#vless-reality-reality-user'
 
 output=$(print_share vless-tls)
-assert_contains "$output" 'vless://22222222-2222-4222-8222-222222222222@tls.example.com:8443?type=tcp&security=tls&sni=tls.example.com#vless-tls-tls-user'
+assert_contains "$output" 'vless://22222222-2222-4222-8222-222222222222@tls.example.com:8443?type=tcp&security=tls&sni=tls.example.com&flow=xtls-rprx-vision#vless-tls-tls-user'
 
 output=$(print_share vless-tls-ws)
 assert_contains "$output" 'vless://33333333-3333-4333-8333-333333333333@tls-ws.example.com:9443?type=ws&security=tls&sni=tls-ws.example.com&host=ws.example.com&path=%2Fvless%20ws#vless-tls-ws-ws%20user'
@@ -127,15 +127,37 @@ output=$(print_share hy2-hop-obfs)
 assert_contains "$output" 'hysteria2://hy2-hop-pass@hy2-hop.example.com:30000-50000?sni=hy2-hop.example.com&obfs=salamander&obfs-password=obfs%20secret#hy2-hop-obfs-hy2-hop'
 
 output=$(print_share socks-open)
-assert_contains "$output" 'socks://socks.example.com:17443  无认证'
+assert_contains "$output" 'socks5://socks.example.com:17443#socks-open'
 
 output=$(print_share socks-auth)
-assert_contains "$output" 'socks://user%20name:p%40ss@socks.example.com:18443#socks-auth-user%20name'
+assert_contains "$output" 'socks5://user%20name:p%40ss@socks.example.com:18443#socks-auth-user%20name'
 
 output=$(print_share http-open)
-assert_contains "$output" 'http://http.example.com:19443  无认证'
+assert_contains "$output" 'http://http.example.com:19443#http-open'
 
 output=$(print_share http-auth)
 assert_contains "$output" 'http://http%20user:http%40pass@http.example.com:20443#http-auth-http%20user'
+
+subscription=$(print_subscription | base64 -d)
+[[ $(printf '%s\n' "$subscription" | wc -l) == 3 ]]
+[[ $(printf '%s\n' "$subscription" | grep -c '^vless://') == 3 ]]
+assert_contains "$subscription" 'type=ws&security=tls'
+subscription=$(print_subscription vless-tls-ws | base64 -d)
+[[ $(printf '%s\n' "$subscription" | wc -l) == 1 ]]
+assert_contains "$subscription" '33333333-3333-4333-8333-333333333333'
+if print_subscription socks-open >/dev/null; then printf 'non-VLESS subscription must fail\n' >&2; exit 1; fi
+if print_subscription missing >/dev/null; then printf 'unknown subscription must fail\n' >&2; exit 1; fi
+jq '(.inbounds[] | select(.tag=="vless-tls-ws") | .users) = []' "$CONFIG_FILE" >"$CONFIG_FILE.tmp"
+mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+if print_subscription vless-tls-ws >/dev/null; then printf 'empty subscription must fail\n' >&2; exit 1; fi
+jq 'del(.inbounds["vless-reality"].realityPublicKey)' "$META_FILE" >"$META_FILE.tmp"
+mv "$META_FILE.tmp" "$META_FILE"
+if print_subscription >/dev/null; then printf 'subscription must fail without REALITY key\n' >&2; exit 1; fi
+jq 'del(.inbounds["trojan-reality"].realityPublicKey, .inbounds["anytls-reality"].realityPublicKey)' "$META_FILE" >"$META_FILE.tmp"
+mv "$META_FILE.tmp" "$META_FILE"
+if print_share trojan-reality >/dev/null; then printf 'Trojan share must fail without REALITY key\n' >&2; exit 1; fi
+if print_share anytls-reality >"$TMP/anytls-share"; then printf 'AnyTLS share must fail without REALITY key\n' >&2; exit 1; fi
+if grep -q 'public_key' "$TMP/anytls-share"; then printf 'AnyTLS share emitted incomplete client configuration\n' >&2; exit 1; fi
+if print_all_share >/dev/null; then printf 'bulk share must report failures\n' >&2; exit 1; fi
 
 printf 'share matrix passed.\n'

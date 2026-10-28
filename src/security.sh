@@ -10,10 +10,28 @@ validate_reality_target() {
 }
 
 build_certificate_tls() {
-  local __json=$1 __host=${2-} identifier sni
-  select_managed_certificate identifier || return 1
-  prompt_certificate_server_name sni "$CERT_DIR/${identifier}.crt" || return 1
-  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$CERT_DIR/${identifier}.crt" --arg key "$CERT_DIR/${identifier}.key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
+  local __json=$1 __host=${2-} identifier sni cert key
+  if (( $(managed_certificate_count) > 0 )) && confirm "使用托管证书？" Y; then
+    select_managed_certificate identifier || return 1
+    cert="$CERT_DIR/${identifier}.crt"; key="$CERT_DIR/${identifier}.key"
+  else
+    prompt_value cert "证书文件绝对路径" || return 1
+    prompt_value key "私钥文件绝对路径" || return 1
+    [[ $cert == /* && $key == /* ]] || { warn "证书和私钥必须使用绝对路径。"; return 1; }
+    local managed_path managed_lexical resolved_path lexical_path path
+    managed_path=$(realpath -m -- "$CERT_DIR") || return 1
+    managed_lexical=$(realpath -ms -- "$CERT_DIR") || return 1
+    for path in "$cert" "$key"; do
+      lexical_path=$(realpath -ms -- "$path") || return 1
+      resolved_path=$(realpath -e -- "$path") || return 1
+      if [[ $resolved_path == "$managed_path" || $resolved_path == "$managed_path/"* || $lexical_path == "$managed_lexical" || $lexical_path == "$managed_lexical/"* ]]; then
+        warn "外部证书和私钥不能位于托管证书目录内。"; return 1
+      fi
+    done
+  fi
+  validate_certificate_pair "$cert" "$key" || { warn "证书无效、已过期或与私钥不匹配。"; return 1; }
+  prompt_certificate_server_name sni "$cert" || return 1
+  printf -v "$__json" '%s' "$(jq -n --arg sni "$sni" --arg cert "$cert" --arg key "$key" '{enabled:true,server_name:$sni,certificate_path:$cert,key_path:$key,min_version:"1.2"}')"
   [[ -z $__host ]] || printf -v "$__host" '%s' "$sni"
 }
 

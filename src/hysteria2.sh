@@ -22,7 +22,6 @@ hy2_port_in_default_hop_range() {
 
 hy2_port_in_any_hop_range() {
   local port=$1 range
-  init_meta 2>/dev/null || true
   while IFS= read -r range; do
     [[ -n $range ]] || continue
     hy2_port_in_range "$port" "$range" && return 0
@@ -80,7 +79,7 @@ hy2_build() {
 hy2_hop_check_conflicts() {
   local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
   new_start=${range%-*}; new_end=${range#*-}
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   while IFS=$'\t' read -r tag existing; do
     [[ -n $tag && -n $existing ]] || continue
     [[ $tag != "$except_tag" ]] || continue
@@ -97,12 +96,11 @@ hy2_hop_check_conflicts() {
 # Apply NAT rules only (meta must already be set). Called from add_inbound after apply.
 hy2_hop_apply_nat() {
   hy2_hop_sync
-  return 0
 }
 
 hy2_hop_range_for_tag() {
   local tag=$1
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r --arg tag "$tag" '.inbounds[$tag].hysteria2PortHopping.range // empty' "$META_FILE"
 }
 
@@ -118,8 +116,8 @@ hy2_hop_meta_set() {
   tmp=$(temp_file)
   jq --arg tag "$tag" --arg range "$range" --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '
     .inbounds[$tag]=((.inbounds[$tag]//{})+{updatedAt:$now}) |
-    .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"
+    .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range}' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
 }
 
@@ -127,13 +125,13 @@ hy2_hop_meta_disable() {
   local tag=$1 tmp
   init_meta
   tmp=$(temp_file)
-  jq --arg tag "$tag" 'del(.inbounds[$tag].hysteria2PortHopping)' "$META_FILE" >"$tmp"
-  install -m 600 "$tmp" "$META_FILE"
+  jq --arg tag "$tag" 'del(.inbounds[$tag].hysteria2PortHopping)' "$META_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
 }
 
 hy2_hop_enabled_count() {
-  init_meta
+  [[ -f $META_FILE ]] || { printf '0'; return; }
   [[ -f $CONFIG_FILE ]] || { printf '0'; return; }
   jq --slurpfile config "$CONFIG_FILE" '
     [.inbounds|to_entries[]?|.key as $tag|
@@ -174,10 +172,10 @@ hy2_hop_boot_service_remove() {
 }
 
 hy2_hop_boot_service_ensure() {
-  [[ -x $QUICK_COMMAND ]] || install_quick_command
+  [[ -x $QUICK_COMMAND ]] || install_quick_command || return 1
   case $(init_system) in
     systemd)
-      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service" <<EOF_UNIT
+      cat >"${SYSTEMD_UNIT_DIR}/sbctl-hy2-hop-restore.service" <<EOF_UNIT || return 1
 [Unit]
 Description=Restore sbctl Hysteria2 port hopping NAT rules
 After=network-online.target
@@ -191,19 +189,19 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF_UNIT
-      systemctl daemon-reload
-      systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || true
+      systemctl daemon-reload || return 1
+      systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || return 1
       ;;
     openrc)
-      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC'
+      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC' || return 1
 #!/sbin/openrc-run
 name="sbctl-hy2-hop-restore"
 description="Restore sbctl Hysteria2 port hopping NAT rules"
 $(printf '%s' 'depend() { need net; }')
 $(printf '%s' 'start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }')
 EOF_RC
-      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore"
-      rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || true
+      chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" || return 1
+      rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || return 1
       ;;
   esac
 }
@@ -212,28 +210,33 @@ EOF_RC
 
 hy2_hop_restore_all() {
   [[ $(uname -s) == Linux ]] || return 0
-  init_meta
   [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
   local count tag range target start end cmd
   count=$(hy2_hop_enabled_count)
   if ((count == 0)); then hy2_hop_clear_rules; return 0; fi
-  hy2_hop_ensure_backend
+  hy2_hop_ensure_backend || return 1
   if command_exists nft; then
-    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
-    nft add table inet sbctl_hy2_hop
-    nft 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }'
+    local batch rc=0
+    batch=$(temp_file) || return 1
+    if nft list table inet sbctl_hy2_hop >/dev/null 2>&1; then
+      printf '%s\n' 'delete table inet sbctl_hy2_hop' >>"$batch"
+    fi
+    printf '%s\n' 'add table inet sbctl_hy2_hop' 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }' >>"$batch"
     while IFS=$'\t' read -r tag range; do
       [[ -n $tag && -n $range ]] || continue
       target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
-      validate_port "$target" || continue
-      nft add rule inet sbctl_hy2_hop prerouting udp dport "$range" redirect to ":${target}"
+      validate_hy2_hop_range "$range" && validate_port "$target" || { rc=1; break; }
+      printf 'add rule inet sbctl_hy2_hop prerouting udp dport %s redirect to :%s\n' "$range" "$target" >>"$batch"
     done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+    if ((rc == 0)); then nft -f "$batch" || rc=1; fi
+    rm -f "$batch"
+    return "$rc"
   else
     for cmd in iptables ip6tables; do
       command_exists "$cmd" || continue
       "$cmd" -t nat -N SBCTL_HY2_HOP >/dev/null 2>&1 || true
-      "$cmd" -t nat -F SBCTL_HY2_HOP
-      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP
+      "$cmd" -t nat -F SBCTL_HY2_HOP || return 1
+      "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP || return 1
     done
     while IFS=$'\t' read -r tag range; do
       [[ -n $tag && -n $range ]] || continue
@@ -242,7 +245,7 @@ hy2_hop_restore_all() {
       start=${range%-*}; end=${range#*-}
       for cmd in iptables ip6tables; do
         command_exists "$cmd" || continue
-        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target"
+        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target" || return 1
       done
     done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
   fi
@@ -250,15 +253,28 @@ hy2_hop_restore_all() {
 
 # Sync all hop rules after CRUD operations (called from inbound.sh)
 hy2_hop_sync() {
-  hy2_hop_clear_rules
   local count
   count=$(hy2_hop_enabled_count)
   if ((count > 0)); then
-    hy2_hop_restore_all
-    hy2_hop_boot_service_ensure
+    hy2_hop_restore_all || return 1
+    hy2_hop_boot_service_ensure || return 1
   else
+    hy2_hop_clear_rules
     hy2_hop_boot_service_remove
   fi
+}
+
+# Restore the pre-change state and its runtime rules after a failed update.
+hy2_hop_rollback() {
+  local cfg=$1 meta=$2 changed=$3 had_meta=${4:-1} failed=0
+  if ((changed)); then
+    apply_candidate "$cfg" || failed=1
+  fi
+  if ((had_meta)); then install -m 600 "$meta" "$META_FILE" || failed=1
+  else rm -f "$META_FILE" || failed=1; fi
+  hy2_hop_sync || failed=1
+  ((failed == 0)) || warn "端口跳跃回滚不完整，请检查配置、metadata 和 NAT 规则。"
+  return "$failed"
 }
 
 hy2_hop_configure() {
@@ -276,7 +292,16 @@ hy2_hop_configure() {
       read -r -p "请选择: " choice || { echo; return; }
       case $choice in
         1) :;;
-        2) hy2_hop_meta_disable "$tag"; hy2_hop_sync; info "端口跳跃已关闭。"; return 0;;
+        2)
+          local old_meta old_cfg
+          old_meta=$(temp_file); old_cfg=$(temp_file)
+          cp -a "$META_FILE" "$old_meta" && cp -a "$CONFIG_FILE" "$old_cfg" || { rm -f "$old_meta" "$old_cfg"; return 1; }
+          if ! hy2_hop_meta_disable "$tag" || ! hy2_hop_sync; then
+            hy2_hop_rollback "$old_cfg" "$old_meta" 0 || true
+            rm -f "$old_meta" "$old_cfg"; return 1
+          fi
+          rm -f "$old_meta" "$old_cfg"
+          info "端口跳跃已关闭。"; return 0;;
         0) return 0;;
         *) warn "无效选项。"; return 1;;
       esac
@@ -284,37 +309,40 @@ hy2_hop_configure() {
   fi
 
   while true; do
-    prompt_value range "端口跳跃范围" "${current:-30000-50000}"
+    prompt_value range "端口跳跃范围" "${current:-30000-50000}" || return 1
     validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
     hy2_hop_check_conflicts "$range" "$tag" || continue
     break
   done
 
-  local listen_port internal_port
+  local listen_port internal_port tmp old_meta old_cfg changed=0 had_meta=0
+  old_meta=$(temp_file); old_cfg=$(temp_file)
+  if [[ -f $META_FILE ]]; then
+    cp -a "$META_FILE" "$old_meta" || { rm -f "$old_meta" "$old_cfg"; return 1; }
+    had_meta=1
+  fi
+  cp -a "$CONFIG_FILE" "$old_cfg" || { rm -f "$old_meta" "$old_cfg"; return 1; }
   listen_port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
   if hy2_port_in_range "$listen_port" "$range"; then
     warn "listen_port ${listen_port} 在跳跃范围内，需要重新选择内部端口。"
-    hy2_pick_internal_port internal_port "$range" || { warn "无法分配可用端口。"; return 1; }
-    local tmp
+    hy2_pick_internal_port internal_port "$range" || { rm -f "$old_meta" "$old_cfg"; warn "无法分配可用端口。"; return 1; }
     tmp=$(temp_file)
-    jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp"
-    if apply_candidate "$tmp"; then
-      hy2_hop_meta_set "$tag" "$range"
-      hy2_hop_sync
-      traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
-      info "Hysteria2 端口跳跃已启用：${range} -> UDP ${internal_port}（外部端口通过 NAT 重定向）"
-    else
-      rm -f "$tmp"
-      return 1
+    if ! jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp" || ! apply_candidate "$tmp"; then
+      rm -f "$tmp" "$old_meta" "$old_cfg"; return 1
     fi
     rm -f "$tmp"
-    return 0
+    changed=1
+    listen_port=$internal_port
   fi
-
-  hy2_hop_meta_set "$tag" "$range"
-  hy2_hop_sync
+  if ! hy2_hop_meta_set "$tag" "$range" || ! hy2_hop_sync; then
+    warn "端口跳跃 NAT 同步失败，正在恢复原状态。"
+    hy2_hop_rollback "$old_cfg" "$old_meta" "$changed" "$had_meta" || true
+    rm -f "$old_meta" "$old_cfg"; return 1
+  fi
+  rm -f "$old_meta" "$old_cfg"
   traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
   info "Hysteria2 端口跳跃已启用：${range} -> UDP ${listen_port}"
+
 }
 
 # Internal commands (called via dispatch)

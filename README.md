@@ -32,8 +32,7 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 - config / metadata / certs 整体备份与事务恢复
 - systemd / OpenRC 服务管理和运行时硬化
 - BBR 能力检测和受限容器保护
-- 三级卸载：仅核心、完全卸载、彻底删除
-- 系统诊断、残留扫描和资源归属保护
+- 主菜单彻底删除、残留扫描和资源归属保护
 
 ### 本机 IPv6 出站回退边界
 
@@ -41,50 +40,19 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 
 CI 使用真实 sing-box `1.13.18` 校验 fallback 配置并执行 TCP 黑洞回退测试。测试中的 `1.14` mock 只保护 JSON 生成分支，不能作为兼容性依据；未来声明支持 sing-box `1.14` 前，必须增加真实 `1.14.x` binary 的 CI 检查与集成测试。
 
-## 安装
-
-### systemd Linux
-
-```bash
-curl -fsSL https://github.com/QiuXiaoye1112/sbctl/raw/refs/heads/main/install.sh | sudo bash
-```
-
-指定 sing-box 版本：
-
-```bash
-curl -fsSL https://github.com/QiuXiaoye1112/sbctl/raw/refs/heads/main/install.sh | sudo bash -s -- 1.13.16
-```
-
-### Alpine Linux
-
-```sh
-wget -qO- https://github.com/QiuXiaoye1112/sbctl/raw/refs/heads/main/alpine/install.sh | sh
-```
-
-安装器只下载构建好的单文件 `dist/sbctl`，完成内容识别与 Bash 语法校验后才原子安装到 `/usr/local/sbin/sbctl`。服务器运行时不再依赖 `/usr/local/lib/sbctl/*.sh`，因此不会出现入口与模块版本不一致。
-
-安装完成后：
-
-```bash
-sbctl
-```
-
 ## 常用命令
 
 ```bash
 sbctl status
-sbctl update
 sbctl restart
 sbctl logs 100
-sbctl diagnose
-sbctl traffic
 sbctl traffic
 sbctl traffic period show
 sbctl traffic period set 22 18:30
 sbctl traffic enable
 sbctl traffic disable
 sbctl traffic limit enable
-sbctl traffic limit set vless 100 15
+sbctl traffic limit set vless 100 15 09:30  # 可选时间，服务器本地时间
 sbctl traffic limit show
 sbctl traffic limit remove vless
 sbctl traffic limit disable
@@ -95,8 +63,7 @@ sbctl inbound show TAG
 sbctl inbound rename OLD NEW
 sbctl inbound modify TAG
 sbctl inbound security TAG
-sbctl inbound disable TAG --yes  # 暂停入站，保留配置和流量额度
-sbctl inbound enable TAG        # 恢复入站
+sbctl inbound transport TAG   # TCP / WebSocket（REALITY 使用 TCP）
 sbctl inbound delete TAG
 
 sbctl outbound list
@@ -111,10 +78,12 @@ sbctl client list TAG
 sbctl client add TAG
 sbctl client rename TAG OLD NEW
 sbctl client rotate TAG USER
-sbctl client delete TAG USER
+sbctl client delete TAG USER --yes
 
 sbctl link TAG
+sbctl subscription [标签]     # Base64 编码的 VLESS 链接，每行一个；可指定入站
 sbctl config check
+sbctl config migrate-tags  # 显式为旧配置中未命名的入站和出站补全标签
 
 sbctl cert list
 sbctl cert issue example.com you@example.com
@@ -127,9 +96,6 @@ sbctl cert delete example.com
 sbctl backup
 sbctl restore /path/to/backup.tar.gz
 
-sbctl uninstall
-sbctl uninstall --purge
-sbctl uninstall --erase
 ```
 
 ## 流量统计
@@ -164,14 +130,6 @@ vless2               | vless      | 14332   |       6.27 GB
 流量限制依赖流量统计。限制功能启用期间不能停止流量统计，需要先关闭限制功能。清空流量记录也会把对应入站的当前周期已用流量清零并解除阻断。
 
 ## v0.4 可靠性与成熟度设计
-
-### 安装与网络
-
-- APT 使用连接超时、重试和总时限；`apt-get update` 失败时会尝试现有索引，不会无限卡在 `Waiting for headers`。
-- 仅在主机确实存在 IPv4 路由时给 APT 自动加 `Acquire::ForceIPv4=true`，不会破坏 IPv6-only 主机。
-- apk、dnf、yum、pacman、zypper 和官方 sing-box 安装流程均有执行上限。
-- 公网 IPv4 探测依次使用 ipify、AWS CheckIP、Cloudflare Trace；IPv6 使用 ipify 和 Cloudflare Trace fallback。
-- bootstrap 下载带连接超时、总时限和重试，并固定到同一个 Git commit。
 
 ### 配置与 metadata 事务
 
@@ -235,9 +193,11 @@ SBCTL_CERTBOT_ACCOUNT=ACCOUNT_ID sbctl cert issue example.com you@example.com
 - NAT/LXC/OpenVZ 等受限环境无法写 sysctl 时仅提示，不让整个菜单异常退出。
 - sbctl 写入的 BBR 配置带 `# managed by sbctl` 标记并登记 metadata。
 - 如果 `/etc/sysctl.d/99-sbctl-bbr.conf` 已存在但不属于 sbctl，启用 BBR 会拒绝覆盖。
-- `sbctl uninstall --erase` 只有确认该配置确实属于 sbctl 时才会回退运行时拥塞控制并删除文件；不会因为系统当前恰好使用 BBR 就修改其他工具或管理员配置的状态。
+- 主菜单的彻底删除 只有确认该配置确实属于 sbctl 时才会回退运行时拥塞控制并删除文件；不会因为系统当前恰好使用 BBR 就修改其他工具或管理员配置的状态。
 
 ## TLS 证书
+
+配置 TLS 时可选择托管证书，也可输入外部证书和私钥的绝对路径。选择时会拒绝位于 sbctl 托管证书目录内的外部文件及指向该目录的符号链接；该目录会整体备份和恢复。已有配置不会自动检查，请自行迁移目录内的外部文件。外部文件由用户负责权限、续期和备份，sbctl 不负责复制、续期或删除目录外的这些文件；请确认实际服务身份及服务沙箱能够读取路径，并在更新证书后按需重启服务。选择时会检查证书有效期及密钥匹配。
 
 ### 域名签发
 
@@ -304,55 +264,9 @@ sbctl restore /path/to/backup.tar.gz
 
 恢复前会检查 tar.gz 和路径穿越，再用 sing-box 校验备份配置。恢复 config、metadata、certs、traffic 后若服务或相关运行时无法恢复，会整体回滚，而不是只恢复 config。
 
-## 卸载
+## 服务管理与删除
 
-### 仅卸载核心
-
-```bash
-sbctl uninstall
-```
-
-卸载 sing-box 核心和 sbctl 管理的服务定义，保留配置、证书、sbctl、Certbot/Cloudflare 续期数据、续期任务和备份，可直接重新运行 `sbctl install`。
-
-### 完全卸载，保留备份
-
-```bash
-sbctl uninstall --purge
-```
-
-先创建最终备份；如果最终备份失败则取消 purge。之后删除 sing-box、sbctl、配置、metadata、托管证书、独立 Certbot/Cloudflare 数据和续期任务，保留 `/var/backups/sbctl/`。
-
-### 彻底删除
-
-```bash
-sbctl uninstall --erase
-```
-
-必须输入 `DELETE`。除 purge 内容外还删除 sbctl 自己的备份和带所有权标记的 BBR 配置，并执行残留扫描。
-
-目录清理会校验危险路径和 metadata 资源归属，不删除系统 Certbot、其他网站的 `/etc/letsencrypt` 或无关系统目录。
-
-## 诊断
-
-```bash
-sbctl diagnose
-```
-
-会检查：
-
-- 系统、内核、虚拟化类型
-- systemd / OpenRC
-- sing-box 版本、运行/自启状态
-- 服务硬化状态
-- 公网 IPv4 / IPv6
-- BBR
-- metadata schema
-- 流量统计状态与计数后端
-- 托管证书与自动续期数量
-- Certbot account 数量
-- Cloudflare DNS 凭据状态
-- 入站/出站数量
-- 当前 sing-box 配置有效性
+服务菜单提供启动、停止、重启、自启和日志。主菜单“卸载”进入彻底删除确认，需输入 `DELETE`；删除包括受管理资源和备份，并检查残留。资源归属和路径检查仍会保护无关数据。
 
 ## 项目结构
 
@@ -370,15 +284,13 @@ src/inbound/clients.sh           入站用户 CRUD
 src/outbound.sh                  出站与路由绑定
 src/share.sh                     分享 URI / 客户端 JSON（只读）
 src/traffic.sh                   按入站流量计数、可自定义月度展示周期、月度额度与采集任务
-src/service.sh                   sing-box 安装、服务、BBR 与诊断
-src/uninstall.sh                 三级卸载与资源归属保护
+src/service.sh                   服务管理、BBR 与资源归属辅助
+src/uninstall.sh                 彻底删除与资源归属保护
 src/menu.sh                      菜单、CLI dispatch 与 help
 scripts/build.sh                 生成单文件 dist/sbctl
 scripts/lint.sh                  语法、ShellCheck 与 diff 校验
 scripts/test.sh                  可移植的单元/集成/冒烟安全网
 dist/sbctl                       服务器实际安装的单文件发行版
-install.sh                       通用 Linux bootstrap
-alpine/install.sh                Alpine bootstrap
 architecture-audit.md            重构前架构、重复函数与写入点审计
 ```
 
@@ -398,7 +310,7 @@ SBCTL_TESTING=1 bash dist/sbctl version
 
 GitHub Actions 会：
 
-- 对主脚本、模块、安装器和测试执行 Bash/POSIX shell 语法检查；
+- 对主脚本、模块和测试执行 Bash/POSIX shell 语法检查；
 - 运行 ShellCheck 和 `git diff --check`；
 - 安装当前稳定 sing-box，以真实 `sing-box check` 执行协议回归；
 - 固定下载并校验 sing-box `1.13.18`，对本机 IPv6 fallback 执行真实配置检查和 TCP Happy Eyeballs 黑洞回退测试；

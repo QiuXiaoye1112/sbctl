@@ -475,18 +475,18 @@ _meta_template_set_outbound() {
 }
 
 list_domain_templates() {
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r '.domainTemplates.templates[]? |
     [.name,((.exact // [])|length),((.suffix // [])|length)] | @tsv' "$META_FILE"
 }
 
 domain_template_exists() {
-  init_meta
+  [[ -f $META_FILE ]] || return 1
   jq -e --arg name "$1" 'any(.domainTemplates.templates[]?; .name==$name)' "$META_FILE" >/dev/null
 }
 
 list_inbound_template_bindings() {
-  init_meta
+  [[ -f $META_FILE ]] || return 0
   jq -r --arg inbound "$1" '.domainTemplates.bindings[]? |
     select(.inbound==$inbound) | [.template,.outbound] | @tsv' "$META_FILE"
 }
@@ -816,16 +816,16 @@ prompt_outbound_tag() {
 add_outbound() {
   ensure_dependencies outbound-add; require_supported_core; ensure_config
   local choice type tag server port auth username="" password="" outbound tmp
-  choose choice "选择出站协议" "SOCKS5" "HTTP"
+  choose choice "选择出站协议" "SOCKS5" "HTTP" || return 1
   [[ $choice == 1 ]] && type=socks || type=http
-  prompt_outbound_tag tag "${type}-out-$(random_hex 2)"
-  prompt_value server "代理服务器地址"
-  prompt_value port "代理服务器端口"
+  prompt_outbound_tag tag "${type}-out-$(random_hex 2)" || return 1
+  prompt_value server "代理服务器地址" || return 1
+  prompt_value port "代理服务器端口" || return 1
   validate_port "$port" || die "端口必须为 1-65535。"
-  choose auth "认证方式" "无认证" "用户名密码"
+  choose auth "认证方式" "无认证" "用户名密码" || return 1
   if [[ $auth == 2 ]]; then
-    prompt_value username "用户名"
-    prompt_secret password "密码"
+    prompt_value username "用户名" || return 1
+    prompt_secret password "密码" || return 1
   fi
   if [[ $type == socks ]]; then
     outbound=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg user "$username" --arg pass "$password" '
@@ -838,7 +838,7 @@ add_outbound() {
   fi
   tmp=$(temp_file)
   jq --argjson outbound "$outbound" '.outbounds += [$outbound]' "$CONFIG_FILE" >"$tmp"
-  if apply_candidate "$tmp"; then info "出站 ${tag} 已添加。"; fi
+  if apply_candidate "$tmp"; then info "出站 ${tag} 已添加。"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }
 
@@ -875,7 +875,7 @@ select_outbound() {
       display_labels+=("$t")
     fi
   done
-  choose answer "选择出站" "${display_labels[@]}"
+  choose answer "选择出站" "${display_labels[@]}" || return 1
   selected=${tags[$((answer-1))]}
   if [[ $selected =~ ^local- ]]; then
     local ip=""
@@ -1137,6 +1137,15 @@ delete_outbound() {
   fi
   [[ $tag != direct ]] || { warn "direct 出站不能删除。"; return 0; }
   outbound_exists "$tag" || die "找不到出站：$tag"
+  if jq -e --arg tag "$tag" '
+    (.route.final == $tag) or
+    ((del(.route.rules) | [.. | objects | to_entries[] |
+      select((.key == "detour" or .key == "download_detour" or .key == "outbound") and .value == $tag)] | length) > 0) or
+    ([.route.rules[]? | .. | objects | select(.rules? != null) | .. | objects | select(.outbound? == $tag)] | length > 0)
+  ' "$CONFIG_FILE" >/dev/null; then
+    warn "该出站被其他配置引用，请先修改配置。"
+    return 1
+  fi
   manual_refs=$(jq -r --arg tag "$tag" "$(_sbctl_managed_domain_rule_filter)
     $(_sbctl_canonical_default_rule_filter)
     [.route.rules[]? | select(.outbound==\$tag) |
