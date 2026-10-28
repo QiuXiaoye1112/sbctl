@@ -6238,7 +6238,7 @@ wait_for_sing_box_service() {
 install_sing_box_release() {
   local requested=${1-} version arch work_dir target target_dir candidate staged backup="" meta_snapshot config_snapshot
   local service_definition="" service_snapshot=""
-  local had_old=0 had_meta=0 had_config=0 old_service_exists=0 old_active=0 old_enabled=0 had_service_definition=0 failed=0
+  local had_old=0 had_meta=0 had_config=0 old_service_exists=0 old_active=0 old_enabled=0 had_service_definition=0 failed=0 rollback_failed=0
 
   ensure_sing_box_install_target_safe || return 1
   version=$(resolve_sing_box_version "$requested") || return 1
@@ -6258,10 +6258,22 @@ install_sing_box_release() {
     had_old=1; backup=$(mktemp "${target_dir}/.sing-box.backup.XXXXXX") || { rm -rf -- "$work_dir"; return 1; }
     cp -p "$target" "$backup" || { rm -f -- "$backup"; rm -rf -- "$work_dir"; return 1; }
   fi
-  meta_snapshot=$(temp_file)
-  if [[ -f $META_FILE ]]; then cp -p "$META_FILE" "$meta_snapshot"; had_meta=1; fi
-  config_snapshot=$(temp_file)
-  if [[ -f $CONFIG_FILE ]]; then cp -p "$CONFIG_FILE" "$config_snapshot"; had_config=1; fi
+  meta_snapshot="$work_dir/meta.snapshot"
+  config_snapshot="$work_dir/config.snapshot"
+  if [[ -f $META_FILE ]]; then
+    if ! cp -p "$META_FILE" "$meta_snapshot"; then
+      rm -f -- "$backup"; rm -rf -- "$work_dir"
+      error "无法备份现有 metadata，未替换旧核心。"; return 1
+    fi
+    had_meta=1
+  fi
+  if [[ -f $CONFIG_FILE ]]; then
+    if ! cp -p "$CONFIG_FILE" "$config_snapshot"; then
+      rm -f -- "$backup"; rm -rf -- "$work_dir"
+      error "无法备份现有配置，未替换旧核心。"; return 1
+    fi
+    had_config=1
+  fi
   service_exists && old_service_exists=1
   service_is_active && old_active=1
   service_is_enabled && old_enabled=1
@@ -6270,7 +6282,12 @@ install_sing_box_release() {
     openrc) service_definition="${OPENRC_INIT_DIR}/${SERVICE_NAME}" ;;
   esac
   if [[ -n $service_definition && -f $service_definition ]]; then
-    service_snapshot=$(temp_file); cp -p "$service_definition" "$service_snapshot"; had_service_definition=1
+    service_snapshot="$work_dir/service.snapshot"
+    if ! cp -p "$service_definition" "$service_snapshot"; then
+      rm -f -- "$backup"; rm -rf -- "$work_dir"
+      error "无法备份现有服务定义，未替换旧核心。"; return 1
+    fi
+    had_service_definition=1
   fi
 
   staged=$(mktemp "${target_dir}/.sing-box.install.XXXXXX") || failed=1
@@ -6293,18 +6310,22 @@ install_sing_box_release() {
 
   if ((failed)); then
     error "新 sing-box 核心未能正常接管服务，正在回滚。"
-    rollback_sing_box_binary "$target" "$backup" "$had_old" || error "sing-box binary 自动回滚失败。"
-    if ((had_meta)); then install -m 600 "$meta_snapshot" "$META_FILE"; else rm -f "$META_FILE"; fi
-    if ((had_config)); then install -m 600 "$config_snapshot" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+    rollback_sing_box_binary "$target" "$backup" "$had_old" || rollback_failed=1
+    if ((had_meta)); then install -m 600 "$meta_snapshot" "$META_FILE" || rollback_failed=1; else rm -f "$META_FILE" || rollback_failed=1; fi
+    if ((had_config)); then install -m 600 "$config_snapshot" "$CONFIG_FILE" || rollback_failed=1; else rm -f "$CONFIG_FILE" || rollback_failed=1; fi
     if ((had_service_definition)); then
-      cp -p "$service_snapshot" "$service_definition"
-      [[ $(init_system) != systemd ]] || systemctl daemon-reload >/dev/null 2>&1 || true
+      cp -p "$service_snapshot" "$service_definition" || rollback_failed=1
+      [[ $(init_system) != systemd ]] || systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=1
     else
-      _remove_sbctl_service_definition
+      _remove_sbctl_service_definition || rollback_failed=1
     fi
-    if ((old_service_exists && old_active)); then service_restart >/dev/null 2>&1 || true; else service_stop >/dev/null 2>&1 || true; fi
-    if ((old_enabled)); then service_enable >/dev/null 2>&1 || true; else service_disable >/dev/null 2>&1 || true; fi
-    rm -f -- "$backup" "$meta_snapshot" "$config_snapshot" "$service_snapshot"; rm -rf -- "$work_dir"
+    if ((old_service_exists && old_active)); then service_restart >/dev/null 2>&1 || rollback_failed=1; else service_stop >/dev/null 2>&1 || rollback_failed=1; fi
+    if ((old_enabled)); then service_enable >/dev/null 2>&1 || rollback_failed=1; else service_disable >/dev/null 2>&1 || rollback_failed=1; fi
+    if ((rollback_failed)); then
+      error "自动回滚不完整；旧核心备份保留在 ${backup:-无}，配置和服务快照保留在 ${work_dir}。"
+    else
+      rm -f -- "$backup"; rm -rf -- "$work_dir"
+    fi
     return 1
   fi
 
