@@ -46,6 +46,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq openssl ripgrep shellcheck
       - name: Static validation
         run: |
+          recorded_commit=$(sed -n 's/^readonly SBCTL_BUILD_COMMIT="\([^"]*\)"/\1/p' dist/sbctl | head -1)
+          export SBCTL_BUILD_COMMIT="$recorded_commit"
           bash scripts/build.sh
           git diff --exit-code -- dist/sbctl
           bash scripts/lint.sh

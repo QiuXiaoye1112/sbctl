@@ -22,6 +22,7 @@ grep -Fq '支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP' <<<
 printf 'CLI smoke checks passed.\n'
 
 if [[ -x dist/sbctl ]]; then
-  [[ $(SBCTL_TESTING=1 bash ./dist/sbctl version) == 'sbctl 0.5.0' ]]
+  recorded_commit=$(sed -n 's/^readonly SBCTL_BUILD_COMMIT="\([^"]*\)"/\1/p' dist/sbctl | head -1)
+  [[ $(SBCTL_TESTING=1 bash ./dist/sbctl version) == "sbctl 0.5.0 (commit $recorded_commit)" ]]
   SBCTL_TESTING=1 bash ./dist/sbctl help | grep -Fq 'sbctl inbound add'
 fi

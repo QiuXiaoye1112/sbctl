@@ -106,7 +106,7 @@ fi
 rm -f "$SNAPSHOT_META"
 
 help=$(show_help)
-grep -Fq "uninstall --erase" <<<"$help"
+! grep -Fq "sbctl uninstall" <<<"$help"
 grep -Fq "cert renew-auto" <<<"$help"
 BASH
 

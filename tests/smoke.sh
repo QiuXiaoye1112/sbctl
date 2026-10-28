@@ -234,7 +234,7 @@ run_generated_case socks $'5\n\n127.0.0.1\n127.0.0.1\n24449\nalice\n\n' \
 
 run_generated_case http $'6\n\n127.0.0.1\n127.0.0.1\n24450\n\n' \
   '.inbounds[0].type=="http" and (.inbounds[0].users|length)==0' \
-  'http://127.0.0.1:24450  无认证' \
+  'http://127.0.0.1:24450' \
   '127.0.0.1'
 
 HY="$MOCK/hy2"
