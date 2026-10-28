@@ -223,12 +223,12 @@ _remove_backups() {
 }
 
 _scan_sbctl_residuals() {
-  local __count_var=$1 include_backups=${2:-0} count=0 path
+  local __count_var=$1 count=0 path
   local paths=("$QUICK_COMMAND" "$QUICK_SYMLINK" "$CONFIG_FILE" "$META_FILE" "$CERT_DIR" "$CERTBOT_VENV" "$CERTBOT_CONFIG_DIR" "$CERTBOT_WORK_DIR" "$CERTBOT_LOGS_DIR" \
     "$TRAFFIC_FILE" "$TRAFFIC_SYSTEMD_SERVICE" "$TRAFFIC_SYSTEMD_TIMER" "$TRAFFIC_OPENRC_SERVICE" \
     "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.service" "${SYSTEMD_UNIT_DIR}/sbctl-certbot-renew.timer" /etc/periodic/daily/sbctl-certbot-renew)
   [[ $LIB_DIR != /usr/local/lib/sbctl ]] || paths+=("$LIB_DIR")
-  ((include_backups == 0)) || paths+=("$BACKUP_DIR" /etc/sysctl.d/99-sbctl-bbr.conf)
+  paths+=("$BACKUP_DIR" /etc/sysctl.d/99-sbctl-bbr.conf)
   for path in "${paths[@]}"; do
     [[ ! -e $path && ! -L $path ]] || { printf '  ✗ 残留: %s\n' "$path"; ((count+=1)); }
   done
@@ -236,7 +236,7 @@ _scan_sbctl_residuals() {
   printf -v "$__count_var" '%s' "$count"
 }
 
-_sbctl_uninstall_level_2() {
+_sbctl_remove_all() {
   heading "删除"
   cat <<'EOF_ERASE'
 
@@ -276,7 +276,7 @@ EOF_ERASE
   fi
   cleanup_step "删除 sbctl 命令与模块" _remove_quick_command_and_libs || ((failures+=1))
   cleanup_step "删除所有备份" _remove_backups || ((failures+=1))
-  heading "残留检查"; _scan_sbctl_residuals residual 1
+  heading "残留检查"; _scan_sbctl_residuals residual
   rm -f "$SNAPSHOT_META"
   printf '执行结果：失败步骤 %d，检测残留 %d\n' "$failures" "$residual"
   ((failures == 0))
@@ -285,7 +285,7 @@ EOF_ERASE
 uninstall_sing_box() {
   ensure_dependencies uninstall
   local uninstall_confirmed=0
-  _sbctl_uninstall_level_2 || return $?
+  _sbctl_remove_all || return $?
   # Clean up Hysteria2 port hopping rules if sing-box was removed
   if ((uninstall_confirmed)) && ! sing_box_installed; then
     traffic_runtime_stop || warn "流量统计运行时未能完全停止。"

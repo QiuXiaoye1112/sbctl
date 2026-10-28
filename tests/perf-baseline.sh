@@ -198,7 +198,8 @@ echo "  ok   cache intact after failed run_menu_action"
 # ========================================================================
 echo "--- standalone build ---"
 before=$(shasum -a 256 dist/sbctl | awk '{print $1}')
-bash scripts/build.sh >/dev/null
+recorded_commit=$(sed -n 's/^readonly SBCTL_BUILD_COMMIT="\([^"]*\)"/\1/p' dist/sbctl | head -1)
+SBCTL_BUILD_COMMIT="$recorded_commit" bash scripts/build.sh >/dev/null
 after=$(shasum -a 256 dist/sbctl | awk '{print $1}')
 [[ $before == "$after" ]] || { echo '  FAIL dist/sbctl was stale' >&2; ((failures+=1)); }
 echo '  ok   dist/sbctl is reproducible'

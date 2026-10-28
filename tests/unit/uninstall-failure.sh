@@ -7,16 +7,15 @@ trap 'rm -rf "$TMP"' EXIT
 export SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/config" SBCTL_CONFIG_FILE="$TMP/config/config.json" SBCTL_META_FILE="$TMP/meta.json" SBCTL_CERT_DIR="$TMP/certs" SBCTL_BACKUP_DIR="$TMP/backups"
 source ./sbctl.sh
 write_default_config
-confirm() { return 0; }
-backup_all() { return 0; }
-traffic_remove_all() { return 1; }
+traffic_remove_all() { touch "$TMP/traffic-stop-attempted"; return 1; }
 _remove_renewal_jobs() { :; }
 _remove_managed_certificates() { touch "$TMP/certificates-removed"; }
 _remove_certbot_environment() { touch "$TMP/environment-removed"; }
 _remove_sing_box_core() { touch "$TMP/core-removed"; }
 _remove_config_and_metadata() { rm -f "$CONFIG_FILE" "$META_FILE"; }
 _remove_quick_command_and_libs() { :; }
-if _sbctl_uninstall_level_1; then exit 1; fi
+if _sbctl_remove_all <<<DELETE; then exit 1; fi
+[[ -f $TMP/traffic-stop-attempted ]]
 [[ -f $CONFIG_FILE && -f $META_FILE ]]
 [[ ! -e $TMP/environment-removed ]]
 [[ ! -e $TMP/certificates-removed && ! -e $TMP/core-removed ]]
