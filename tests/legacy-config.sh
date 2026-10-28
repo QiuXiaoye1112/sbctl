@@ -40,6 +40,7 @@ cat >"$TMP/cfg/config.json" <<'JSON'
 }
 JSON
 
+SBCTL_TESTING=1 \
 SBCTL_SING_BOX_BIN="$TMP/sing-box" \
 SBCTL_CONFIG_DIR="$TMP/cfg" \
 SBCTL_CONFIG_FILE="$TMP/cfg/config.json" \
