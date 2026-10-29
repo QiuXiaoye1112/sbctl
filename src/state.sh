@@ -178,11 +178,16 @@ backup_all() {
     mkdir -p "$BACKUP_DIR" || return 1
     : >"$BACKUP_DIR/.sbctl-owned" || return 1
   fi
+  # Record ownership before archiving metadata so the backup is self-consistent.
+  # Never claim an existing directory without our ownership marker.
+  if [[ ! -L $BACKUP_DIR && -f $BACKUP_DIR/.sbctl-owned && ! -L $BACKUP_DIR/.sbctl-owned ]]; then
+    meta_resource_register backupDir "$BACKUP_DIR" || return 1
+  fi
   mkdir -p "$(dirname "$target")" || return 1
   [[ ! -d $CERT_DIR ]] || paths+=("${CERT_DIR#/}")
   [[ ! -f $TRAFFIC_FILE ]] || paths+=("${TRAFFIC_FILE#/}")
   tar -czf "$target" -C / "${paths[@]}" || { rm -f "$target"; die "备份失败。"; }
-  chmod 600 "$target"; meta_resource_register backupDir "$BACKUP_DIR"
+  chmod 600 "$target" || return 1
   info "备份已创建：$target"
   info "提示：备份包含配置、metadata、流量记录和证书副本，不包含 Certbot 账户/lineage 数据。"
 }
@@ -216,7 +221,24 @@ restore_backup() {
   [[ ! -f $TRAFFIC_FILE ]] || { cp -a "$TRAFFIC_FILE" "$snapshot/traffic.json"; had_traffic=1; }
   if ! {
     cp -a "$temp/$extract_config" "$CONFIG_FILE" &&
-    { if [[ -f $temp/${META_FILE#/} ]]; then cp -a "$temp/${META_FILE#/}" "$META_FILE"; else rm -f "$META_FILE"; fi; } &&
+    { if [[ -f $temp/${META_FILE#/} ]]; then
+        # Resource ownership belongs to this installation, not the machine
+        # that produced the archive. Keep current records even for old backups.
+        if ((had_meta)); then
+          jq --slurpfile current "$snapshot/meta.json" \
+            '$current[0] as $local | .managedResources=($local.managedResources // {}) |
+             if ($local|has("singBox")) then .singBox=$local.singBox else del(.singBox) end' \
+            "$temp/${META_FILE#/}" >"$temp/restored-meta.json" &&
+            install -m 600 "$temp/restored-meta.json" "$META_FILE"
+        else
+          jq '.managedResources={} | del(.singBox)' "$temp/${META_FILE#/}" >"$temp/restored-meta.json" &&
+            install -m 600 "$temp/restored-meta.json" "$META_FILE"
+        fi
+      elif ((had_meta)); then
+        jq '{schema:2,inbounds:{},certificates:{},managedResources:(.managedResources // {}),migrations:{}} +
+            (if has("singBox") then {singBox:.singBox} else {} end)' \
+          "$snapshot/meta.json" >"$temp/restored-meta.json" && install -m 600 "$temp/restored-meta.json" "$META_FILE"
+      else rm -f "$META_FILE"; fi; } &&
     (init_meta) && rm -rf "$CERT_DIR" && mkdir -p "$CERT_DIR" &&
     { [[ ! -d $temp/${CERT_DIR#/} ]] || cp -a "$temp/${CERT_DIR#/}/." "$CERT_DIR/"; } &&
     { if [[ -f $temp/${TRAFFIC_FILE#/} ]]; then
