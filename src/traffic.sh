@@ -711,7 +711,7 @@ traffic_after_config_change() {
   if traffic_is_enabled; then traffic_collect || return 1; else traffic_sync_inventory || return 1; fi
   if [[ -n $old && -n $new ]]; then
     traffic_rename_records "$old" "$new" || return 1
-    traffic_is_enabled && traffic_rules_restore_serialized
+    if traffic_is_enabled; then traffic_rules_restore_serialized || return 1; fi
   elif [[ -n $old ]]; then
     traffic_remove_limit_data "$old"
   fi

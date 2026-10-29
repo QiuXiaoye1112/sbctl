@@ -278,7 +278,7 @@ sbctl backup
 sbctl restore /path/to/backup.tar.gz
 ```
 
-恢复前会检查 tar.gz 和路径穿越，再用 sing-box 校验备份配置。恢复 config、metadata、certs、traffic 后若服务或相关运行时无法恢复，会整体回滚，而不是只恢复 config。
+恢复前会检查 tar.gz 和路径穿越，再用 sing-box 校验备份配置。恢复 config、metadata、certs、traffic 后若服务或相关运行时无法恢复，会整体回滚，而不是只恢复 config。恢复时保留本机已有的受管理资源归属登记，避免旧备份或其他主机的资源路径覆盖本机安装信息。
 
 ## 服务管理与删除
 
