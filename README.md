@@ -18,7 +18,7 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 
 ## 主要能力
 
-- AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP 入站
+- AnyTLS、Hysteria2、SOCKS5、HTTP 入站
 - REALITY 与证书 TLS
 - 用户新增、重命名、删除和凭据轮换
 - SOCKS5 / HTTP / 本地地址出站与入站绑定
@@ -68,9 +68,9 @@ sbctl traffic period set 22 18:30
 sbctl traffic enable
 sbctl traffic disable
 sbctl traffic limit enable
-sbctl traffic limit set vless 100 15 09:30  # 可选时间，服务器本地时间
+sbctl traffic limit set anytls 100 15 09:30  # 可选时间，服务器本地时间
 sbctl traffic limit show
-sbctl traffic limit remove vless
+sbctl traffic limit remove anytls
 sbctl traffic limit disable
 
 sbctl inbound list
@@ -97,7 +97,7 @@ sbctl client rotate TAG USER
 sbctl client delete TAG USER --yes
 
 sbctl link TAG
-sbctl subscription [标签]     # Base64 编码的 VLESS 链接，每行一个；可指定入站
+sbctl subscription [标签]     # Base64 编码的订阅链接，每行一个；可指定入站
 sbctl config check
 sbctl config migrate-tags  # 显式为旧配置中未命名的入站和出站补全标签
 
@@ -125,8 +125,8 @@ sbctl restore /path/to/backup.tar.gz
 统计范围：2026-08-22 18:30:00 ～ 2026-09-22 18:30:00
 
 标签                 | 协议       | 端口    |       总流量
-vless                | vless      | 17225   |      12.48 GB
-vless2               | vless      | 14332   |       6.27 GB
+anytls               | anytls     | 17225   |      12.48 GB
+hy2                  | hysteria2  | 14332   |       6.27 GB
 ----------------------------------------------------------
 全部入站：18.75 GB
 ```

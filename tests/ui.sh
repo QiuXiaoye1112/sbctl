@@ -12,8 +12,8 @@ display_width width "标签"
 [[ $width == 4 ]]
 
 width=""
-display_width width "vless-test"
-[[ $width == 10 ]]
+display_width width "anytls-test"
+[[ $width == 11 ]]
 
 (
   export LC_ALL=C

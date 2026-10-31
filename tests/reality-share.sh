@@ -34,11 +34,11 @@ EOF
   cat >"$CONFIG_FILE" <<JSON
 {
   "inbounds": [{
-    "type": "vless",
-    "tag": "vless-test",
+    "type": "anytls",
+    "tag": "anytls-test",
     "listen": "0.0.0.0",
     "listen_port": 21312,
-    "users": [{"name":"user-007b","uuid":"bc49d1c8-a6be-4db7-b583-fc6c7dcb14e4","flow":"xtls-rprx-vision"}],
+    "users": [{"name":"user-007b","password":"user-password"}],
     "tls": {
       "enabled": true,
       "server_name": "www.microsoft.com",
@@ -56,15 +56,14 @@ EOF
 JSON
   sha=$(printf %s private-test | openssl dgst -sha256 -r | awk "{print \$1}")
   cat >"$META_FILE" <<JSON
-{"inbounds":{"vless-test":{"host":"192.236.223.194","realityPublicKey":"YYoeEzXUPLu5wq2RwTQpfx9hpvGuuWTWF60hp4Eklkg","realityPrivateSHA256":"$sha"}}}
+{"inbounds":{"anytls-test":{"host":"192.236.223.194","realityPublicKey":"YYoeEzXUPLu5wq2RwTQpfx9hpvGuuWTWF60hp4Eklkg","realityPrivateSHA256":"$sha"}}}
 JSON
 
-  output=$(print_share vless-test)
-  grep -Fq "vless-test 分享信息" <<<"$output"
+  output=$(print_share anytls-test)
+  grep -Fq "anytls-test 分享信息" <<<"$output"
   grep -Fq "用户: user-007b" <<<"$output"
-  grep -Fq "链接: vless://bc49d1c8-a6be-4db7-b583-fc6c7dcb14e4@192.236.223.194:21312?type=tcp&security=reality" <<<"$output"
-  grep -Fq "spx=%2F" <<<"$output"
-  grep -Fq "flow=xtls-rprx-vision" <<<"$output"
+  grep -Fq "客户端 outbound JSON" <<<"$output"
+  grep -Fq "YYoeEzXUPLu5wq2RwTQpfx9hpvGuuWTWF60hp4Eklkg" <<<"$output"
   grep -Fq -- "------------------------------------------------------------------------" <<<"$output"
 '
 

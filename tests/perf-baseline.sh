@@ -69,10 +69,10 @@ SCRIPT
 chmod +x "$TMP/bin/sed"
 
 cat >"$TMP/cfg/config.json" <<'JSON'
-{"log":{"level":"warn"},"inbounds":[{"type":"vless","tag":"v","listen":"::","listen_port":443,"users":[{"name":"u","uuid":"00000000-0000-0000-0000-000000000001","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"x.com","reality":{"enabled":true,"handshake":{"server":"m.com","server_port":443},"private_key":"k","short_id":["a"]}}},{"type":"trojan","tag":"t","listen":"::","listen_port":8443,"users":[{"name":"u","password":"p"}],"tls":{"enabled":true,"server_name":"t.com"}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
+{"log":{"level":"warn"},"inbounds":[{"type":"anytls","tag":"a","listen":"::","listen_port":443,"users":[{"name":"u","password":"p"}],"tls":{"enabled":true,"server_name":"x.com","reality":{"enabled":true,"handshake":{"server":"m.com","server_port":443},"private_key":"k","short_id":["a"]}}},{"type":"hysteria2","tag":"h","listen":"::","listen_port":8443,"users":[{"name":"u","password":"p"}],"tls":{"enabled":true,"server_name":"t.com"}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
 JSON
 cat >"$TMP/meta.json" <<'JSON'
-{"schema":2,"inbounds":{"v":{"host":"1.2.3.4"},"t":{"host":"t.com"}},"certificates":{},"managedResources":{},"migrations":{"legacyCertScanV1":true}}
+{"schema":2,"inbounds":{"a":{"host":"1.2.3.4"},"h":{"host":"t.com"}},"certificates":{},"managedResources":{},"migrations":{"legacyCertScanV1":true}}
 JSON
 
 export COUNTERS

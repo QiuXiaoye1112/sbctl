@@ -24,9 +24,9 @@ apply_mode=success
 
 seed_config() {
   write_default_config
-  jq '.inbounds += [{type:"vless",tag:"vless-edit",listen:"0.0.0.0",listen_port:443,users:[{name:"u",uuid:"00000000-0000-0000-0000-000000000001",flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:"old.example.com",reality:{enabled:true,handshake:{server:"target.example.com",server_port:443},private_key:"old-private",short_id:["oldsid"]}}}]' "$CONFIG_FILE" >"$CONFIG_FILE.tmp"
+  jq '.inbounds += [{type:"anytls",tag:"anytls-edit",listen:"0.0.0.0",listen_port:443,users:[{name:"u",password:"secret"}],tls:{enabled:true,server_name:"old.example.com",reality:{enabled:true,handshake:{server:"target.example.com",server_port:443},private_key:"old-private",short_id:["oldsid"]}}}]' "$CONFIG_FILE" >"$CONFIG_FILE.tmp"
   mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-  printf '%s\n' '{"schema":2,"inbounds":{"vless-edit":{"host":"old-client.example.com","realityPublicKey":"old-public"}},"certificates":{},"managedResources":{},"migrations":{}}' >"$META_FILE"
+  printf '%s\n' '{"schema":2,"inbounds":{"anytls-edit":{"host":"old-client.example.com","realityPublicKey":"old-public"}},"certificates":{},"managedResources":{},"migrations":{}}' >"$META_FILE"
 }
 
 prompt_value() {
@@ -71,25 +71,25 @@ apply_candidate_with_meta() {
 }
 
 seed_config
-modify_inbound_basic vless-edit
-jq -e '.inbounds[]|select(.tag=="vless-edit")|.listen=="127.0.0.1" and .listen_port==24443' "$CONFIG_FILE" >/dev/null
-[[ $(jq -r '.inbounds["vless-edit"].host' "$META_FILE") == basic-client.example.com ]]
+modify_inbound_basic anytls-edit
+jq -e '.inbounds[]|select(.tag=="anytls-edit")|.listen=="127.0.0.1" and .listen_port==24443' "$CONFIG_FILE" >/dev/null
+[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == basic-client.example.com ]]
 
 seed_config
 active_case=security
 security_choice=1
-modify_inbound_security vless-edit
-jq -e '.inbounds[]|select(.tag=="vless-edit")|.tls.reality.enabled==true and .tls.server_name=="reality2.example.com" and .users[0].flow=="xtls-rprx-vision"' "$CONFIG_FILE" >/dev/null
-[[ $(jq -r '.inbounds["vless-edit"].host' "$META_FILE") == old-client.example.com ]]
-[[ $(jq -r '.inbounds["vless-edit"].realityPublicKey' "$META_FILE") == new-public ]]
+modify_inbound_security anytls-edit
+jq -e '.inbounds[]|select(.tag=="anytls-edit")|.tls.reality.enabled==true and .tls.server_name=="reality2.example.com"' "$CONFIG_FILE" >/dev/null
+[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == old-client.example.com ]]
+[[ $(jq -r '.inbounds["anytls-edit"].realityPublicKey' "$META_FILE") == new-public ]]
 
 seed_config
 active_case=security
 security_choice=2
-modify_inbound_security vless-edit
-jq -e '.inbounds[]|select(.tag=="vless-edit")|.tls.enabled==true and (.tls.reality.enabled // false)==false and .tls.server_name=="cert2.example.com" and .tls.certificate_path=="/tmp/cert2.crt" and .users[0].flow==""' "$CONFIG_FILE" >/dev/null
-[[ $(jq -r '.inbounds["vless-edit"].host' "$META_FILE") == cert2.example.com ]]
-[[ $(jq -r '.inbounds["vless-edit"].realityPublicKey // empty' "$META_FILE") == '' ]]
+modify_inbound_security anytls-edit
+jq -e '.inbounds[]|select(.tag=="anytls-edit")|.tls.enabled==true and (.tls.reality.enabled // false)==false and .tls.server_name=="cert2.example.com" and .tls.certificate_path=="/tmp/cert2.crt"' "$CONFIG_FILE" >/dev/null
+[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == cert2.example.com ]]
+[[ $(jq -r '.inbounds["anytls-edit"].realityPublicKey // empty' "$META_FILE") == '' ]]
 
 seed_config
 init_meta
@@ -97,22 +97,12 @@ before_config=$(sha256sum "$CONFIG_FILE")
 before_meta=$(sha256sum "$META_FILE")
 active_case=basic
 apply_mode=failure
-! modify_inbound_basic vless-edit
+! modify_inbound_basic anytls-edit
 [[ $(sha256sum "$CONFIG_FILE") == "$before_config" ]]
 [[ $(sha256sum "$META_FILE") == "$before_meta" ]]
 
 seed_config
 apply_mode=success
-if modify_inbound_transport vless-edit; then printf 'REALITY transport edit must fail\n' >&2; exit 1; fi
-security_choice=2
-active_case=security
-modify_inbound_security vless-edit
-apply_candidate() { install -m 600 "$1" "$CONFIG_FILE"; }
-prompt_value() { printf -v "$1" '%s' '/test'; }
-modify_inbound_transport vless-edit
-jq -e '.inbounds[0] | .transport.type=="ws" and .transport.path=="/test" and .users[0].uuid=="00000000-0000-0000-0000-000000000001"' "$CONFIG_FILE" >/dev/null
-security_choice=1
-modify_inbound_transport vless-edit
-jq -e '.inbounds[0] | has("transport")|not' "$CONFIG_FILE" >/dev/null
+if modify_inbound_transport anytls-edit; then printf 'AnyTLS transport edit must fail\n' >&2; exit 1; fi
 
 printf 'inbound modify checks passed.\n'

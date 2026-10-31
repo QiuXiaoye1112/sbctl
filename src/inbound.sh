@@ -57,8 +57,8 @@ prompt_port() {
 
 build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host="" tls="" reality_public="" name="" password="" uuid="" flow="" obfs_choice="" obfs_password="" up="" down="" selected_hop_range="" transport_json="null" ws_path=""
-  choose choice "选择入站协议" "AnyTLS" "VLESS" "Hysteria2" "Trojan" "SOCKS5" "HTTP" || return 1
-  case $choice in 1) type=anytls;; 2) type=vless;; 3) type=hysteria2;; 4) type=trojan;; 5) type=socks;; 6) type=http;; esac
+  choose choice "选择入站协议" "AnyTLS" "Hysteria2" "SOCKS5" "HTTP" || return 1
+  case $choice in 1) type=anytls;; 2) type=hysteria2;; 3) type=socks;; 4) type=http;; esac
   prompt_tag tag "${type}-$(random_hex 2)" || return 1
   prompt_value listen "监听地址" "0.0.0.0" || return 1
 
@@ -67,25 +67,6 @@ build_inbound() {
   #   REALITY    → prompt_public_host (client_host may differ from SNI)
   #   no TLS     → prompt_public_host
   case $type in
-    vless)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" "无加密" || return 1
-      case $choice in
-        1) build_reality_tls tls reality_public || return 1; prompt_public_host client_host || return 1 ;;
-        2) build_certificate_tls tls client_host || return 1 ;;
-        3) tls=""; prompt_public_host client_host || return 1 ;;
-      esac
-      prompt_port port || return 1
-      # Transport: REALITY forces tcp; cert-TLS/none can choose tcp/ws
-      if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
-        local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws" || return 1
-        if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)" || return 1
-          validate_websocket_path "$ws_path" || return 1
-          transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
-        fi
-      fi
-      ;;
     anytls)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if [[ $choice == 1 ]]; then
@@ -95,26 +76,6 @@ build_inbound() {
         build_certificate_tls tls client_host || return 1
       fi
       prompt_port port || return 1
-      ;;
-    trojan)
-      choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
-      if [[ $choice == 1 ]]; then
-        build_reality_tls tls reality_public || return 1
-        prompt_public_host client_host || return 1
-      else
-        build_certificate_tls tls client_host || return 1
-      fi
-      prompt_port port || return 1
-      # Transport: REALITY forces tcp; cert-TLS can choose tcp/ws
-      if protocol_capability "$type" transport && [[ $choice != 1 ]]; then
-        local tp_choice
-        choose tp_choice "传输方式" "tcp" "ws" || return 1
-        if [[ $tp_choice == 2 ]]; then
-          prompt_value ws_path "WebSocket 路径" "/$(random_hex 8)" || return 1
-          validate_websocket_path "$ws_path" || return 1
-          transport_json=$(jq -n --arg path "$ws_path" --arg host "$client_host" '{type:"ws",path:$path,headers:{Host:$host}}')
-        fi
-      fi
       ;;
     hysteria2)
       build_certificate_tls tls client_host || return 1
@@ -146,12 +107,6 @@ build_inbound() {
       prompt_secret password "AnyTLS 密码" "$(random_password)" || return 1
       protocol_build_anytls "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls"
       ;;
-    vless)
-      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
-      uuid=$(generate_uuid)
-      if [[ -n $tls ]] && jq -e '.reality.enabled == true' <<<"$tls" >/dev/null 2>&1; then flow=xtls-rprx-vision; else flow=""; fi
-      protocol_build_vless "$__json" "$tag" "$listen" "$port" "$name" "$uuid" "$flow" "$tls" "$transport_json"
-      ;;
     hysteria2)
       prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
       prompt_secret password "Hysteria2 密码" "$(random_password)" || return 1
@@ -160,11 +115,6 @@ build_inbound() {
       choose obfs_choice "QUIC 混淆" "关闭" "Salamander" || return 1
       if [[ $obfs_choice == 2 ]]; then prompt_secret obfs_password "混淆密码" "$(random_password)" || return 1; fi
       hy2_build "$__json" "$tag" "$listen" "$port" "$name" "$password" "$up" "$down" "$obfs_password" "$tls"
-      ;;
-    trojan)
-      prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
-      prompt_secret password "Trojan 密码" "$(random_password)" || return 1
-      protocol_build_trojan "$__json" "$tag" "$listen" "$port" "$name" "$password" "$tls" "$transport_json"
       ;;
     socks|http)
       prompt_optional name "用户名（留空=无认证）" || return 1
@@ -343,7 +293,7 @@ modify_inbound_security() {
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   case $type in
-    anytls|vless|trojan)
+    anytls)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public || return 1; else build_certificate_tls tls host || return 1; fi
       ;;
@@ -360,10 +310,7 @@ modify_inbound_security() {
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
     (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
-    if $tls.reality.enabled==true then (.inbounds[]|select(.tag==$tag)) |= del(.transport) else . end |
-    if $type=="vless" then
-      (.inbounds[]|select(.tag==$tag)|.users) |= map(.flow=(if $tls.reality.enabled==true then "xtls-rprx-vision" else "" end))
-    else . end' "$CONFIG_FILE" >"$tmp"
+    if $tls.reality.enabled==true then (.inbounds[]|select(.tag==$tag)) |= del(.transport) else . end' "$CONFIG_FILE" >"$tmp"
   build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
   if apply_candidate_with_meta "$tmp" "$meta_tmp"; then info "入站 ${tag} 的安全方式已更新。"; else rc=$?; fi
   rm -f "$tmp" "$meta_tmp"
@@ -380,7 +327,7 @@ modify_inbound_transport() {
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  [[ $type == vless || $type == trojan ]] || { error "${type} 不支持此传输编辑。"; return 1; }
+  if ! protocol_capability "$type" transport; then error "${type} 不支持此传输编辑。"; return 1; fi
   if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
     error "REALITY 入站仅支持 TCP；请先修改安全方式。"; return 1
   fi

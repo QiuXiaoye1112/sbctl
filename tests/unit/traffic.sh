@@ -23,7 +23,7 @@ source ./sbctl.sh
 write_default_config
 candidate=$(temp_file)
 jq '.inbounds=[
-  {"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]},
+  {"type":"anytls","tag":"anytls","listen":"0.0.0.0","listen_port":17225,"users":[]},
   {"type":"socks","tag":"socks","listen":"0.0.0.0","listen_port":5000,"users":[]},
   {"type":"hysteria2","tag":"hy2","listen":"0.0.0.0","listen_port":24443,"users":[]}
 ]' "$CONFIG_FILE" >"$candidate"
@@ -65,18 +65,18 @@ jq -e '.limitsEnabled==false' "$TRAFFIC_FILE" >/dev/null
 
 # Existing client-side totals are converted once, including quota usage.
 tmp=$(temp_file)
-jq '.periodsSeeded=true | .inbounds.vless={protocol:"vless",port:17225,daily:{"2026-08-24":100},cycles:{"2026-08-01 00:00:00":100},limit:{quotaBytes:1000,usedBytes:30}}' "$TRAFFIC_FILE" >"$tmp"
+jq '.periodsSeeded=true | .inbounds.anytls={protocol:"anytls",port:17225,daily:{"2026-08-24":100},cycles:{"2026-08-01 00:00:00":100},limit:{quotaBytes:1000,usedBytes:30}}' "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 traffic_sync_inventory
 traffic_sync_inventory
-jq -e '.accountingMultiplier==2 and .inbounds.vless.daily["2026-08-24"]==200 and .inbounds.vless.cycles["2026-08-01 00:00:00"]==200 and .inbounds.vless.limit.usedBytes==60 and .inbounds.vless.limit.quotaBytes==1000' "$TRAFFIC_FILE" >/dev/null
+jq -e '.accountingMultiplier==2 and .inbounds.anytls.daily["2026-08-24"]==200 and .inbounds.anytls.cycles["2026-08-01 00:00:00"]==200 and .inbounds.anytls.limit.usedBytes==60 and .inbounds.anytls.limit.quotaBytes==1000' "$TRAFFIC_FILE" >/dev/null
 tmp=$(temp_file); traffic_default_json >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 
 # Collection adds one sample to the current daily bucket and resets rules only
 # after the file was committed. Backend functions are mocked at this boundary.
 traffic_set_enabled true
-MOCK_COUNTERS=$'vless\t1073741824\nsocks\t2048\nhy2\t4096'
+MOCK_COUNTERS=$'anytls\t1073741824\nsocks\t2048\nhy2\t4096'
 RESTORE_CALLS=0
 traffic_read_counters() { printf '%s\n' "$MOCK_COUNTERS"; }
 traffic_rules_restore() { RESTORE_CALLS=$((RESTORE_CALLS + 1)); }
@@ -86,7 +86,7 @@ jq -e '
   .enabled==true and
   .limitsEnabled==false and
   .accountingMultiplier==2 and
-  .inbounds.vless.daily["2026-08-24"]==2147483648 and
+  .inbounds.anytls.daily["2026-08-24"]==2147483648 and
   .inbounds.socks.daily["2026-08-24"]==4096 and
   .inbounds.hy2.daily["2026-08-24"]==8192
 ' "$TRAFFIC_FILE" >/dev/null
@@ -99,34 +99,34 @@ output=$(traffic_show 2026-08-01 2026-08-24)
 grep -Fq '统计范围：2026-08-01 ～ 2026-08-24' <<<"$output"
 grep -Fq '2.00 GB' <<<"$output"
 grep -Fq '全部入站：2.00 GB' <<<"$output"
-vless_line=$(grep -n '^vless[[:space:]]' <<<"$output" | cut -d: -f1)
+anytls_line=$(grep -n '^anytls[[:space:]]' <<<"$output" | cut -d: -f1)
 socks_line=$(grep -n '^socks[[:space:]]' <<<"$output" | cut -d: -f1)
 hy2_line=$(grep -n '^hy2[[:space:]]' <<<"$output" | cut -d: -f1)
-[[ $vless_line -lt $socks_line && $socks_line -lt $hy2_line ]]
+[[ $anytls_line -lt $socks_line && $socks_line -lt $hy2_line ]]
 # jq 1.6 parses `end` as a keyword, so date range filters must not expose it
 # as a jq variable even though newer jq releases accept it in some contexts.
 ! grep -Eq -- '--arg(json)?[[:space:]]+end([[:space:]]|$)' src/traffic.sh
 
 # Entries before the current period are removed, while the current period remains queryable.
 tmp=$(temp_file)
-jq '.inbounds.vless.daily += {"2026-07-31":100,"2026-08-01":200}' "$TRAFFIC_FILE" >"$tmp"
+jq '.inbounds.anytls.daily += {"2026-07-31":100,"2026-08-01":200}' "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 traffic_sync_inventory
 jq -e '
-  (.inbounds.vless.daily["2026-07-31"] == null) and
-  .inbounds.vless.daily["2026-08-01"]==200
+  (.inbounds.anytls.daily["2026-07-31"] == null) and
+  .inbounds.anytls.daily["2026-08-01"]==200
 ' "$TRAFFIC_FILE" >/dev/null
 
 # A rename preserves and merges daily history under the new inbound tag.
 tmp=$(temp_file)
-jq '(.inbounds[]|select(.tag=="vless")|.tag)="vless-new"' "$CONFIG_FILE" >"$tmp"
+jq '(.inbounds[]|select(.tag=="anytls")|.tag)="anytls-new"' "$CONFIG_FILE" >"$tmp"
 mv -f "$tmp" "$CONFIG_FILE"
 traffic_sync_inventory
-traffic_rename_records vless vless-new
+traffic_rename_records anytls anytls-new
 jq -e '
-  (.inbounds.vless == null) and
-  .inbounds["vless-new"].daily["2026-08-24"]==2147483648 and
-  .inbounds["vless-new"].daily["2026-08-01"]==200
+  (.inbounds.anytls == null) and
+  .inbounds["anytls-new"].daily["2026-08-24"]==2147483648 and
+  .inbounds["anytls-new"].daily["2026-08-01"]==200
 ' "$TRAFFIC_FILE" >/dev/null
 
 # Deleted inbounds keep their retained history and are marked for display.
@@ -161,13 +161,14 @@ traffic_set_enabled false
 archive="${TRAFFIC_FILE%/*}/traffic-backup.tar.gz"
 backup_all "$archive" >/dev/null
 tmp=$(temp_file)
-jq '.inbounds["vless-new"].daily["2026-08-24"]=1' "$TRAFFIC_FILE" >"$tmp"
+jq '.inbounds["anytls-new"].daily["2026-08-24"]=1' "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 confirm() { return 0; }
 restart_service_checked() { return 0; }
 hy2_hop_sync() { return 0; }
+validate_candidate() { return 0; }
 restore_backup "$archive" >/dev/null
-jq -e '.inbounds["vless-new"].daily["2026-08-24"]==2147483648' "$TRAFFIC_FILE" >/dev/null
+jq -e '.inbounds["anytls-new"].daily["2026-08-24"]==2147483648' "$TRAFFIC_FILE" >/dev/null
 BASH
 
 # Monthly limits start at the exact creation time, retain that anchor when the
@@ -187,7 +188,7 @@ set -Eeuo pipefail
 source ./sbctl.sh
 write_default_config
 tmp=$(temp_file)
-jq '.inbounds=[{"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
+jq '.inbounds=[{"type":"anytls","tag":"anytls","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
 mv -f "$tmp" "$CONFIG_FILE"
 traffic_set_backend nft
 traffic_set_enabled true
@@ -201,25 +202,25 @@ traffic_limits_are_enabled
 traffic_limits_disable >/dev/null
 ! traffic_limits_are_enabled
 traffic_limits_enable >/dev/null
-traffic_limit_set vless 1 7 >/dev/null
+traffic_limit_set anytls 1 7 >/dev/null
 jq -e '
   .limitsEnabled==true and
-  .inbounds.vless.limit.quotaBytes==1073741824 and
-  .inbounds.vless.limit.usedBytes==0 and
-  .inbounds.vless.limit.cycleStart=="2026-08-07 18:00:00" and
-  .inbounds.vless.limit.cycleEnd=="2026-09-07 18:00:00"
+  .inbounds.anytls.limit.quotaBytes==1073741824 and
+  .inbounds.anytls.limit.usedBytes==0 and
+  .inbounds.anytls.limit.cycleStart=="2026-08-07 18:00:00" and
+  .inbounds.anytls.limit.cycleEnd=="2026-09-07 18:00:00"
 ' "$TRAFFIC_FILE" >/dev/null
 output=$(traffic_limits_show)
 grep -Fq '功能：已启用  ·  已设置：1  ·  已禁用：0' <<<"$output"
 grep -Fq '流量  0 B / 1.00 GB  (0.00%)' <<<"$output"
 grep -Fq '周期  2026-08-07 18:00 → 09-07 18:00' <<<"$output"
 
-MOCK_COUNTERS=$'vless\t268435456\n'
+MOCK_COUNTERS=$'anytls\t268435456\n'
 traffic_collect
-! traffic_limit_is_blocked vless
-MOCK_COUNTERS=$'vless\t268435456\n'
+! traffic_limit_is_blocked anytls
+MOCK_COUNTERS=$'anytls\t268435456\n'
 traffic_collect
-traffic_limit_is_blocked vless
+traffic_limit_is_blocked anytls
 output=$(traffic_limits_show)
 grep -Fq '已设置：1  ·  已禁用：1' <<<"$output"
 grep -Fq '100.00%' <<<"$output"
@@ -230,10 +231,10 @@ grep -Fq '流量限制：已启用' <<<"$output"
 MOCK_COUNTERS=""
 traffic_limits_disable >/dev/null
 ! traffic_limits_are_enabled
-! traffic_limit_is_blocked vless
-jq -e '.inbounds.vless.limit.usedBytes==1073741824' "$TRAFFIC_FILE" >/dev/null
+! traffic_limit_is_blocked anytls
+jq -e '.inbounds.anytls.limit.usedBytes==1073741824' "$TRAFFIC_FILE" >/dev/null
 traffic_limits_enable >/dev/null
-traffic_limit_is_blocked vless
+traffic_limit_is_blocked anytls
 ! traffic_disable 2>/dev/null
 traffic_is_enabled
 
@@ -241,30 +242,30 @@ traffic_is_enabled
 SBCTL_TRAFFIC_NOW='2026-08-20 12:34:56'
 SBCTL_TRAFFIC_TODAY=2026-08-20
 MOCK_COUNTERS=""
-traffic_limit_set vless 2 7 >/dev/null
+traffic_limit_set anytls 2 7 >/dev/null
 jq -e '
-  .inbounds.vless.limit.quotaBytes==2147483648 and
-  .inbounds.vless.limit.usedBytes==1073741824 and
-  .inbounds.vless.limit.cycleStart=="2026-08-07 18:00:00" and
-  .inbounds.vless.limit.cycleEnd=="2026-09-07 18:00:00"
+  .inbounds.anytls.limit.quotaBytes==2147483648 and
+  .inbounds.anytls.limit.usedBytes==1073741824 and
+  .inbounds.anytls.limit.cycleStart=="2026-08-07 18:00:00" and
+  .inbounds.anytls.limit.cycleEnd=="2026-09-07 18:00:00"
 ' "$TRAFFIC_FILE" >/dev/null
 
 # Changing the schedule keeps usage while updating the next reset.
-traffic_limit_set vless 2 31 09:30 >/dev/null
-jq -e '.inbounds.vless.limit | .usedBytes==1073741824 and .anchorTime=="09:30:00" and .cycleEnd=="2026-08-31 09:30:00"' "$TRAFFIC_FILE" >/dev/null
-! traffic_limit_set vless 2 31 25:00 >/dev/null 2>&1
-traffic_limit_set vless 2 7 18:00 >/dev/null
+traffic_limit_set anytls 2 31 09:30 >/dev/null
+jq -e '.inbounds.anytls.limit | .usedBytes==1073741824 and .anchorTime=="09:30:00" and .cycleEnd=="2026-08-31 09:30:00"' "$TRAFFIC_FILE" >/dev/null
+! traffic_limit_set anytls 2 31 25:00 >/dev/null 2>&1
+traffic_limit_set anytls 2 7 18:00 >/dev/null
 
 SBCTL_TRAFFIC_NOW='2026-09-07 17:59:59'
 SBCTL_TRAFFIC_TODAY=2026-09-07
 traffic_sync_inventory
-jq -e '.inbounds.vless.limit.usedBytes==1073741824' "$TRAFFIC_FILE" >/dev/null
+jq -e '.inbounds.anytls.limit.usedBytes==1073741824' "$TRAFFIC_FILE" >/dev/null
 SBCTL_TRAFFIC_NOW='2026-09-07 18:00:00'
 traffic_sync_inventory
 jq -e '
-  .inbounds.vless.limit.usedBytes==0 and
-  .inbounds.vless.limit.cycleStart=="2026-09-07 18:00:00" and
-  .inbounds.vless.limit.cycleEnd=="2026-10-07 18:00:00"
+  .inbounds.anytls.limit.usedBytes==0 and
+  .inbounds.anytls.limit.cycleStart=="2026-09-07 18:00:00" and
+  .inbounds.anytls.limit.cycleEnd=="2026-10-07 18:00:00"
 ' "$TRAFFIC_FILE" >/dev/null
 BASH_LIMITS
 
@@ -283,9 +284,9 @@ nft() {
   [[ $1 == -j ]] || return 1
   cat <<'JSON'
 {"nftables":[
-  {"rule":{"comment":"sbctl-traffic:vless","expr":[{"counter":{"packets":2,"bytes":100}}]}},
-  {"rule":{"comment":"sbctl-traffic:count:vless","expr":[{"counter":{"packets":3,"bytes":250}}]}},
-  {"rule":{"comment":"sbctl-traffic:block:vless","expr":[{"counter":{"packets":4,"bytes":999}}]}},
+  {"rule":{"comment":"sbctl-traffic:anytls","expr":[{"counter":{"packets":2,"bytes":100}}]}},
+  {"rule":{"comment":"sbctl-traffic:count:anytls","expr":[{"counter":{"packets":3,"bytes":250}}]}},
+  {"rule":{"comment":"sbctl-traffic:block:anytls","expr":[{"counter":{"packets":4,"bytes":999}}]}},
   {"rule":{"comment":"unrelated","expr":[{"counter":{"packets":1,"bytes":999}}]}},
   {"rule":{"comment":"sbctl-traffic:socks","expr":[{"counter":{"packets":1,"bytes":50}}]}}
 ]}
@@ -293,7 +294,7 @@ JSON
 }
 rows=$(traffic_read_nft_counters | sort)
 grep -Fxq $'socks\t50' <<<"$rows"
-grep -Fxq $'vless\t350' <<<"$rows"
+grep -Fxq $'anytls\t350' <<<"$rows"
 ! traffic_clear_nft_rules 2>/dev/null
 BASH_NFT
 
@@ -319,7 +320,7 @@ nft() {
   {"table":{"family":"inet","name":"sbctl_traffic"}},
   {"chain":{"family":"inet","table":"sbctl_traffic","name":"input"}},
   {"chain":{"family":"inet","table":"sbctl_traffic","name":"output"}},
-  {"rule":{"family":"inet","table":"sbctl_traffic","chain":"input","comment":"sbctl-traffic:count:vless","expr":[]}}
+  {"rule":{"family":"inet","table":"sbctl_traffic","chain":"input","comment":"sbctl-traffic:count:anytls","expr":[]}}
 ]}
 JSON
     return 0
@@ -353,12 +354,12 @@ iptables-save() { printf "*filter\nCOMMIT\n"; }
 iptables-restore() { cat >/dev/null; }
 write_default_config
 tmp=$(temp_file)
-jq '.inbounds=[{"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
+jq '.inbounds=[{"type":"anytls","tag":"anytls","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
 mv -f "$tmp" "$CONFIG_FILE"
 traffic_init_file
 tmp=$(temp_file)
 jq '.enabled=true | .limitsEnabled=true | .backend="iptables" |
-  .inbounds.vless={protocol:"vless",port:17225,deleted:false,daily:{},limit:{enabled:true,quotaBytes:100,
+  .inbounds.anytls={protocol:"anytls",port:17225,deleted:false,daily:{},limit:{enabled:true,quotaBytes:100,
     anchorDay:24,anchorTime:"12:00:00",cycleStart:"2026-08-24 12:00:00",cycleEnd:"2026-09-24 12:00:00",usedBytes:100}}' \
   "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
@@ -369,8 +370,8 @@ iptables() {
     cat <<'TABLE'
 Chain mock (1 references)
  pkts bytes target prot opt in out source destination
- 1 100 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 /* sbctl-traffic:count:vless */
- 1 999 DROP tcp -- * * 0.0.0.0/0 0.0.0.0/0 /* sbctl-traffic:block:vless */
+ 1 100 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 /* sbctl-traffic:count:anytls */
+ 1 999 DROP tcp -- * * 0.0.0.0/0 0.0.0.0/0 /* sbctl-traffic:block:anytls */
 TABLE
     return 0
   fi
@@ -378,13 +379,13 @@ TABLE
   local IFS=' '; printf '%s\n' "$*" >>"$CASE_DIR/iptables-calls"
 }
 rows=$(traffic_read_iptables_counters)
-[[ $(grep -Fc $'vless\t100' <<<"$rows") == 2 ]]
-! grep -Fq $'vless\t999' <<<"$rows"
+[[ $(grep -Fc $'anytls\t100' <<<"$rows") == 2 ]]
+! grep -Fq $'anytls\t999' <<<"$rows"
 
 IPTABLES_MODE=write
 traffic_restore_iptables_rules
-drop_line=$(grep -nF -- '--comment sbctl-traffic:block:vless -j DROP' "$CASE_DIR/iptables-calls" | head -1 | cut -d: -f1)
-count_line=$(grep -nF -- '--comment sbctl-traffic:count:vless -j RETURN' "$CASE_DIR/iptables-calls" | head -1 | cut -d: -f1)
+drop_line=$(grep -nF -- '--comment sbctl-traffic:block:anytls -j DROP' "$CASE_DIR/iptables-calls" | head -1 | cut -d: -f1)
+count_line=$(grep -nF -- '--comment sbctl-traffic:count:anytls -j RETURN' "$CASE_DIR/iptables-calls" | head -1 | cut -d: -f1)
 [[ -n $drop_line && -n $count_line && $drop_line -lt $count_line ]]
 BASH_IPTABLES
 
@@ -411,14 +412,14 @@ source ./sbctl.sh
 write_default_config
 tmp=$(temp_file)
 jq '.inbounds=[
-  {"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]},
+  {"type":"anytls","tag":"anytls","listen":"0.0.0.0","listen_port":17225,"users":[]},
   {"type":"socks","tag":"socks","listen":"0.0.0.0","listen_port":5000,"users":[]},
   {"type":"hysteria2","tag":"hy2","listen":"0.0.0.0","listen_port":24443,"users":[]}
 ]' "$CONFIG_FILE" >"$tmp"; mv -f "$tmp" "$CONFIG_FILE"
 traffic_set_backend nft
 traffic_init_file
 tmp=$(temp_file)
-jq '.limitsEnabled=true | .inbounds.vless={protocol:"vless",port:17225,deleted:false,daily:{},limit:{enabled:true,quotaBytes:100,anchorDay:24,anchorTime:"12:00:00",cycleStart:"2026-08-24 12:00:00",cycleEnd:"2026-09-24 12:00:00",usedBytes:100}}' "$TRAFFIC_FILE" >"$tmp"
+jq '.limitsEnabled=true | .inbounds.anytls={protocol:"anytls",port:17225,deleted:false,daily:{},limit:{enabled:true,quotaBytes:100,anchorDay:24,anchorTime:"12:00:00",cycleStart:"2026-08-24 12:00:00",cycleEnd:"2026-09-24 12:00:00",usedBytes:100}}' "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 
 nft() {
@@ -427,9 +428,9 @@ nft() {
   local IFS=' '; printf '%s\n' "$*" >>"$CASE_DIR/nft-calls"
 }
 traffic_rules_restore
-grep -Fq 'add rule inet sbctl_traffic input tcp dport 17225 drop comment "sbctl-traffic:block:vless"' "$CASE_DIR/nft-calls"
-grep -Fq 'add rule inet sbctl_traffic output tcp sport 17225 drop comment "sbctl-traffic:block:vless"' "$CASE_DIR/nft-calls"
-grep -Fq 'add rule inet sbctl_traffic input tcp dport 17225 counter comment "sbctl-traffic:count:vless"' "$CASE_DIR/nft-calls"
+grep -Fq 'add rule inet sbctl_traffic input tcp dport 17225 drop comment "sbctl-traffic:block:anytls"' "$CASE_DIR/nft-calls"
+grep -Fq 'add rule inet sbctl_traffic output tcp sport 17225 drop comment "sbctl-traffic:block:anytls"' "$CASE_DIR/nft-calls"
+grep -Fq 'add rule inet sbctl_traffic input tcp dport 17225 counter comment "sbctl-traffic:count:anytls"' "$CASE_DIR/nft-calls"
 grep -Fq 'add rule inet sbctl_traffic input tcp dport 5000 counter comment "sbctl-traffic:count:socks"' "$CASE_DIR/nft-calls"
 grep -Fq 'add rule inet sbctl_traffic input udp dport 5000 counter comment "sbctl-traffic:count:socks"' "$CASE_DIR/nft-calls"
 grep -Fq 'add rule inet sbctl_traffic input udp dport 24443 counter comment "sbctl-traffic:count:hy2"' "$CASE_DIR/nft-calls"
@@ -493,34 +494,34 @@ set -Eeuo pipefail
 source ./sbctl.sh
 write_default_config
 tmp=$(temp_file)
-jq '.inbounds=[{"type":"vless","tag":"vless","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
+jq '.inbounds=[{"type":"anytls","tag":"anytls","listen":"0.0.0.0","listen_port":17225,"users":[]}]' "$CONFIG_FILE" >"$tmp"
 mv -f "$tmp" "$CONFIG_FILE"
 traffic_init_file
 tmp=$(temp_file)
-jq '.inbounds.vless={protocol:"vless",port:17225,deleted:false,daily:{"2026-08-21":100,"2026-08-22":200,"2026-08-24":300},limit:{enabled:true,quotaBytes:1000,resetDay:7,anchorDay:7,anchorTime:"09:00:00",cycleStart:"2026-08-07 09:00:00",cycleEnd:"2026-09-07 09:00:00",usedBytes:600}}' "$TRAFFIC_FILE" >"$tmp"
+jq '.inbounds.anytls={protocol:"anytls",port:17225,deleted:false,daily:{"2026-08-21":100,"2026-08-22":200,"2026-08-24":300},limit:{enabled:true,quotaBytes:1000,resetDay:7,anchorDay:7,anchorTime:"09:00:00",cycleStart:"2026-08-07 09:00:00",cycleEnd:"2026-09-07 09:00:00",usedBytes:600}}' "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 traffic_period_set 22 18:30 >/dev/null
 ! traffic_period_set 22 18:30:15 2>/dev/null
 [[ $(traffic_period_start '2026-08-22 18:29:59') == '2026-07-22 18:30:00' ]]
 [[ $(traffic_period_start '2026-08-22 18:30:00') == '2026-08-22 18:30:00' ]]
 [[ $(traffic_period_bounds '2026-08-24 12:00:00') == $'2026-08-22 18:30:00\t2026-09-22 18:30:00' ]]
-jq -e '.inbounds.vless.cycles["2026-08-22 18:30:00"]==500 and .inbounds.vless.limit.anchorDay==7 and .inbounds.vless.limit.usedBytes==600' "$TRAFFIC_FILE" >/dev/null
+jq -e '.inbounds.anytls.cycles["2026-08-22 18:30:00"]==500 and .inbounds.anytls.limit.anchorDay==7 and .inbounds.anytls.limit.usedBytes==600' "$TRAFFIC_FILE" >/dev/null
 output=$(traffic_show)
 grep -Fq '统计范围：2026-08-22 18:30:00 ～ 2026-09-22 18:30:00' <<<"$output"
 grep -Fq '全部入站：500 B' <<<"$output"
-MOCK_COUNTERS=$'vless\t50'
+MOCK_COUNTERS=$'anytls\t50'
 traffic_read_counters() { printf '%s\n' "$MOCK_COUNTERS"; }
 traffic_rules_restore() { :; }
 traffic_set_enabled true
 tmp=$(temp_file)
-jq '.inbounds.vless.limit.cycleStart="2026-09-07 09:00:00" | .inbounds.vless.limit.cycleEnd="2026-10-07 09:00:00" | .inbounds.vless.limit.usedBytes=600' "$TRAFFIC_FILE" >"$tmp"
+jq '.inbounds.anytls.limit.cycleStart="2026-09-07 09:00:00" | .inbounds.anytls.limit.cycleEnd="2026-10-07 09:00:00" | .inbounds.anytls.limit.usedBytes=600' "$TRAFFIC_FILE" >"$tmp"
 install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
 SBCTL_TRAFFIC_NOW='2026-09-22 18:29:59'
 SBCTL_TRAFFIC_TODAY=2026-09-22
 traffic_collect
 SBCTL_TRAFFIC_NOW='2026-09-22 18:30:00'
 traffic_collect
-jq -e '.inbounds.vless.cycles["2026-08-22 18:30:00"]==null and .inbounds.vless.cycles["2026-09-22 18:30:00"]==100 and .inbounds.vless.daily["2026-09-22"]==100 and (.inbounds.vless.daily|length)==1 and .inbounds.vless.limit.usedBytes==800' "$TRAFFIC_FILE" >/dev/null
+jq -e '.inbounds.anytls.cycles["2026-08-22 18:30:00"]==null and .inbounds.anytls.cycles["2026-09-22 18:30:00"]==100 and .inbounds.anytls.daily["2026-09-22"]==100 and (.inbounds.anytls.daily|length)==1 and .inbounds.anytls.limit.usedBytes==800' "$TRAFFIC_FILE" >/dev/null
 [[ $(traffic_period_start '2026-02-28 23:59:59') == '2026-02-22 18:30:00' ]]
 traffic_period_set 31 00:00 >/dev/null
 [[ $(traffic_period_bounds '2026-02-28 23:59:59') == $'2026-02-28 00:00:00\t2026-03-31 00:00:00' ]]

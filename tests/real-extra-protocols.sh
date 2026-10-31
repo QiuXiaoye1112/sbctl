@@ -18,35 +18,12 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/key.pem" -out "$T/cert.pem
 openssl s_server -quiet -accept "127.0.0.1:$tls_port" -cert "$T/cert.pem" -key "$T/key.pem" >"$T/tls.log" 2>&1 & tls_pid=$!
 printf 'extra-ok\n' >"$T/index.html"
 python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$T" >"$T/http.log" 2>&1 & http_pid=$!
-for mode in trojan-reality anytls-reality trojan-ws; do
+for mode in anytls-reality; do
   protocol=${mode%-*}
   jq -n --arg type "$protocol" --argjson port "$server_port" --arg cert "$T/cert.pem" --arg key "$T/key.pem" '{inbounds:[{type:$type,tag:"test",listen:"127.0.0.1",listen_port:$port,users:[{name:"user",password:"test-password"}],tls:{enabled:true,server_name:"example.test",certificate_path:$cert,key_path:$key}}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' >"$CONFIG_FILE"
-  if [[ $mode == *-reality ]]; then
-    jq --arg private "$private" --argjson target "$tls_port" '.inbounds[0].tls |= (del(.certificate_path,.key_path) + {reality:{enabled:true,handshake:{server:"127.0.0.1",server_port:$target},private_key:$private,short_id:["01234567"]}})' "$CONFIG_FILE" >"$T/tmp"; mv "$T/tmp" "$CONFIG_FILE"
-  else
-    jq '.inbounds[0].transport={type:"ws",path:"/test",headers:{Host:"example.test"}}' "$CONFIG_FILE" >"$T/tmp"; mv "$T/tmp" "$CONFIG_FILE"
-  fi
+  jq --arg private "$private" --argjson target "$tls_port" '.inbounds[0].tls |= (del(.certificate_path,.key_path) + {reality:{enabled:true,handshake:{server:"127.0.0.1",server_port:$target},private_key:$private,short_id:["01234567"]}})' "$CONFIG_FILE" >"$T/tmp"; mv "$T/tmp" "$CONFIG_FILE"
   jq -n --arg public "$public" --arg sha "$sha" '{inbounds:{test:{host:"127.0.0.1",realityPublicKey:$public,realityPrivateSHA256:$sha}}}' >"$META_FILE"
-  if [[ $mode == anytls-reality ]]; then
-    print_share test | sed -n '/^客户端 outbound JSON: /,$p' | sed '1s/^客户端 outbound JSON: //' | sed '/^------------------------------------------------------------------------/,$d' >"$T/outbound.json"
-  else
-    link=$(print_share test | sed -n 's/^链接: //p')
-    python3 - "$link" "$mode" "$T/cert.pem" "$T/outbound.json" <<'PY'
-import json,sys
-from urllib.parse import urlsplit,parse_qs,unquote
-u=urlsplit(sys.argv[1]); q=parse_qs(u.query); mode=sys.argv[2]
-assert u.scheme=='trojan'
-out={'type':'trojan','tag':'proxy','server':u.hostname,'server_port':u.port,'password':unquote(u.username),'tls':{'enabled':True,'server_name':q['sni'][0]}}
-if mode.endswith('reality'):
-    assert q['security']==['reality']
-    out['tls'].update(utls={'enabled':True,'fingerprint':q['fp'][0]},reality={'enabled':True,'public_key':q['pbk'][0],'short_id':q['sid'][0]})
-else:
-    assert q['type']==['ws'] and q['security']==['tls']
-    out['tls']['certificate_path']=sys.argv[3]
-    out['transport']={'type':'ws','path':q['path'][0],'headers':{'Host':q['host'][0]}}
-with open(sys.argv[4],'w') as f: json.dump(out,f)
-PY
-  fi
+  print_share test | sed -n '/^客户端 outbound JSON: /,$p' | sed '1s/^客户端 outbound JSON: //' | sed '/^------------------------------------------------------------------------/,$d' >"$T/outbound.json"
   jq -n --argjson port "$client_port" --slurpfile out "$T/outbound.json" '{inbounds:[{type:"socks",listen:"127.0.0.1",listen_port:$port}],outbounds:[$out[0]],route:{final:"proxy"}}' >"$T/client.json"
   "$REAL_BIN" run -c "$CONFIG_FILE" >"$T/server.log" 2>&1 & server_pid=$!
   "$REAL_BIN" run -c "$T/client.json" >"$T/client.log" 2>&1 & client_pid=$!

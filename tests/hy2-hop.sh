@@ -64,7 +64,7 @@ bash -c '
   choose() {
     local __var=$1 prompt=$2
     case $prompt in
-      "选择入站协议") printf -v "$__var" "%s" 3 ;;   # Hysteria2
+      "选择入站协议") printf -v "$__var" "%s" 2 ;;   # Hysteria2
       "端口模式") printf -v "$__var" "%s" 1 ;;        # 普通端口
       "QUIC 混淆") printf -v "$__var" "%s" 1 ;;        # 关闭
     esac
@@ -113,7 +113,7 @@ bash -c '
   choose() {
     local __var=$1 prompt=$2
     case $prompt in
-      "选择入站协议") printf -v "$__var" "%s" 3 ;;   # Hysteria2
+      "选择入站协议") printf -v "$__var" "%s" 2 ;;   # Hysteria2
       "端口模式") printf -v "$__var" "%s" 2 ;;        # 端口跳跃
       "QUIC 混淆") printf -v "$__var" "%s" 1 ;;        # 关闭
     esac
@@ -161,7 +161,7 @@ bash -c '
   choose() {
     local __var=$1 prompt=$2
     case $prompt in
-      "选择入站协议") printf -v "$__var" "%s" 3 ;;
+      "选择入站协议") printf -v "$__var" "%s" 2 ;;
       "端口模式") printf -v "$__var" "%s" 2 ;;      # hopping
     esac
   }

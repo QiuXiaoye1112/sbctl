@@ -12,7 +12,7 @@ client_exists() {
 add_client() {
   ensure_dependencies client-add; ensure_config
   local tag=${1-} type name password uuid flow user tmp
-  [[ -n $tag ]] || select_inbound tag '^(anytls|vless|hysteria2|trojan|socks|http|mixed)$' || return 0
+  [[ -n $tag ]] || select_inbound tag '^(anytls|hysteria2|socks|http|mixed)$' || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   while true; do
     prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
@@ -20,11 +20,7 @@ add_client() {
     break
   done
   case $type in
-    vless)
-      uuid=$(generate_uuid)
-      flow=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[0].flow // empty' "$CONFIG_FILE")
-      user=$(jq -n --arg name "$name" --arg uuid "$uuid" --arg flow "$flow" '{name:$name,uuid:$uuid,flow:$flow}') ;;
-    anytls|hysteria2|trojan)
+    anytls|hysteria2)
       prompt_secret password "密码" "$(random_password)" || return 1
       user=$(jq -n --arg name "$name" --arg password "$password" '{name:$name,password:$password}') ;;
     socks|http|mixed)
@@ -46,13 +42,7 @@ list_clients() {
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
   heading "${tag} 用户"
   case $type in
-    vless)
-      while IFS=$'\t' read -r name cred; do
-        ((i+=1))
-        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
-      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.uuid]|@tsv' "$CONFIG_FILE")
-      ;;
-    anytls|hysteria2|trojan)
+    anytls|hysteria2)
       while IFS=$'\t' read -r name cred; do
         ((i+=1))
         printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
@@ -116,13 +106,8 @@ rotate_client_credential() {
   [[ -n $name ]] || { select_client name "$tag" || return 0; }
   client_exists "$tag" "$name" || die "找不到用户：${name}"
   tmp=$(temp_file)
-  if [[ $type == vless ]]; then
-    value=$(generate_uuid)
-    jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.uuid)=$value' "$CONFIG_FILE" >"$tmp"
-  else
-    value=$(random_password)
-    jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
-  fi
+  value=$(random_password)
+  jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then info "新凭据：${value}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
 }

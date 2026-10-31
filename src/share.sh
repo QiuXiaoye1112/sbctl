@@ -10,25 +10,10 @@ print_share_entry() {
   printf '用户: %s\n%s: %s\n' "$label" "$field" "$value"
 }
 
-share_transport_query() {
-  local tag=$1 security=$2 sni=$3 transport_type transport_path transport_host query
-  transport_type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.type // "tcp"' "$CONFIG_FILE")
-  query="type=$(url_encode "$transport_type")"
-  if [[ $security != none ]]; then
-    query+="&security=$(url_encode "$security")&sni=$(url_encode "$sni")"
-  fi
-  if [[ $transport_type == ws ]]; then
-    transport_path=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.path // empty' "$CONFIG_FILE")
-    transport_host=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.transport.headers.Host // empty' "$CONFIG_FILE")
-    query+="&host=$(url_encode "$transport_host")&path=$(url_encode "$transport_path")"
-  fi
-  printf '%s' "$query"
-}
-
 print_share() {
   # Does NOT call ensure_config — caller validates config once at entry.
   [[ -f $CONFIG_FILE ]] || { warn "配置不存在。"; return 1; }
-  local tag=${1-} filter=${2-} type host uri_host port name value flow sni public sid security tls_enabled obfs obfs_password link json
+  local tag=${1-} filter=${2-} type host uri_host port name value sni public sid security tls_enabled obfs obfs_password link json
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
@@ -39,57 +24,6 @@ print_share() {
   heading "${tag} 分享信息"
 
   case $type in
-    vless)
-      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
-      tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
-      if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-        security=reality
-        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 1; }
-        sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
-      elif [[ $tls_enabled == true ]]; then
-        security=tls
-      else
-        security=none
-      fi
-      while IFS=$'\t' read -r name value flow; do
-        [[ -z $filter || $name == "$filter" ]] || continue
-        if [[ $security == reality ]]; then
-          link="vless://${value}@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
-        elif [[ $security == tls ]]; then
-          link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
-        else
-          link="vless://${value}@${uri_host}:${port}?$(share_transport_query "$tag" none "")"
-        fi
-        [[ -n $flow ]] && link+="&flow=$(url_encode "$flow")"
-        link+="#$(url_encode "${tag}-${name}")"
-        print_share_entry "$name" "链接" "$link"
-      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.uuid,(.flow//"")]|@tsv' "$CONFIG_FILE")
-      ;;
-
-    trojan)
-      sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name // empty' "$CONFIG_FILE")
-      tls_enabled=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled // false' "$CONFIG_FILE")
-      if jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.enabled==true' "$CONFIG_FILE" >/dev/null; then
-        security=reality
-        public=$(reality_public_key "$tag") || { warn "无法获得 REALITY 公钥。"; return 1; }
-        sid=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.reality.short_id[0]' "$CONFIG_FILE")
-      elif [[ $tls_enabled == true ]]; then
-        security=tls
-      else
-        warn "Trojan 入站未启用 TLS/REALITY，无法生成分享链接。"; return 0
-      fi
-      while IFS=$'\t' read -r name value; do
-        [[ -z $filter || $name == "$filter" ]] || continue
-        if [[ $security == reality ]]; then
-          link="trojan://$(url_encode "$value")@${uri_host}:${port}?type=tcp&security=reality&sni=$(url_encode "$sni")&fp=chrome&pbk=$(url_encode "$public")&sid=$(url_encode "$sid")&spx=%2F"
-        else
-          link="trojan://$(url_encode "$value")@${uri_host}:${port}?$(share_transport_query "$tag" tls "$sni")"
-        fi
-        link+="#$(url_encode "${tag}-${name}")"
-        print_share_entry "$name" "链接" "$link"
-      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]|[.name,.password]|@tsv' "$CONFIG_FILE")
-      ;;
-
     hysteria2)
       jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true' "$CONFIG_FILE" >/dev/null || { warn "Hysteria2 必须启用 TLS。"; return 0; }
       sni=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.server_name' "$CONFIG_FILE")
@@ -152,22 +86,21 @@ print_all_share() {
   return "$failed"
 }
 
-# Match xrayctl's subscription scope: only VLESS URIs, one per line.
 print_subscription() {
   ensure_config
   local selected=${1-} tag line output links=''
-  if [[ -n $selected ]] && ! jq -e --arg tag "$selected" '.inbounds[] | select(.tag==$tag and .type=="vless")' "$CONFIG_FILE" >/dev/null; then
-    warn "找不到可订阅的 VLESS 入站：$selected"
+  if [[ -n $selected ]] && ! jq -e --arg tag "$selected" '.inbounds[] | select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; then
+    warn "找不到可订阅的入站：$selected"
     return 1
   fi
   while IFS= read -r tag; do
     output=$(print_share "$tag") || return 1
     while IFS= read -r line; do
-      [[ $line == '链接: vless://'* ]] || continue
+      [[ $line == '链接: '* ]] || continue
       links+="${line#链接: }"$'\n'
     done <<<"$output"
-  done < <(jq -r --arg selected "$selected" '.inbounds[] | select(.type=="vless" and ($selected=="" or .tag==$selected)) | .tag' "$CONFIG_FILE")
-  [[ -n $links ]] || { warn "没有可生成订阅的 VLESS 链接。"; return 1; }
+  done < <(jq -r --arg selected "$selected" '.inbounds[] | select($selected=="" or .tag==$selected) | .tag' "$CONFIG_FILE")
+  [[ -n $links ]] || { warn "没有可生成订阅的链接。"; return 1; }
   printf '%s' "$links" | base64 | tr -d '\n'
   printf '\n'
 }

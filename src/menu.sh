@@ -14,7 +14,7 @@ manage_inbound_menu() {
     printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
 
     case $type in
-      anytls|vless|trojan|hysteria2)
+      anytls|hysteria2)
         if [[ $security == tls ]]; then
           printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 证书管理\n5) 查看 JSON\n0) 返回列表\n'
         else
@@ -84,9 +84,7 @@ modify_inbound_menu() {
     if [[ $type == hysteria2 ]]; then
       printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
     else
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n'
-      [[ $type == vless || $type == trojan ]] && printf '4) 修改传输方式\n'
-      printf '0) 返回\n'
+      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
     fi
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
@@ -99,7 +97,7 @@ modify_inbound_menu() {
          pause;;
       2) run_menu_action modify_inbound_basic "$current_tag"; pause;;
       3) run_menu_action modify_inbound_security "$current_tag"; pause;;
-      4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; vless|trojan) run_menu_action modify_inbound_transport "$current_tag";; *) warn "无效选项。";; esac; pause;;
+      4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; *) warn "无效选项。";; esac; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac
@@ -549,7 +547,7 @@ sbctl - sing-box Linux 管理器
   sbctl client delete [标签] [用户] [--yes]
 
   sbctl link [标签] [用户]           输出分享信息/客户端 JSON
-  sbctl subscription [标签]          输出 Base64 VLESS 订阅
+  sbctl subscription [标签]          输出 Base64 订阅
   sbctl config check|show|edit|migrate-tags
   sbctl cert list
   sbctl cert issue [域名/IP] [邮箱]
@@ -570,7 +568,7 @@ sbctl - sing-box Linux 管理器
   - 公网 IP 证书使用 Certbot 5.4+ short-lived profile + HTTP 验证。
   - Certbot 使用 /opt/sbctl/certbot 独立环境，不污染系统 Certbot。
 
-支持入站: AnyTLS、VLESS、Hysteria2、Trojan、SOCKS5、HTTP
+支持入站: AnyTLS、Hysteria2、SOCKS5、HTTP
 出站: SOCKS5/HTTP 代理、本地出口
 EOF_HELP
 }

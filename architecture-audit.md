@@ -140,7 +140,7 @@ graph TD
 | `src/state.sh` | engine config/transaction、compat migration、core metadata、ops backup/restore |
 | `src/security.sh` | reality validator、inbound 中 REALITY/TLS builder |
 | `src/certificate.sh` | certificate、certmeta、certops、cloudflare、cert_guard 最终实现 |
-| `src/protocols.sh` | 普通协议 capability 与 VLESS/AnyTLS/Trojan/SOCKS/HTTP builders |
+| `src/protocols.sh` | 普通协议 capability 与 AnyTLS/SOCKS/HTTP builders |
 | `src/hysteria2.sh` | HY2 builder、hy2_hop、hy2_nft、protocols 中端口跳跃 helper |
 | `src/inbound.sh` | inbound CRUD/选择/显示与 clients/rename_client |
 | `src/outbound.sh` | outbound（基本原样） |

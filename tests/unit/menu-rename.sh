@@ -6,7 +6,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export SBCTL_TESTING=1 SBCTL_CONFIG_FILE="$TMP/config.json"
 source ./sbctl.sh
-printf '%s\n' '{"inbounds":[{"tag":"old","type":"vless","listen_port":1234,"users":[]}],"outbounds":[]}' >"$CONFIG_FILE"
+printf '%s\n' '{"inbounds":[{"tag":"old","type":"anytls","listen_port":1234,"users":[]}],"outbounds":[]}' >"$CONFIG_FILE"
 clear_screen() { :; }
 pause() { :; }
 run_menu_action() {
@@ -25,7 +25,7 @@ INPUT
 )
 [[ $output == *'修改入站信息 · new'* ]]
 [[ $output == *'入站 · new'* ]]
-printf '%s\n' '{"inbounds":[{"tag":"old","type":"vless","listen_port":1234,"users":[]}],"outbounds":[]}' >"$CONFIG_FILE"
+printf '%s\n' '{"inbounds":[{"tag":"old","type":"anytls","listen_port":1234,"users":[]}],"outbounds":[]}' >"$CONFIG_FILE"
 run_menu_action() { :; }
 output=$(manage_inbound_menu old <<'INPUT'
 3

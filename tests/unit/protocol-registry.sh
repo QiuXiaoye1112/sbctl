@@ -6,7 +6,7 @@ cd "$ROOT"
 
 SBCTL_TESTING=1 source ./sbctl.sh
 
-expected=(anytls vless hysteria2 trojan socks http)
+expected=(anytls hysteria2 socks http)
 actual=()
 while IFS= read -r protocol; do actual+=("$protocol"); done < <(protocol_list)
 [[ ${#actual[@]} == ${#expected[@]} ]]
@@ -18,8 +18,8 @@ for protocol in "${actual[@]}"; do
 done
 
 declare -F protocol_build_anytls >/dev/null
-declare -F protocol_build_vless >/dev/null
-declare -F protocol_build_trojan >/dev/null
+! declare -F protocol_build_vless >/dev/null
+! declare -F protocol_build_trojan >/dev/null
 declare -F hy2_build >/dev/null
 declare -F protocol_build_proxy >/dev/null
 declare -F print_share >/dev/null
@@ -38,8 +38,8 @@ done
 ! protocol_capability hysteria2 reality
 ! protocol_capability hysteria2 transport
 
-for capability in tls reality users certificate transport tcp; do protocol_capability vless "$capability"; done
-for capability in tls reality users certificate transport tcp; do protocol_capability trojan "$capability"; done
+! protocol_capability vless tcp
+! protocol_capability trojan tcp
 for capability in tls reality users certificate tcp; do protocol_capability anytls "$capability"; done
 
 ! protocol_capability socks tls

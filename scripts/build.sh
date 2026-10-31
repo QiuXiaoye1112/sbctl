@@ -18,7 +18,7 @@ trap 'rm -f "$candidate"' EXIT
 sed '/^# BEGIN MODULE LOADER$/,$d' sbctl.sh >"$candidate"
 source_commit=${SBCTL_BUILD_COMMIT:-$(git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)}
 [[ $source_commit =~ ^[a-zA-Z0-9._-]+$ ]] || { printf 'invalid build commit\n' >&2; exit 1; }
-sed -i "s/^readonly SBCTL_BUILD_COMMIT=.*/readonly SBCTL_BUILD_COMMIT=\"$source_commit\"/" "$candidate"
+sed "s/^readonly SBCTL_BUILD_COMMIT=.*/readonly SBCTL_BUILD_COMMIT=\"$source_commit\"/" "$candidate" >"${candidate}.tmp" && mv -f "${candidate}.tmp" "$candidate"
 printf '\n# Built from modular sources by scripts/build.sh.\n' >>"$candidate"
 for module in "${MODULES[@]}"; do
   source_file="src/${module}.sh"

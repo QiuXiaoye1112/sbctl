@@ -11,7 +11,7 @@ sh -n alpine/install.sh
 grep -q '^build_inbound()' src/inbound.sh
 grep -q '^restore_backup()' src/state.sh
 grep -q '^build_reality_tls()' src/security.sh
-grep -q '"AnyTLS" "VLESS" "Hysteria2" "Trojan"' src/inbound.sh
+grep -q '"AnyTLS" "Hysteria2" "SOCKS5" "HTTP"' src/inbound.sh
 grep -q 'META_FILE="${SBCTL_META_FILE:-/var/lib/sbctl/meta.json}"' sbctl.sh
 grep -q -- '-c ${CONFIG_FILE}' src/service.sh
 
@@ -114,6 +114,7 @@ EOF
 
 CLIENT="$MOCK/client"
 mkdir -p "$CLIENT"
+SBCTL_TESTING=1 \
 SBCTL_SING_BOX_BIN="$MOCK/sing-box" \
 SBCTL_CONFIG_DIR="$CLIENT/cfg" \
 SBCTL_CONFIG_FILE="$CLIENT/cfg/config.json" \
@@ -126,21 +127,24 @@ bash -c '
   print_share(){ :; }
   write_default_config
   tmp=$(temp_file)
-  jq ".inbounds += [{type:\"vless\",tag:\"vless-test\",listen:\"::\",listen_port:24446,users:[{name:\"base\",uuid:\"22222222-2222-4222-8222-222222222222\",flow:\"\"}]}]" "$CONFIG_FILE" >"$tmp"
+  jq ".inbounds += [{type:\"anytls\",tag:\"anytls-test\",listen:\"::\",listen_port:24446,users:[{name:\"base\",password:\"pass-base\"}],tls:{enabled:true,server_name:\"example.com\"}}]" "$CONFIG_FILE" >"$tmp"
   mv "$tmp" "$CONFIG_FILE"
-  meta_set_host vless-test 1.2.3.4
-  add_client vless-test <<<"alice"
-  client_exists vless-test alice
-  old=$(jq -r ".inbounds[]|select(.tag==\"vless-test\")|.users[]|select(.name==\"alice\")|.uuid" "$CONFIG_FILE")
-  [[ $old == 11111111-1111-4111-8111-111111111111 ]]
+  meta_set_host anytls-test 1.2.3.4
+  add_client anytls-test <<'EOF'
+alice
+secretpass
+EOF
+  client_exists anytls-test alice
+  old=$(jq -r ".inbounds[]|select(.tag==\"anytls-test\")|.users[]|select(.name==\"alice\")|.password" "$CONFIG_FILE")
+  [[ -n $old ]]
   tmp=$(temp_file)
-  jq "(.inbounds[]|select(.tag==\"vless-test\")|.users[]|select(.name==\"alice\")|.uuid)=\"33333333-3333-4333-8333-333333333333\"" "$CONFIG_FILE" >"$tmp"
+  jq "(.inbounds[]|select(.tag==\"anytls-test\")|.users[]|select(.name==\"alice\")|.password)=\"new-password\"" "$CONFIG_FILE" >"$tmp"
   mv "$tmp" "$CONFIG_FILE"
-  rotate_client_credential vless-test alice
-  [[ $(jq -r ".inbounds[]|select(.tag==\"vless-test\")|.users[]|select(.name==\"alice\")|.uuid" "$CONFIG_FILE") == 11111111-1111-4111-8111-111111111111 ]]
+  rotate_client_credential anytls-test alice
+  [[ $(jq -r ".inbounds[]|select(.tag==\"anytls-test\")|.users[]|select(.name==\"alice\")|.password" "$CONFIG_FILE") != "new-password" ]]
   confirm(){ return 0; }
-  delete_client vless-test alice
-  ! client_exists vless-test alice
+  delete_client anytls-test alice
+  ! client_exists anytls-test alice
 
   tmp=$(temp_file)
   jq ".inbounds += [{type:\"anytls\",tag:\"reality-test\",listen:\"::\",listen_port:24447,users:[{name:\"u\",password:\"p\"}],tls:{enabled:true,server_name:\"www.microsoft.com\",reality:{enabled:true,handshake:{server:\"www.microsoft.com\",server_port:443},private_key:\"priv_test\",short_id:[\"0123abcd\"]}}}]" "$CONFIG_FILE" >"$tmp"
@@ -175,7 +179,7 @@ bash -c '
   printf old >"$CERT_DIR/kept.key"
   traffic_init_file
   tmp=$(temp_file)
-  jq ".inbounds.test={protocol:\"vless\",port:12345,deleted:false,daily:{\"2026-08-24\":4096}}" "$TRAFFIC_FILE" >"$tmp"
+  jq ".inbounds.test={protocol:\"anytls\",port:12345,deleted:false,daily:{\"2026-08-24\":4096}}" "$TRAFFIC_FILE" >"$tmp"
   install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
   archive="$SBCTL_BACKUP_DIR/test.tar.gz"
   backup_all "$archive"
@@ -219,20 +223,12 @@ run_generated_case anytls $'1\n\n\n1\n\n\n1.2.3.4\n24443\n\n\n' \
   '.inbounds[0].type=="anytls" and .inbounds[0].tls.reality.enabled==true' \
   '"type": "anytls"'
 
-run_generated_case vless $'2\n\n\n1\n\n\n1.2.3.4\n24444\n\n' \
-  '.inbounds[0].type=="vless" and .inbounds[0].users[0].flow=="xtls-rprx-vision" and .inbounds[0].tls.reality.enabled==true' \
-  'security=reality'
-
-run_generated_case trojan $'4\n\n\n1\n\n\n1.2.3.4\n24448\n\n\n' \
-  '.inbounds[0].type=="trojan" and .inbounds[0].tls.reality.enabled==true' \
-  'security=reality'
-
-run_generated_case socks $'5\n\n127.0.0.1\n127.0.0.1\n24449\nalice\n\n' \
+run_generated_case socks $'3\n\n127.0.0.1\n127.0.0.1\n24449\nalice\n\n' \
   '.inbounds[0].type=="socks" and .inbounds[0].users[0].username=="alice"' \
   '@127.0.0.1:24449' \
   '127.0.0.1'
 
-run_generated_case http $'6\n\n127.0.0.1\n127.0.0.1\n24450\n\n' \
+run_generated_case http $'4\n\n127.0.0.1\n127.0.0.1\n24450\n\n' \
   '.inbounds[0].type=="http" and (.inbounds[0].users|length)==0' \
   'http://127.0.0.1:24450' \
   '127.0.0.1'
@@ -254,7 +250,7 @@ bash -c '
   detect_public_ipv4(){ return 1; }
   detect_public_ipv6(){ return 1; }
   add_inbound <<EOF2
-3
+2
 
 
 1
@@ -284,9 +280,6 @@ if command -v sing-box >/dev/null 2>&1; then
   SID=0123abcd
   cat >"$REAL/anytls-reality.json" <<JSON
 {"log":{"level":"warn","timestamp":true},"inbounds":[{"type":"anytls","tag":"anytls-in","listen":"::","listen_port":24443,"users":[{"name":"test","password":"test-password"}],"tls":{"enabled":true,"server_name":"www.microsoft.com","reality":{"enabled":true,"handshake":{"server":"www.microsoft.com","server_port":443},"private_key":"$PRIVATE","short_id":["$SID"]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
-JSON
-  cat >"$REAL/vless-reality.json" <<JSON
-{"log":{"level":"warn","timestamp":true},"inbounds":[{"type":"vless","tag":"vless-in","listen":"::","listen_port":24444,"users":[{"name":"test","uuid":"$UUID","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"www.microsoft.com","reality":{"enabled":true,"handshake":{"server":"www.microsoft.com","server_port":443},"private_key":"$PRIVATE","short_id":["$SID"]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}
 JSON
   cat >"$REAL/hy2-tls.json" <<JSON
 {"log":{"level":"warn","timestamp":true},"inbounds":[{"type":"hysteria2","tag":"hy2-in","listen":"::","listen_port":24445,"users":[{"name":"test","password":"test-password"}],"obfs":{"type":"salamander","password":"obfs-password"},"tls":{"enabled":true,"server_name":"example.com","certificate_path":"$REAL/certs/example.com.crt","key_path":"$REAL/certs/example.com.key"}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}

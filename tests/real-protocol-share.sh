@@ -13,7 +13,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/key.pem" -out "$T/cert.pem
 IFS=' ' read -r server_port client_port http_port < <(python3 -c 'import socket; s=[socket.socket() for _ in range(3)]; [x.bind(("127.0.0.1",0)) for x in s]; print(*(x.getsockname()[1] for x in s))')
 printf 'protocol-ok\n' >"$T/index.html"
 python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$T" >"$T/http.log" 2>&1 & http_pid=$!
-for protocol in trojan anytls hysteria2; do
+for protocol in anytls hysteria2; do
   jq -n --arg type "$protocol" --argjson port "$server_port" --arg cert "$T/cert.pem" --arg key "$T/key.pem" '{inbounds:[{type:$type,tag:"test",listen:"127.0.0.1",listen_port:$port,users:[{name:"user",password:"test-password"}],tls:{enabled:true,server_name:"example.test",certificate_path:$cert,key_path:$key}}],outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}}' >"$CONFIG_FILE"
   [[ $protocol != hysteria2 ]] || jq '.inbounds[0].obfs={type:"salamander",password:"obfs-password"}' "$CONFIG_FILE" >"$T/tmp.json" && { [[ $protocol != hysteria2 ]] || cp "$T/tmp.json" "$CONFIG_FILE"; }
   printf '%s\n' '{"inbounds":{"test":{"host":"127.0.0.1"}}}' >"$META_FILE"

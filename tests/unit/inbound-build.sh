@@ -104,11 +104,7 @@ run_build() {
     '.type==$type and .tag==$tag and .listen==$listen and .listen_port==$port' <<<"$inbound" >/dev/null
 
   case $case_expected_type in
-    vless)
-      assert_json --arg name "$case_name" --arg uuid '00000000-0000-0000-0000-000000000001' \
-        '(.users|length)==1 and .users[0].name==$name and .users[0].uuid==$uuid'
-      ;;
-    anytls|trojan|hysteria2)
+    anytls|hysteria2)
       assert_json --arg name "$case_name" --arg password "$case_password" \
         '(.users|length)==1 and .users[0].name==$name and .users[0].password==$password'
       ;;
@@ -184,35 +180,23 @@ run_case() {
   printf 'passed %s\n' "$case_tag"
 }
 
-# VLESS: Reality/TCP, certificate TLS/TCP+WS, and no TLS/TCP+WS.
-run_case vless-reality 2 vless reality tcp 1 1 '' ''
-run_case vless-cert-tcp 2 vless cert tcp 1 1 '' ''
-run_case vless-cert-ws 2 vless cert ws 1 1 '' '' '' '' 30000-50000 10326 /vless-ws
-run_case vless-none-tcp 2 vless none tcp 1 1 '' ''
-run_case vless-none-ws 2 vless none ws 1 1 '' '' '' '' 30000-50000 10326 /plain-ws
-
 # AnyTLS: Reality and certificate TLS.
 run_case anytls-reality 1 anytls reality tcp 1 1 '' ''
 run_case anytls-cert 1 anytls cert tcp 1 1 '' ''
 
-# Trojan: Reality/TCP and certificate TLS/TCP+WS.
-run_case trojan-reality 4 trojan reality tcp 1 1 '' ''
-run_case trojan-cert-tcp 4 trojan cert tcp 1 1 '' ''
-run_case trojan-cert-ws 4 trojan cert ws 1 1 '' '' '' '' 30000-50000 10326 /trojan-ws
-
 # Hysteria2: ordinary/hopping, obfuscation, and optional bandwidth limits.
-run_case hy2-plain 3 hysteria2 cert tcp 1 1 '' ''
-run_case hy2-obfs 3 hysteria2 cert tcp 1 2 '' ''
-run_case hy2-hop 3 hysteria2 cert tcp 2 1 '' ''
-run_case hy2-hop-obfs 3 hysteria2 cert tcp 2 2 '' ''
-run_case hy2-bandwidth 3 hysteria2 cert tcp 1 1 100 200
-run_case hy2-no-bandwidth 3 hysteria2 cert tcp 1 1 '' ''
+run_case hy2-plain 2 hysteria2 cert tcp 1 1 '' ''
+run_case hy2-obfs 2 hysteria2 cert tcp 1 2 '' ''
+run_case hy2-hop 2 hysteria2 cert tcp 2 1 '' ''
+run_case hy2-hop-obfs 2 hysteria2 cert tcp 2 2 '' ''
+run_case hy2-bandwidth 2 hysteria2 cert tcp 1 1 100 200
+run_case hy2-no-bandwidth 2 hysteria2 cert tcp 1 1 '' ''
 
 # SOCKS and HTTP: unauthenticated and username/password modes.
-run_case socks-open 5 socks none tcp 1 1 '' ''
-run_case socks-auth 5 socks none tcp 1 1 '' '' socks-user
-run_case http-open 6 http none tcp 1 1 '' ''
-run_case http-auth 6 http none tcp 1 1 '' '' http-user
+run_case socks-open 3 socks none tcp 1 1 '' ''
+run_case socks-auth 3 socks none tcp 1 1 '' '' socks-user
+run_case http-open 4 http none tcp 1 1 '' ''
+run_case http-auth 4 http none tcp 1 1 '' '' http-user
 
 validate_websocket_path /valid-path
 if validate_websocket_path '/bad path'; then
