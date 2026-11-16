@@ -129,7 +129,7 @@ client_menu() {
   local tag=$1 choice
   while inbound_exists "$tag"; do
     clear_screen; heading "用户管理 · ${tag}"; list_clients "$tag"
-    printf '\n1) 添加用户\n2) 重命名用户\n3) 更换 UUID/密码\n4) 删除用户\n0) 返回\n'
+    printf '\n1) 添加用户\n2) 重命名用户\n3) 更换密码\n4) 删除用户\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_client "$tag"; pause;;

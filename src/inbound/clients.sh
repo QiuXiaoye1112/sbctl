@@ -105,8 +105,12 @@ rotate_client_credential() {
   field=$(client_label_field "$type")
   [[ -n $name ]] || { select_client name "$tag" || return 0; }
   client_exists "$tag" "$name" || die "找不到用户：${name}"
+  value=$(random_password) || { warn "无法生成新密码，未修改凭据。"; return 1; }
+  [[ -n $value ]] || { warn "无法生成新密码，未修改凭据。"; return 1; }
+  if [[ $type == socks ]]; then
+    prompt_secret value "新密码" "$value" || return 1
+  fi
   tmp=$(temp_file)
-  value=$(random_password)
   jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then info "新凭据：${value}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"

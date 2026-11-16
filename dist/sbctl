@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SBCTL_VERSION="0.5.0"
-readonly SBCTL_BUILD_COMMIT="a0ed33d3532c"
+readonly SBCTL_BUILD_COMMIT="20700d6e59cf"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly SING_BOX_MIN_VERSION="1.12.0"
@@ -2137,8 +2137,12 @@ rotate_client_credential() {
   field=$(client_label_field "$type")
   [[ -n $name ]] || { select_client name "$tag" || return 0; }
   client_exists "$tag" "$name" || die "找不到用户：${name}"
+  value=$(random_password) || { warn "无法生成新密码，未修改凭据。"; return 1; }
+  [[ -n $value ]] || { warn "无法生成新密码，未修改凭据。"; return 1; }
+  if [[ $type == socks ]]; then
+    prompt_secret value "新密码" "$value" || return 1
+  fi
   tmp=$(temp_file)
-  value=$(random_password)
   jq --arg tag "$tag" --arg name "$name" --arg field "$field" --arg value "$value" '(.inbounds[]|select(.tag==$tag)|.users[]|select(.[$field]==$name)|.password)=$value' "$CONFIG_FILE" >"$tmp"
   if apply_candidate "$tmp"; then info "新凭据：${value}"; else rm -f "$tmp"; return 1; fi
   rm -f "$tmp"
@@ -6766,7 +6770,7 @@ client_menu() {
   local tag=$1 choice
   while inbound_exists "$tag"; do
     clear_screen; heading "用户管理 · ${tag}"; list_clients "$tag"
-    printf '\n1) 添加用户\n2) 重命名用户\n3) 更换 UUID/密码\n4) 删除用户\n0) 返回\n'
+    printf '\n1) 添加用户\n2) 重命名用户\n3) 更换密码\n4) 删除用户\n0) 返回\n'
     read -r -p "请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_client "$tag"; pause;;

@@ -32,6 +32,14 @@ cat >"$CONFIG_FILE" <<'JSON'
 JSON
 client_exists() { jq -e --arg tag "$1" --arg name "$2" '.inbounds[]|select(.tag==$tag)|.users[]?|select(.username==$name)' "$CONFIG_FILE" >/dev/null; }
 apply_candidate() { cp "$1" "$CONFIG_FILE"; }
+random_password() { printf 'generated-password'; }
+rotate_client_credential proxy one <<< 'manual-password' >/dev/null
+jq -e '.inbounds[0].users[0].password=="manual-password" and .inbounds[0].users[1].password=="secret"' "$CONFIG_FILE" >/dev/null
+rotate_client_credential proxy one <<< '' >/dev/null
+jq -e '.inbounds[0].users[0].password=="generated-password"' "$CONFIG_FILE" >/dev/null
+before=$(cat "$CONFIG_FILE")
+! rotate_client_credential proxy one </dev/null >/dev/null 2>&1
+[[ $(cat "$CONFIG_FILE") == "$before" ]]
 confirm() { return 1; }
 delete_client proxy one 1
 jq -e '.inbounds[0].users|length==1' "$CONFIG_FILE" >/dev/null
