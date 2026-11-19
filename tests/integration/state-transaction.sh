@@ -39,6 +39,15 @@ fi
 
 [[ $(jq '.inbounds | length' "$CONFIG_FILE") == 0 ]]
 [[ $(jq -r '.inbounds.candidate // empty' "$META_FILE") == '' ]]
+
+service_is_active() { return 1; }
+service_restart() { : >"${LOCK_FILE}.restarted"; return 1; }
+restart_service_checked() { service_restart; }
+output=$(apply_candidate_with_meta "$candidate" "$meta_candidate")
+[[ $output == *'配置已保存，sing-box 启动后生效。'* ]]
+[[ ! -e ${LOCK_FILE}.restarted ]]
+[[ $(jq -r '.inbounds[0].tag' "$CONFIG_FILE") == candidate ]]
+[[ $(jq -r '.inbounds.candidate.host' "$META_FILE") == example.com ]]
 BASH
 
 printf 'state transaction integration checks passed.\n'

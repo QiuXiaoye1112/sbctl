@@ -37,25 +37,32 @@ add_client() {
 list_clients() {
   # Pure display — does NOT call ensure_config.
   [[ -f $CONFIG_FILE ]] || { info "配置不存在。"; return 1; }
-  local tag=${1-} type i=0 name cred
+  local tag=${1-} context=${2-} type field i=0 name cred
   [[ -n $tag ]] || select_inbound tag || return 0
   type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  heading "${tag} 用户"
+  if [[ $context == --menu ]]; then ui_section "用户列表"; else heading "${tag} 用户"; fi
   case $type in
-    anytls|hysteria2)
-      while IFS=$'\t' read -r name cred; do
-        ((i+=1))
-        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
-      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.name,.password]|@tsv' "$CONFIG_FILE")
-      ;;
-    socks|http|mixed)
-      while IFS=$'\t' read -r name cred; do
-        ((i+=1))
-        printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
-      done < <(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.users[]?|[.username,.password]|@tsv' "$CONFIG_FILE")
-      ;;
+    anytls|hysteria2|socks|http|mixed) field=$(client_label_field "$type") ;;
+    *) info "还没有用户。"; return ;;
   esac
-  (($i)) || info "还没有用户。"
+  while IFS=$'\t' read -r name cred; do
+    if [[ $context == --menu ]] && ((i == 0)); then
+      printf '  %s' "$C_DIM"
+      print_table_cell "序号" 6
+      print_table_cell "名称" 18
+      printf '密码%s\n' "$C_RESET"
+    fi
+    ((i+=1))
+    if [[ $context == --menu ]]; then
+      printf '  '
+      print_table_cell "$i" 6
+      print_table_cell_clipped "$name" 16
+      printf '  %s\n' "$cred"
+    else
+      printf ' %-2d) %-20s %s\n' "$i" "$name" "$cred"
+    fi
+  done < <(jq -r --arg tag "$tag" --arg field "$field" '.inbounds[]|select(.tag==$tag)|.users[]?|[.[$field],.password]|@tsv' "$CONFIG_FILE")
+  ((i)) || info "还没有用户。"
 }
 
 select_client() {

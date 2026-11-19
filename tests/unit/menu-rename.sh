@@ -37,4 +37,18 @@ INPUT
 )
 [[ $output == *'修改入站信息 · old'* ]]
 [[ $output != *'入站 · new'* ]]
+[[ $output != *'5) 修改上下行限速'* ]]
+
+printf '%s\n' '{"inbounds":[{"tag":"hy2","type":"hysteria2","listen_port":1234,"up_mbps":80,"users":[]}],"outbounds":[]}' >"$CONFIG_FILE"
+run_menu_action() { printf 'action %s %s\n' "$1" "$2"; }
+output=$(manage_inbound_menu hy2 <<'INPUT'
+3
+5
+0
+0
+INPUT
+)
+[[ $output == *'80 Mbps / 不限'* && $output == *'4) 端口跳跃'*'5) 修改上下行限速'* ]]
+[[ $output == *'action hy2_modify_bandwidth hy2'* ]]
+
 printf 'menu rename navigation passed.\n'

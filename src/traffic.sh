@@ -746,7 +746,7 @@ traffic_exhausted_tags() {
 }
 
 traffic_limits_show() {
-  local rows tag quota used remaining rate status status_color cycle_start cycle_end cycle feature feature_color configured blocked limits_active=0
+  local context=${1-} rows tag quota used remaining rate status status_color cycle_start cycle_end cycle feature feature_color configured blocked limits_active=0
   traffic_init_file; traffic_sync_inventory
   if traffic_limits_are_enabled; then
     feature="已启用"; feature_color=$C_GREEN; limits_active=1
@@ -760,8 +760,14 @@ traffic_limits_show() {
   else
     blocked=0
   fi
-  heading "月度流量限制"
-  printf '功能：%s%s%s  ·  已设置：%s  ·  已禁用：%s\n\n' "$feature_color" "$feature" "$C_RESET" "$configured" "$blocked"
+  if [[ $context == --menu ]]; then
+    ui_field "额度状态" "$(ui_status "$feature")"
+    ui_field "已设置 / 已禁用" "${configured} 个 / ${blocked} 个"
+    ui_section "入站额度"
+  else
+    heading "月度流量限制"
+    printf '功能：%s%s%s  ·  已设置：%s  ·  已禁用：%s\n\n' "$feature_color" "$feature" "$C_RESET" "$configured" "$blocked"
+  fi
   rows=$(jq -r '
     .inbounds | to_entries | sort_by(.key)[] |
     select(.value.deleted!=true and .value.limit.enabled==true) |
@@ -980,7 +986,7 @@ traffic_period_set() {
 }
 
 traffic_show() {
-  local start=${1-} end=${2-} period=false rows tag protocol port bytes deleted total status last limit_status display_order
+  local start=${1-} end=${2-} context=${3-} period=false rows tag protocol port bytes deleted disabled total status last limit_status display_order columns=72
   if [[ -n $start && -z $end ]]; then end=$(traffic_today); fi
   if [[ -z $start && -z $end ]]; then
     traffic_init_file
@@ -992,11 +998,31 @@ traffic_show() {
   traffic_init_file; traffic_sync_inventory
   traffic_is_enabled && status="运行中" || status="已停止"
   last=$(jq -r '.lastCollectedAt // empty' "$TRAFFIC_FILE")
-  heading "流量信息"
-  printf '统计状态：%s\n统计范围：%s ～ %s\n最后采集：%s\n\n' "$status" "$start" "$end" "${last:-尚未采集}"
-  print_table_cell_clipped "标签" 20; printf '| '
-  print_table_cell_clipped "协议" 10; printf '| '
-  print_table_cell "端口" 7; printf '| %14s\n' "总流量"
+  if [[ $context == --menu ]]; then
+    columns=$(ui_width)
+    ui_field "统计状态" "$(ui_status "$status")"
+    if ((columns < 60)) && [[ $start == *' '* || $end == *' '* ]]; then
+      ui_field "开始时间" "$start"
+      ui_field "结束时间" "$end"
+    else
+      ui_field "统计范围" "$start ～ $end"
+    fi
+    ui_field "最后采集" "${last:-尚未采集}"
+    ui_section "按入站统计"
+    if ((columns >= 58)); then
+      printf '  %s' "$C_DIM"
+      print_table_cell "标签" 22
+      print_table_cell "协议" 12
+      print_table_cell "端口" 9
+      printf '总流量%s\n' "$C_RESET"
+    fi
+  else
+    heading "流量信息"
+    printf '统计状态：%s\n统计范围：%s ～ %s\n最后采集：%s\n\n' "$status" "$start" "$end" "${last:-尚未采集}"
+    print_table_cell_clipped "标签" 20; printf '| '
+    print_table_cell_clipped "协议" 10; printf '| '
+    print_table_cell "端口" 7; printf '| %14s\n' "总流量"
+  fi
   display_order=$(jq -c '[.inbounds[]?.tag]' "$CONFIG_FILE" 2>/dev/null || printf '[]')
   rows=$(jq -r --arg start "$start" --arg finish "$end" --argjson period "$period" --argjson order "$display_order" '
     ($order | to_entries | map({key:.value,value:.key}) | from_entries) as $positions |
@@ -1010,19 +1036,39 @@ traffic_show() {
   if [[ -n $rows ]]; then
     while IFS=$'\t' read -r tag protocol port bytes deleted disabled; do
       if [[ $disabled == true ]]; then tag="${tag}(已禁用)"; elif [[ $deleted == true ]]; then tag="${tag}(已删除)"; fi
-      print_table_cell_clipped "$tag" 20; printf '| '
-      print_table_cell_clipped "$protocol" 10; printf '| '
-      print_table_cell "$port" 7; printf '| %14s\n' "$(traffic_format_bytes "$bytes")"
+      if [[ $context == --menu ]]; then
+        protocol=$(protocol_display_name "$protocol" || printf '%s' "$protocol")
+        if ((columns < 58)); then
+          printf '  %s\n    %s · 端口 %s · %s\n' "$tag" "$protocol" "$port" "$(traffic_format_bytes "$bytes")"
+        else
+          printf '  '
+          print_table_cell_clipped "$tag" 20; printf '  '
+          print_table_cell_clipped "$protocol" 10; printf '  '
+          print_table_cell "$port" 7; printf '  %s\n' "$(traffic_format_bytes "$bytes")"
+        fi
+      else
+        print_table_cell_clipped "$tag" 20; printf '| '
+        print_table_cell_clipped "$protocol" 10; printf '| '
+        print_table_cell "$port" 7; printf '| %14s\n' "$(traffic_format_bytes "$bytes")"
+      fi
     done <<<"$rows"
+  elif [[ $context == --menu ]]; then
+    printf '  暂无流量记录。\n'
   fi
   if [[ $period == true ]]; then
     total=$(jq --arg start "$start" '[.inbounds[]?.cycles[$start] // 0] | add // 0' "$TRAFFIC_FILE")
   else
     total=$(traffic_range_total "$start" "$end")
   fi
-  printf '%s\n全部入站：%s\n' '----------------------------------------------------------' "$(traffic_format_bytes "$total")"
   traffic_limits_are_enabled && limit_status="已启用" || limit_status="未启用"
-  printf '流量限制：%s\n' "$limit_status"
+  if [[ $context == --menu ]]; then
+    ui_rule
+    ui_field "全部入站" "$(traffic_format_bytes "$total")"
+    ui_field "流量限制" "$(ui_status "$limit_status")"
+  else
+    printf '%s\n全部入站：%s\n' '----------------------------------------------------------' "$(traffic_format_bytes "$total")"
+    printf '流量限制：%s\n' "$limit_status"
+  fi
 }
 
 traffic_prompt_range() {

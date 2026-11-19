@@ -2,25 +2,31 @@
 # sbctl menus — canonical interactive UI, dispatch, and help.
 # All menus are defined exactly once.
 
-# ---- inbound detail menu (from layout.sh — with user_count and protocol-specific options) ----
 manage_inbound_menu() {
   local tag=$1 choice row type port security user_count
   while inbound_exists "$tag"; do
-    clear_screen
-    # Single-jq: fetch type, port, security, user_count in one call
     row=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|[.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),((.users//[])|length|tostring)]|@tsv' "$CONFIG_FILE")
     IFS=$'\t' read -r type port security user_count <<<"$row"
-    heading "入站 · ${tag}"
-    printf '协议: %s  |  端口: %s  |  安全: %s\n\n' "$type" "$port" "$security"
+    ui_page "入站 · ${tag}" "主菜单 › 入站管理"
+    ui_field "协议 / 安全" "$(protocol_display_name "$type" || printf '%s' "$type") · ${security}"
+    ui_field "监听端口" "$port"
 
     case $type in
       anytls|hysteria2)
+        ui_field "用户" "${user_count} 个"
+        ui_section "连接与用户"
+        ui_option 1 "分享信息"
+        ui_option 2 "用户管理"
+        ui_section "配置"
+        ui_option 3 "修改入站信息"
         if [[ $security == tls ]]; then
-          printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 证书管理\n5) 查看 JSON\n0) 返回列表\n'
+          ui_option 4 "证书管理"
+          ui_option 5 "查看 JSON"
         else
-          printf '1) 分享信息\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
+          ui_option 4 "查看 JSON"
         fi
-        read -r -p "请选择: " choice || { echo; return; }
+        ui_footer "返回入站列表"
+        read -r -p "  请选择: " choice || { echo; return; }
         case $choice in
           1) run_menu_action print_share "$tag"; pause;;
           2) client_menu "$tag";;
@@ -31,10 +37,16 @@ manage_inbound_menu() {
         esac
         ;;
       socks|http)
-        if ((user_count > 0)); then printf '认证: 已启用\n\n'; else printf '认证: 无\n\n'; fi
+        if ((user_count > 0)); then ui_field "账号认证" "${user_count} 个用户"; else ui_field "账号认证" "无认证"; fi
+        ui_section "客户端"
+        ui_option 1 "客户端配置"
         if ((user_count > 0)); then
-          printf '1) 客户端配置\n2) 用户管理\n3) 修改入站信息\n4) 查看 JSON\n0) 返回列表\n'
-          read -r -p "请选择: " choice || { echo; return; }
+          ui_option 2 "用户管理"
+          ui_section "配置"
+          ui_option 3 "修改入站信息"
+          ui_option 4 "查看 JSON"
+          ui_footer "返回入站列表"
+          read -r -p "  请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
             2) client_menu "$tag";;
@@ -43,8 +55,11 @@ manage_inbound_menu() {
             0) return;; *) warn "无效选项。"; pause;;
           esac
         else
-          printf '1) 客户端配置\n2) 修改入站信息\n3) 查看 JSON\n0) 返回列表\n'
-          read -r -p "请选择: " choice || { echo; return; }
+          ui_section "配置"
+          ui_option 2 "修改入站信息"
+          ui_option 3 "查看 JSON"
+          ui_footer "返回入站列表"
+          read -r -p "  请选择: " choice || { echo; return; }
           case $choice in
             1) run_menu_action print_share "$tag"; pause;;
             2) modify_inbound_menu tag;;
@@ -63,9 +78,14 @@ inbound_certificate_menu() {
   while inbound_exists "$tag" && jq -e --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.tls.enabled==true and (.tls.reality.enabled!=true)' "$CONFIG_FILE" >/dev/null; do
     row=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|[.tls.certificate_path // "未设置",.tls.key_path // "未设置",.tls.server_name // "未设置"]|@tsv' "$CONFIG_FILE")
     IFS=$'\t' read -r cert key sni <<<"$row"
-    clear_screen; heading "证书管理 · ${tag}"
-    printf '证书: %s\n私钥: %s\nSNI: %s\n\n1) 更换证书\n0) 返回入站\n' "$cert" "$key" "$sni"
-    read -r -p '请选择: ' choice || { echo; return; }
+    ui_page "证书管理 · ${tag}" "主菜单 › 入站管理"
+    ui_field "证书文件" "$cert"
+    ui_field "私钥文件" "$key"
+    ui_field "SNI" "$sni"
+    ui_section "证书操作"
+    ui_option 1 "更换证书"
+    ui_footer "返回入站"
+    read -r -p '  请选择: ' choice || { echo; return; }
     case $choice in
       1) run_menu_action modify_inbound_certificate "$tag"; pause;;
       0) return;; *) warn '无效选项。'; pause;;
@@ -73,20 +93,29 @@ inbound_certificate_menu() {
   done
 }
 
-# ---- modify inbound menu (from hy2_hop.sh — adds port hopping for hysteria2) ----
 modify_inbound_menu() {
   local -n current_tag=$1
-  local choice type new_tag
+  local choice type new_tag row up down
   while inbound_exists "$current_tag"; do
-    clear_screen
-    type=$(jq -r --arg tag "$current_tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-    heading "修改入站信息 · ${tag}"
+    row=$(jq -r --arg tag "$current_tag" '
+      .inbounds[] | select(.tag==$tag) | [.type, (.up_mbps // 0), (.down_mbps // 0)] | @tsv
+    ' "$CONFIG_FILE")
+    IFS=$'\t' read -r type up down <<<"$row"
+    ui_page "修改入站信息 · ${current_tag}" "主菜单 › 入站管理"
     if [[ $type == hysteria2 ]]; then
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n4) 端口跳跃\n0) 返回\n'
-    else
-      printf '1) 修改入站名称\n2) 修改地址和端口\n3) 修改安全方式 / 证书\n0) 返回\n'
+      ui_field "上行 / 下行" "$(hy2_bandwidth_display "$up") / $(hy2_bandwidth_display "$down")"
     fi
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_section "基础设置"
+    ui_option 1 "修改入站名称"
+    ui_option 2 "修改地址和端口"
+    ui_section "安全与传输"
+    ui_option 3 "修改安全方式 / 证书"
+    if [[ $type == hysteria2 ]]; then
+      ui_option 4 "端口跳跃"
+      ui_option 5 "修改上下行限速"
+    fi
+    ui_footer "返回入站"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) prompt_value new_tag "新入站名称" "$current_tag" || continue
          if [[ $new_tag == "$current_tag" ]]; then info "名称未更改。"
@@ -98,6 +127,7 @@ modify_inbound_menu() {
       2) run_menu_action modify_inbound_basic "$current_tag"; pause;;
       3) run_menu_action modify_inbound_security "$current_tag"; pause;;
       4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; *) warn "无效选项。";; esac; pause;;
+      5) case $type in hysteria2) run_menu_action hy2_modify_bandwidth "$current_tag";; *) warn "无效选项。";; esac; pause;;
       0) return;;
       *) warn "无效选项。"; pause;;
     esac
@@ -108,14 +138,19 @@ inbound_menu() {
   ensure_config  # once at entry, not on every redraw
   local choice tag
   while true; do
-    clear_screen
-    heading "入站管理"
-    list_inbounds
-    printf '\n完整配置: %s\n\n' "$CONFIG_FILE"
-    printf '1) 新增入站\n2) 管理已有入站\n3) 全部分享信息\n4) 删除入站\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_page "入站管理" "主菜单"
+    ui_field "配置文件" "$CONFIG_FILE"
+    ui_section "入站列表"
+    list_inbounds --menu
+    ui_section "入站操作"
+    ui_option 1 "新增入站"
+    ui_option 2 "管理已有入站"
+    ui_option 3 "全部分享信息"
+    ui_option 4 "删除入站"
+    ui_footer "返回主菜单"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
-      1) run_menu_action add_inbound; pause;;
+      1) ui_page "新增入站" "主菜单 › 入站管理"; run_menu_action add_inbound; pause;;
       2) select_inbound tag && manage_inbound_menu "$tag";;
       3) run_menu_action print_all_share; pause;;
       4) run_menu_action delete_inbound; pause;;
@@ -128,9 +163,15 @@ client_menu() {
   ensure_config  # once at entry
   local tag=$1 choice
   while inbound_exists "$tag"; do
-    clear_screen; heading "用户管理 · ${tag}"; list_clients "$tag"
-    printf '\n1) 添加用户\n2) 重命名用户\n3) 更换密码\n4) 删除用户\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_page "用户管理 · ${tag}" "主菜单 › 入站管理"
+    list_clients "$tag" --menu
+    ui_section "用户操作"
+    ui_option 1 "添加用户"
+    ui_option 2 "重命名用户"
+    ui_option 3 "更换密码"
+    ui_option 4 "删除用户"
+    ui_footer "返回入站"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action add_client "$tag"; pause;;
       2) run_menu_action rename_client "$tag"; pause;;
@@ -144,9 +185,8 @@ client_menu() {
 domain_rule_detail_menu() {
   local tag=$1 choice template outbound has_binding=0
   while inbound_exists "$tag"; do
-    clear_screen
-    heading "域名分流 · ${tag}"
-    printf '模板：\n'
+    ui_page "域名分流 · ${tag}" "主菜单 › 出站管理 › 域名分流"
+    ui_section "已应用模板"
     has_binding=0
     while IFS=$'\t' read -r template outbound; do
       [[ -n $template ]] || continue
@@ -156,8 +196,12 @@ domain_rule_detail_menu() {
     ((has_binding)) || printf '  无\n'
     printf '\n'
     list_domain_rules "$tag" --menu
-    printf '\n1) 管理模板\n2) 添加规则\n3) 删除规则\n0) 返回\n'
-    read -r -p '请选择: ' choice || return
+    ui_section "分流操作"
+    ui_option 1 "管理模板"
+    ui_option 2 "添加规则"
+    ui_option 3 "删除规则"
+    ui_footer "返回入站列表"
+    read -r -p '  请选择: ' choice || return
     case $choice in
       1) inbound_template_manage_menu "$tag";;
       2) if run_menu_action add_domain_rule "$tag" "" "" "" --prompt; then pause; fi;;
@@ -188,9 +232,8 @@ domain_rule_menu() {
   local choice tag number
   local -a tags=()
   while true; do
-    clear_screen
-    heading '域名分流'
-    printf '入站列表\n\n'
+    ui_page "域名分流" "主菜单 › 出站管理"
+    ui_section "选择入站"
     tags=()
     while IFS= read -r tag; do [[ -n $tag ]] && tags+=("$tag"); done < <(jq -r '.inbounds[].tag // empty' "$CONFIG_FILE")
     if ((${#tags[@]} == 0)); then
@@ -198,12 +241,13 @@ domain_rule_menu() {
     fi
     for ((number=0; number<${#tags[@]}; number++)); do
       tag=${tags[$number]}
-      printf '%d) %s\n' "$((number+1))" "$tag"
-      printf '   模板：%s\n' "$(domain_rule_inbound_templates "$tag")"
-      printf '   域名规则：%s 条\n\n' "$(domain_rule_inbound_count "$tag")"
+      ui_option "$((number+1))" "$tag"
+      printf '       模板 %s · 域名规则 %s 条\n' "$(domain_rule_inbound_templates "$tag")" "$(domain_rule_inbound_count "$tag")"
     done
-    printf '操作：\n  [%d] 管理模板\n  [0] 返回\n' "$(( ${#tags[@]} + 1 ))"
-    read -r -p '请选择: ' choice || return
+    ui_section "模板"
+    ui_option "$(( ${#tags[@]} + 1 ))" "管理模板"
+    ui_footer "返回出站管理"
+    read -r -p '  请选择: ' choice || return
     case $choice in
       0) return;;
       ''|*[!0-9]*) warn '无效选项。'; pause;;
@@ -230,13 +274,16 @@ select_inbound_template() {
 inbound_template_manage_menu() {
   local inbound=$1 choice name outbound
   while inbound_exists "$inbound"; do
-    clear_screen
-    heading "入站模板 · ${inbound}"
-    printf '已应用模板：\n'
+    ui_page "入站模板 · ${inbound}" "主菜单 › 出站管理 › 域名分流"
+    ui_section "已应用模板"
     while IFS=$'\t' read -r name outbound; do [[ -n $name ]] && printf '  %s → %s\n' "$name" "$outbound"; done \
       < <(list_inbound_template_bindings "$inbound")
-    printf '\n1) 添加模板\n2) 移除模板\n3) 修改出站\n0) 返回\n'
-    read -r -p '请选择: ' choice || return
+    ui_section "模板操作"
+    ui_option 1 "添加模板"
+    ui_option 2 "移除模板"
+    ui_option 3 "修改出站"
+    ui_footer "返回域名分流"
+    read -r -p '  请选择: ' choice || return
     case $choice in
       1) if apply_domain_template_menu "$inbound"; then pause; fi;;
       2)
@@ -270,8 +317,8 @@ delete_domain_template_domains_menu() {
     jq -r --arg name "$name" --arg match "$match" '.domainTemplates.templates[]? |
       select(.name==$name) | .[$match][]? // empty' "$META_FILE")
   ((${#domains[@]})) || { warn "当前模板没有${type_label}。"; return 1; }
-  printf '\n%s：\n\n' "$type_label"
-  for ((idx=0; idx<${#domains[@]}; idx++)); do printf '%d) %s\n' "$((idx+1))" "${domains[$idx]}"; done
+  ui_section "$type_label"
+  for ((idx=0; idx<${#domains[@]}; idx++)); do ui_option "$((idx+1))" "${domains[$idx]}"; done
   while true; do
     read -r -p '请选择要删除的域名（支持 1,3,2）: ' selection || return 1
     selection=$(printf '%s' "$selection" | tr -d '[:space:]'); selected=()
@@ -299,13 +346,16 @@ delete_domain_template_domains_menu() {
 template_manage_menu() {
   local name=$1 choice type domains match
   while domain_template_exists "$name"; do
-    clear_screen; heading "模板 · ${name}"
-    printf '精确域名：\n'
+    ui_page "模板 · ${name}" "主菜单 › 出站管理 › 模板库"
+    ui_section "精确域名"
     jq -r --arg name "$name" '.domainTemplates.templates[]? | select(.name==$name) | .exact[]? // empty | "  "+.' "$META_FILE"
-    printf '子域名：\n'
+    ui_section "子域名"
     jq -r --arg name "$name" '.domainTemplates.templates[]? | select(.name==$name) | .suffix[]? // empty | "  "+.' "$META_FILE"
-    printf '\n1) 添加域名\n2) 删除域名\n0) 返回\n'
-    read -r -p '请选择: ' choice || return
+    ui_section "域名操作"
+    ui_option 1 "添加域名"
+    ui_option 2 "删除域名"
+    ui_footer "返回模板库"
+    read -r -p '  请选择: ' choice || return
     case $choice in
       1)
         choose type "域名类型" "精确域名" "域名及所有子域名" || continue
@@ -325,14 +375,19 @@ template_library_menu() {
   local choice name exact suffix number
   local -a names=()
   while true; do
-    clear_screen; heading '模板库'; names=(); number=0
+    ui_page "模板库" "主菜单 › 出站管理 › 域名分流"
+    names=(); number=0
     while IFS=$'\t' read -r name exact suffix; do
       [[ -n $name ]] || continue
       names+=("$name"); ((number+=1))
-      printf '%s) %-16s 精确 %s 个，子域名 %s 个\n' "$number" "$name" "$exact" "$suffix"
+      ui_option "$number" "$name"
+      printf '       精确域名 %s 个 · 子域名 %s 个\n' "$exact" "$suffix"
     done < <(list_domain_templates)
-    printf '\n%s) 新建模板\n0) 返回\n' "$((number+1))"
-    read -r -p '请选择: ' choice || return
+    if ((number == 0)); then printf '  暂无模板。\n'; fi
+    ui_section "模板操作"
+    ui_option "$((number+1))" "新建模板"
+    ui_footer "返回域名分流"
+    read -r -p '  请选择: ' choice || return
     case $choice in
       0) return;; ''|*[!0-9]*) warn '无效选项。'; pause;;
       *)
@@ -354,11 +409,17 @@ outbound_menu() {
   ensure_config  # once at entry
   local choice
   while true; do
-    clear_screen
-    heading "出站管理"
-    list_outbound_overview
-    printf '\n1) 设置入站默认出站\n2) 域名分流\n3) 添加 SOCKS5/HTTP 出站\n4) 查看出站详情\n5) 删除出站\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_page "出站管理" "主菜单"
+    list_outbound_overview --menu
+    ui_section "路由"
+    ui_option 1 "设置入站默认出站"
+    ui_option 2 "域名分流"
+    ui_section "代理出站"
+    ui_option 3 "添加 SOCKS5 / HTTP 出站"
+    ui_option 4 "查看出站详情"
+    ui_option 5 "删除出站"
+    ui_footer "返回主菜单"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action assign_outbound; pause;;
       2) domain_rule_menu;;
@@ -371,14 +432,21 @@ outbound_menu() {
   done
 }
 
-# ---- certificate menu (from cloudflare.sh — adds Cloudflare credentials option) ----
 certificate_menu() {
   local choice
   while true; do
-    clear_screen; heading "TLS 证书"
-    printf '托管证书: %s\n\n' "$(managed_certificate_count)"
-    printf "1) Let's Encrypt 签发\n2) 导入已有证书\n3) 查看托管证书\n4) 删除托管证书\n5) Cloudflare DNS 凭据\n6) 立即检查/续期自动证书\n0) 返回\n"
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_page "TLS 证书" "主菜单"
+    ui_field "托管证书" "$(managed_certificate_count) 张"
+    ui_section "证书"
+    ui_option 1 "Let's Encrypt 签发"
+    ui_option 2 "导入已有证书"
+    ui_option 3 "查看托管证书"
+    ui_option 4 "删除托管证书"
+    ui_section "DNS 与续期"
+    ui_option 5 "Cloudflare DNS 凭据"
+    ui_option 6 "立即检查并续期"
+    ui_footer "返回主菜单"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action issue_certificate; pause;;
       2) run_menu_action import_certificate; pause;;
@@ -404,12 +472,24 @@ toggle_service_startup() {
 service_menu() {
   local choice svc_summary boot_summary ver_summary
   while true; do
-    clear_screen; heading "服务管理"
-    # Single _service_summary_all call, parse with read — no repeated awk/systemctl
+    ui_page "服务管理" "主菜单"
     read -r svc_summary boot_summary ver_summary <<< "$(_service_summary_all)"
-    printf '状态: %s  |  开机自启: %s  |  sing-box: %s\n\n' "$svc_summary" "$boot_summary" "$ver_summary"
-    printf '1) 启动/停止\n2) 重启服务\n3) 开关开机自启\n4) 查看日志\n5) 安装 sing-box\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_field "服务状态" "$(ui_status "$svc_summary")"
+    ui_field "开机自启" "$(ui_status "$boot_summary")"
+    ui_field "sing-box" "$ver_summary"
+    ui_section "服务操作"
+    case $svc_summary in
+      运行中) ui_option 1 "停止服务" ;;
+      已停止) ui_option 1 "启动服务" ;;
+      *) ui_option 1 "启动 / 停止" ;;
+    esac
+    ui_option 2 "重启服务"
+    ui_option 3 "切换开机自启"
+    ui_section "维护"
+    ui_option 4 "查看日志"
+    ui_option 5 "安装 / 更新 sing-box"
+    ui_footer "返回主菜单"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action toggle_service_running; pause;;
       2) run_menu_action service_action restart; pause;;
@@ -422,22 +502,26 @@ service_menu() {
 }
 
 show_main_inbounds() {
-  heading "当前入站"
-  list_inbounds
-  printf '\n'
+  ui_section "入站概览"
+  list_inbounds --menu
 }
 
 traffic_menu() {
   local choice
   traffic_is_enabled && run_menu_action traffic_collect
   while true; do
-    clear_screen
-    traffic_show || true
-    printf '\n1) 刷新\n2) 流量限制\n3) 清空指定入站记录\n4) 清空全部流量记录\n'
-    if traffic_is_enabled; then printf '5) 停止流量统计\n'; else printf '5) 开启流量统计\n'; fi
-    printf '6) 设置月度统计起点\n'
-    printf '0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_page "流量信息" "主菜单"
+    traffic_show "" "" --menu || true
+    ui_section "统计与额度"
+    ui_option 1 "刷新流量"
+    ui_option 2 "流量限制"
+    ui_section "记录与周期"
+    ui_option 3 "清空指定入站记录"
+    ui_option 4 "清空全部流量记录"
+    if traffic_is_enabled; then ui_option 5 "停止流量统计"; else ui_option 5 "开启流量统计"; fi
+    ui_option 6 "设置月度统计起点"
+    ui_footer "返回主菜单"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action traffic_collect;;
       2) traffic_limit_menu;;
@@ -458,14 +542,19 @@ traffic_limit_menu() {
   local choice
   while true; do
     if traffic_is_enabled; then run_menu_action traffic_collect || true; fi
-    clear_screen
-    traffic_limits_show || true
+    ui_page "月度流量限制" "主菜单 › 流量信息"
+    traffic_limits_show --menu || true
+    ui_section "额度操作"
     if traffic_limits_are_enabled; then
-      printf '操作\n1) 刷新状态\n2) 设置/修改入站额度\n3) 取消入站额度\n4) 关闭流量限制\n0) 返回\n'
+      ui_option 1 "刷新状态"
+      ui_option 2 "设置 / 修改入站额度"
+      ui_option 3 "取消入站额度"
+      ui_option 4 "关闭流量限制"
     else
-      printf '操作\n1) 启用流量限制\n0) 返回\n'
+      ui_option 1 "启用流量限制"
     fi
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_footer "返回流量信息"
+    read -r -p "  请选择: " choice || { echo; return; }
     if traffic_limits_are_enabled; then
       case $choice in
         1) continue;;
@@ -489,12 +578,21 @@ main_menu() {
   ensure_config 2>/dev/null || true
   local choice
   while true; do
-    clear_screen
-    printf '%ssbctl · sing-box Linux 管理器%s  v%s\n' "$C_BOLD$C_BLUE" "$C_RESET" "$SBCTL_VERSION"
+    ui_page "sbctl · sing-box 管理控制台" "" "v${SBCTL_VERSION}"
     node_summary
     show_main_inbounds
-    printf '1) 入站管理\n2) 出站管理\n3) TLS 证书\n4) 流量信息\n5) BBR启用/关闭\n6) 服务管理\n7) 卸载\n0) 退出\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_section "代理与路由"
+    ui_option 1 "入站管理"
+    ui_option 2 "出站管理"
+    ui_section "证书与流量"
+    ui_option 3 "TLS 证书"
+    ui_option 4 "流量信息"
+    ui_section "系统与运维"
+    ui_option 5 "BBR 启用 / 关闭"
+    ui_option 6 "服务管理"
+    ui_option 7 "卸载"
+    ui_footer "退出"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) inbound_menu;; 2) outbound_menu;; 3) certificate_menu;; 4) traffic_menu;;
       5) run_menu_action toggle_bbr; pause;; 6) service_menu;; 7) clear_screen; run_menu_action uninstall_sing_box; pause;;

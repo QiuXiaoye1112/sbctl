@@ -112,16 +112,20 @@ delete_cloudflare_credentials() {
 cloudflare_credentials_menu() {
   local choice email=""
   while true; do
-    clear_screen; heading "Cloudflare DNS 凭据"
+    ui_page "Cloudflare DNS 凭据" "主菜单 › TLS 证书"
     if load_cloudflare_credentials; then
       email=$(sed -n 's/^[[:space:]]*dns_cloudflare_email[[:space:]]*=[[:space:]]*//p' "$CLOUDFLARE_INI" | head -1)
-      printf 'Cloudflare 邮箱: %s\nGlobal API Key: 已配置\n' "${email:-未知}"
+      ui_field "邮箱" "${email:-未知}"
+      ui_field "Global API Key" "$(ui_status "已配置")"
     else
-      printf 'Cloudflare 凭据: 未配置\n'
+      ui_field "凭据状态" "$(ui_status "未配置")"
     fi
-    printf '依赖自动续期证书: %s\n\n' "$(cloudflare_dependency_count)"
-    printf '1) 设置/替换邮箱和 Global API Key\n2) 删除凭据\n0) 返回\n'
-    read -r -p "请选择: " choice || { echo; return; }
+    ui_field "依赖此凭据续期" "$(cloudflare_dependency_count) 张证书"
+    ui_section "凭据操作"
+    ui_option 1 "设置 / 替换凭据"
+    ui_option 2 "删除凭据"
+    ui_footer "返回 TLS 证书"
+    read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
       1) run_menu_action save_cloudflare_credentials; pause;;
       2) run_menu_action delete_cloudflare_credentials; pause;;

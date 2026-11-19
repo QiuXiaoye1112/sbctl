@@ -76,6 +76,61 @@ hy2_build() {
     if $obfs!="" then .obfs={type:"salamander",password:$obfs} else . end')"
 }
 
+hy2_bandwidth_display() {
+  if [[ ${1:-0} == 0 ]]; then printf '不限'; else printf '%s Mbps' "$1"; fi
+}
+
+prompt_hy2_bandwidth() {
+  local __var=$1 label=$2 input
+  while true; do
+    prompt_optional input "$label" || return 1
+    if [[ -z $input || $input =~ ^[0-9]+$ ]]; then
+      printf -v "$__var" '%s' "$input"
+      return 0
+    fi
+    warn "请输入非负整数，或直接回车保留当前设置。"
+  done
+}
+
+hy2_modify_bandwidth() {
+  local tag=$1 current current_up current_down up down tmp rc=0
+  ensure_dependencies inbound-modify; require_supported_core; ensure_config
+  current=$(jq -er --arg tag "$tag" '
+    .inbounds[] | select(.tag==$tag and .type=="hysteria2") |
+    [(.up_mbps // 0), (.down_mbps // 0)] | @tsv
+  ' "$CONFIG_FILE") || { error "找不到 Hysteria2 入站：$tag"; return 1; }
+  IFS=$'\t' read -r current_up current_down <<<"$current"
+
+  ui_page "修改上下行限速 · ${tag}" "主菜单 › 入站管理"
+  ui_field "当前上行" "$(hy2_bandwidth_display "$current_up")"
+  ui_field "当前下行" "$(hy2_bandwidth_display "$current_down")"
+  printf '\n  回车保留当前设置，输入 0 表示不限。\n'
+  prompt_hy2_bandwidth up "上行限速 (Mbps)" || return 1
+  prompt_hy2_bandwidth down "下行限速 (Mbps)" || return 1
+  if [[ -z $up && -z $down ]]; then info "上下行限速未更改。"; return 0; fi
+
+  tmp=$(temp_file) || return 1
+  if jq --arg tag "$tag" --arg up "$up" --arg down "$down" '
+    def update($field; $value):
+      if $value == "" then .
+      elif ($value | tonumber) == 0 then del(.[$field])
+      else .[$field] = ($value | tonumber)
+      end;
+    (.inbounds[] | select(.tag==$tag and .type=="hysteria2")) |=
+      (update("up_mbps"; $up) | update("down_mbps"; $down))
+  ' "$CONFIG_FILE" >"$tmp"; then
+    if jq -es '.[0] == .[1]' "$CONFIG_FILE" "$tmp" >/dev/null; then
+      info "上下行限速未更改。"
+    else
+      apply_candidate "$tmp" || rc=$?
+    fi
+  else
+    rc=$?
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
 hy2_hop_check_conflicts() {
   local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
   new_start=${range%-*}; new_end=${range#*-}

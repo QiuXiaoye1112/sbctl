@@ -155,24 +155,20 @@ sing_box_version_summary() {
 }
 
 node_summary() {
-  local svc count=0 bbr ver
-  if [[ ${SBCTL_TESTING:-0} != 1 ]]; then
-    local load active
-    read -r load active _ <<< "$(_service_states)"
-    if [[ $load == not-found ]]; then svc=未安装
-    elif [[ $active == active ]]; then svc=运行中
-    else svc=已停止; fi
+  local svc boot ver count=0 bbr certs
+  read -r svc boot ver <<< "$(_service_summary_all)"
+  if [[ -r $CONFIG_FILE ]]; then count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf '?'); fi
+  bbr=$(bbr_state_summary)
+  certs=$(managed_certificate_count)
+  if (($(ui_width) >= 60)); then
+    printf '  服务 %s    自启 %s    sing-box %s\n' "$(ui_status "$svc")" "$(ui_status "$boot")" "$ver"
+    printf '  入站 %s 个    托管证书 %s 张    BBR %s\n' "$count" "$certs" "$(ui_status "$bbr")"
   else
-    svc=未安装
+    ui_field "服务 / 自启" "${svc} / ${boot}"
+    ui_field "sing-box" "$ver"
+    ui_field "入站 / 证书" "${count} 个 / ${certs} 张"
+    ui_field "BBR" "$(ui_status "$bbr")"
   fi
-  [[ -f $CONFIG_FILE ]] && count=$(jq '.inbounds|length' "$CONFIG_FILE" 2>/dev/null || printf 0)
-  if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-    if [[ $(< /proc/sys/net/ipv4/tcp_congestion_control) == bbr ]]; then bbr=已启用; else bbr=未启用; fi
-  else
-    bbr=不可用
-  fi
-  ver=$(sing_box_version_summary)
-  printf '服务: %s  |  入站: %s  |  BBR: %s  |  sing-box: %s\n' "$svc" "$count" "$bbr" "${ver:-已安装}"
 }
 
 # APT uses a foreground timeout when available so package hooks cannot suspend
