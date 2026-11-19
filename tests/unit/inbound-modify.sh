@@ -105,4 +105,42 @@ seed_config
 apply_mode=success
 if modify_inbound_transport anytls-edit; then printf 'AnyTLS transport edit must fail\n' >&2; exit 1; fi
 
+jq '.inbounds += [
+  {type:"hysteria2",tag:"hy2-edit",listen_port:8443,up_mbps:120,down_mbps:240,
+   tls:{enabled:true,server_name:"hy2.example.com"},users:[{name:"u",password:"fixture-only"}]},
+  {type:"hysteria2",tag:"hy2-other",listen_port:8444,up_mbps:50,down_mbps:60}
+]' "$CONFIG_FILE" >"$TMP/with-hy2.json"
+cp "$TMP/with-hy2.json" "$CONFIG_FILE"
+before_meta=$(sha256sum "$META_FILE")
+apply_candidate() {
+  printf 'apply\n' >>"$TMP/bandwidth-applies"
+  [[ $apply_mode == success ]] || return 1
+  cp "$1" "$CONFIG_FILE"
+}
+
+hy2_modify_bandwidth hy2-edit <<'INPUT'
+-10
+200
+
+INPUT
+jq -e '.inbounds[1].up_mbps==200 and .inbounds[1].down_mbps==240' "$CONFIG_FILE" >/dev/null
+hy2_modify_bandwidth hy2-edit <<< $'0\n350'
+jq -e '.inbounds[1] | (has("up_mbps")|not) and .down_mbps==350' "$CONFIG_FILE" >/dev/null
+hy2_modify_bandwidth hy2-edit <<< $'\n0'
+jq -e '.inbounds[1] | (has("up_mbps")|not) and (has("down_mbps")|not)' "$CONFIG_FILE" >/dev/null
+jq -es '.[0] == (.[1] | del(.inbounds[1].up_mbps,.inbounds[1].down_mbps))' "$CONFIG_FILE" "$TMP/with-hy2.json" >/dev/null
+[[ $(sha256sum "$META_FILE") == "$before_meta" ]]
+
+before_config=$(sha256sum "$CONFIG_FILE")
+hy2_modify_bandwidth hy2-edit <<< $'\n'
+hy2_modify_bandwidth hy2-edit <<< $'0\n0'
+if hy2_modify_bandwidth hy2-edit <<<"310"; then printf 'unexpected success on EOF\n' >&2; exit 1; fi
+if hy2_modify_bandwidth anytls-edit </dev/null; then printf 'unexpected success on AnyTLS\n' >&2; exit 1; fi
+[[ $(wc -l <"$TMP/bandwidth-applies") -eq 3 ]]
+[[ $(sha256sum "$CONFIG_FILE") == "$before_config" ]]
+
+apply_mode=failure
+if hy2_modify_bandwidth hy2-edit <<< $'80\n100'; then printf 'unexpected success on transaction failure\n' >&2; exit 1; fi
+[[ $(sha256sum "$CONFIG_FILE") == "$before_config" ]]
+
 printf 'inbound modify checks passed.\n'

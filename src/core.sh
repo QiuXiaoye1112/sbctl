@@ -2,11 +2,13 @@
 # sbctl core — logging, interaction, validators, temp files, and table helpers.
 # Domain and platform operations live in their dedicated modules.
 
-if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
   C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
   C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
 else
   C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+  C_DIM=""
 fi
 
 info()    { printf '%s[信息]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
@@ -23,7 +25,9 @@ warn_if_no_diagnostic() {
 }
 die()     { error "$*"; exit 1; }
 heading() { printf '\n%s%s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
-clear_screen() { clear 2>/dev/null || true; }
+clear_screen() {
+  if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then clear 2>/dev/null || true; fi
+}
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 is_root() { [[ $(id -u) -eq 0 ]]; }
 require_root() { [[ ${SBCTL_TESTING:-0} == 1 ]] && return 0; is_root || die "此操作需要 root 权限，请使用 sudo sbctl $*."; }
@@ -56,7 +60,7 @@ trap cleanup_session_on_exit EXIT
 
 pause() {
   [[ -t 0 ]] || return 0
-  read -r -p "按回车键继续..." _ || true
+  read -r -p "  按回车键返回菜单..." _ || true
 }
 
 confirm() {
@@ -117,10 +121,10 @@ choose() {
   local __var=$1 prompt=$2; shift 2
   local options=("$@") __choice="" i
   printf -v "$__var" '%s' ''
-  printf '%s\n' "$prompt"
-  for ((i=0;i<${#options[@]};i++)); do printf '  %d) %s\n' "$((i+1))" "${options[$i]}"; done
+  ui_section "$prompt"
+  for ((i=0;i<${#options[@]};i++)); do ui_option "$((i+1))" "${options[$i]}"; done
   while true; do
-    read -r -p "请选择 [1-${#options[@]}]: " __choice || { echo; return 1; }
+    read -r -p "  请选择 [1-${#options[@]}]: " __choice || { echo; return 1; }
     if [[ $__choice =~ ^[0-9]+$ ]] && ((__choice>=1 && __choice<=${#options[@]})); then
       printf -v "$__var" '%s' "$__choice"; return 0
     fi
@@ -220,6 +224,67 @@ _cert_run_bounded() { run_bounded "$@"; }
 
 temp_file() { mktemp "${TMPDIR:-/tmp}/sbctl.XXXXXX"; }
 timestamp() { date '+%Y%m%d-%H%M%S'; }
+
+# ---- interactive page layout ----
+ui_width() {
+  local columns=${COLUMNS:-}
+  if [[ ! $columns =~ ^[1-9][0-9]{0,3}$ && ${TERM:-dumb} != dumb ]] && [[ -t 0 || -t 2 ]]; then
+    columns=$(tput cols 2>/dev/null || true)
+  fi
+  [[ $columns =~ ^[1-9][0-9]{0,3}$ ]] || columns=72
+  if ((columns > 76)); then columns=76; fi
+  printf '%s' "$columns"
+}
+
+ui_rule() {
+  local columns line
+  columns=$(ui_width)
+  ((columns > 4)) || return 0
+  printf -v line '%*s' "$((columns - 4))" ''
+  printf '  %s%s%s\n' "$C_DIM" "${line// /─}" "$C_RESET"
+}
+
+ui_page() {
+  local title=$1 parent=${2-} note=${3-} title_width
+  clear_screen
+  if [[ -n $parent ]]; then printf '\n  %s%s%s\n' "$C_DIM" "$parent" "$C_RESET"; else printf '\n'; fi
+  printf '  %s%s%s' "$C_BOLD$C_CYAN" "$title" "$C_RESET"
+  if [[ -n $note ]]; then
+    display_width title_width "$title  $note"
+    if ((title_width + 2 > $(ui_width))); then printf '\n'; fi
+    printf '  %s%s%s' "$C_DIM" "$note" "$C_RESET"
+  fi
+  printf '\n'
+  ui_rule
+}
+
+ui_section() { printf '\n  %s%s%s\n' "$C_BOLD" "$1" "$C_RESET"; }
+
+ui_option() {
+  printf '    %s%s)%s %s\n' "$C_CYAN" "$1" "$C_RESET" "$2"
+}
+
+ui_footer() {
+  printf '\n'
+  ui_rule
+  ui_option 0 "${1:-返回}"
+}
+
+ui_field() {
+  printf '  %s' "$C_DIM"
+  print_table_cell "$1" 14
+  printf '%s %s\n' "$C_RESET" "$2"
+}
+
+ui_status() {
+  local label=$1 mark='○' color=$C_DIM
+  case $label in
+    运行中|已启用|已开启|已配置) mark='●'; color=$C_GREEN ;;
+    已停止|未启用) color=$C_YELLOW ;;
+    失败) mark='●'; color=$C_RED ;;
+  esac
+  printf '%s%s %s%s' "$color" "$mark" "$label" "$C_RESET"
+}
 
 # ---- terminal table helpers ----
 display_width() {

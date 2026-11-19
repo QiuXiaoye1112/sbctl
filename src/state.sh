@@ -75,7 +75,11 @@ apply_candidate_with_meta() {
     return 1
   fi
   rm -f "$cfg_rollback" "$meta_rollback"
-  info "配置已应用。"
+  if ((old_active)); then
+    info "配置已应用。"
+  else
+    info "配置已保存，sing-box 启动后生效。"
+  fi
 }
 
 # Config-only convenience API.

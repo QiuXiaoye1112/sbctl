@@ -745,34 +745,71 @@ list_domain_rules() {
 # Pure display — does NOT call ensure_config. Callers must validate config.
 list_outbound_overview() {
   [[ -f $CONFIG_FILE ]] || { info "还没有配置。"; return 0; }
-  local inbound outbound type server port user number=0
-  heading "入站与出站规则"
+  local context=${1-} inbound outbound type server port user display endpoint number=0 columns=72
+  if [[ $context == --menu ]]; then
+    columns=$(ui_width)
+    ui_section "入站默认出站"
+  else
+    heading "入站与出站规则"
+  fi
   if ! jq -e '.inbounds|length>0' "$CONFIG_FILE" >/dev/null; then
     info "还没有入站。"
   else
-    print_table_cell_clipped "入站" 26; printf '| 出站\n'
+    if [[ $context == --menu ]]; then
+      printf '  %s入站 → 出站%s\n' "$C_DIM" "$C_RESET"
+    else
+      print_table_cell_clipped "入站" 26; printf '| 出站\n'
+    fi
     while IFS= read -r inbound; do
       outbound=$(current_outbound_for_inbound "$inbound")
-      local display; display=$(_outbound_display_name "$outbound")
-      print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$display"
+      display=$(_outbound_display_name "$outbound")
+      if [[ $context == --menu ]]; then
+        printf '  %s → %s\n' "$inbound" "$display"
+      else
+        print_table_cell_clipped "$inbound" 26; printf '| %s\n' "$display"
+      fi
     done < <(jq -r '.inbounds[].tag' "$CONFIG_FILE")
   fi
 
-  heading "SOCKS5 / HTTP 出站"
+  if [[ $context == --menu ]]; then ui_section "SOCKS5 / HTTP 出站"; else heading "SOCKS5 / HTTP 出站"; fi
   if ! jq -e '.outbounds[]?|select(.type=="socks" or .type=="http")' "$CONFIG_FILE" >/dev/null; then
     info "还没有代理出站。"
     return 0
   fi
-  print_table_cell "序号" 4; printf '| '
-  print_table_cell_clipped "标签" 16; printf '| '
-  print_table_cell "协议" 7; printf '| '
-  print_table_cell_clipped "地址" 22; printf '| 用户\n'
+  if [[ $context == --menu ]]; then
+    if ((columns >= 64)); then
+      printf '  %s' "$C_DIM"
+      print_table_cell "标签" 18
+      print_table_cell "协议" 9
+      print_table_cell "地址" 24
+      printf '用户%s\n' "$C_RESET"
+    fi
+  else
+    print_table_cell "序号" 4; printf '| '
+    print_table_cell_clipped "标签" 16; printf '| '
+    print_table_cell "协议" 7; printf '| '
+    print_table_cell_clipped "地址" 22; printf '| 用户\n'
+  fi
   while IFS=$'\t' read -r outbound type server port user; do
     ((number+=1))
-    print_table_cell "$number" 4; printf '| '
-    print_table_cell_clipped "$outbound" 16; printf '| '
-    print_table_cell "$type" 7; printf '| '
-    print_table_cell_clipped "$(_outbound_endpoint_display "$server" "$port")" 22; printf '| %s\n' "${user:-无}"
+    endpoint=$(_outbound_endpoint_display "$server" "$port")
+    if [[ $context == --menu ]]; then
+      type=$(protocol_display_name "$type")
+      if ((columns >= 64)); then
+        printf '  '
+        print_table_cell_clipped "$outbound" 16; printf '  '
+        print_table_cell "$type" 7; printf '  '
+        print_table_cell_clipped "$endpoint" 22; printf '  '
+        print_table_cell_clipped "${user:-无}" "$((columns - 53))"; printf '\n'
+      else
+        printf '  %s · %s\n    %s\n    用户 %s\n' "$outbound" "$type" "$endpoint" "${user:-无}"
+      fi
+    else
+      print_table_cell "$number" 4; printf '| '
+      print_table_cell_clipped "$outbound" 16; printf '| '
+      print_table_cell "$type" 7; printf '| '
+      print_table_cell_clipped "$endpoint" 22; printf '| %s\n' "${user:-无}"
+    fi
   done < <(jq -r '.outbounds[]?|select(.type=="socks" or .type=="http")|[.tag,.type,.server,(.server_port|tostring),(.username//"")]|@tsv' "$CONFIG_FILE")
 }
 

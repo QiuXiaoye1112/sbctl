@@ -59,6 +59,7 @@ build_inbound() {
   local __json=$1 __host=$2 __public=$3 __hop=${4-} choice type tag listen port client_host="" tls="" reality_public="" name="" password="" uuid="" flow="" obfs_choice="" obfs_password="" up="" down="" selected_hop_range="" transport_json="null" ws_path=""
   choose choice "选择入站协议" "AnyTLS" "Hysteria2" "SOCKS5" "HTTP" || return 1
   case $choice in 1) type=anytls;; 2) type=hysteria2;; 3) type=socks;; 4) type=http;; esac
+  ui_section "监听与连接"
   prompt_tag tag "${type}-$(random_hex 2)" || return 1
   prompt_value listen "监听地址" "0.0.0.0" || return 1
 
@@ -101,6 +102,7 @@ build_inbound() {
       ;;
   esac
 
+  ui_section "用户与认证"
   case $type in
     anytls)
       prompt_value name "用户名称" "user-$(random_hex 2)" || return 1
@@ -173,6 +175,36 @@ add_inbound() {
   return "$rc"
 }
 
+ui_inbound_rows() {
+  local rows=$1 columns tag type port security transport users display_tag
+  columns=$(ui_width)
+  if ((columns >= 64)); then
+    printf '  %s' "$C_DIM"
+    print_table_cell "标签" 18
+    print_table_cell "协议" 12
+    print_table_cell "端口" 7
+    print_table_cell "安全" 10
+    print_table_cell "传输" 8
+    printf '用户%s\n' "$C_RESET"
+  fi
+  while IFS=$'\t' read -r tag type port security transport users; do
+    type=$(protocol_display_name "$type" || printf '%s' "$type")
+    if ((columns < 64)); then
+      display_tag=$(print_table_cell_clipped "$tag" "$((columns > 8 ? columns - 4 : 4))")
+      display_tag=${display_tag%"${display_tag##*[! ]}"}
+      printf '  %s%s%s\n    %s · %s · %s\n    端口 %s · 用户 %s\n' \
+        "$C_BOLD" "$display_tag" "$C_RESET" "$type" "$security" "$transport" "$port" "$users"
+    else
+      printf '  '
+      print_table_cell_clipped "$tag" 16; printf '  '
+      print_table_cell_clipped "$type" 10; printf '  '
+      print_table_cell "$port" 5; printf '  '
+      print_table_cell_clipped "$security" 8; printf '  '
+      print_table_cell_clipped "$transport" 6; printf '  %s\n' "$users"
+    fi
+  done <<<"$rows"
+}
+
 # Single-jq list_inbounds — one jq call for the entire table.
 # Does NOT call ensure_config/init_meta — callers must ensure config is valid.
 list_inbounds() {
@@ -182,6 +214,7 @@ list_inbounds() {
   # One jq call: produces TSV, empty means no inbounds
   rows=$(jq -r '.inbounds[] | [.tag,.type,(.listen_port|tostring),(if .tls.reality.enabled==true then "reality" elif .tls.enabled==true then "tls" else "none" end),(.transport.type // (if .type=="hysteria2" then "quic" else "tcp" end)),((.users//[])|length|tostring)] | @tsv' "$CONFIG_FILE")
   if [[ -z $rows ]]; then info "还没有入站。"; return 0; fi
+  if [[ ${1-} == --menu ]]; then ui_inbound_rows "$rows"; return; fi
 
   print_table_cell_clipped "标签" "$tag_width"; printf '| '
   print_table_cell_clipped "协议" "$type_width"; printf '| '
