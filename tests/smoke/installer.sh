@@ -42,4 +42,41 @@ bash ./install.sh 1.2.3 >/dev/null
 [[ -L $CASE_DIR/install/bin/sbctl ]]
 [[ $(<"$CASE_DIR/install.log") == 'install 1.2.3' ]]
 
+export PATH="$CASE_DIR/bin:$PATH"
+export SBCTL_DIST_URL=https://example.invalid/dist/sbctl
+export SBCTL_INSTALL_TARGET="$CASE_DIR/install/sbin/sbctl"
+export SBCTL_INSTALL_SYMLINK="$CASE_DIR/install/bin/sbctl"
+export SBCTL_INSTALL_TEST_SOURCE="$CASE_DIR/source/sbctl"
+export SBCTL_INSTALL_TEST_LOG="$CASE_DIR/install.log"
+printf 'existing core\n' >"$CASE_DIR/core"
+printf 'existing config\n' >"$CASE_DIR/config"
+printf 'untouched\n' >"$SBCTL_INSTALL_TEST_LOG"
+bash ./install.sh >"$CASE_DIR/update.out"
+[[ $(<"$SBCTL_INSTALL_TEST_LOG") == untouched ]]
+[[ $(<"$CASE_DIR/core") == 'existing core' && $(<"$CASE_DIR/config") == 'existing config' ]]
+grep -Fq '管理脚本已更新' "$CASE_DIR/update.out"
+bash ./install.sh 1.2.3 >/dev/null
+[[ $(<"$SBCTL_INSTALL_TEST_LOG") == 'install 1.2.3' ]]
+
+# Exercise the Alpine shell entry point without depending on the host OS.
+sed 's@\[ -f /etc/alpine-release \]@[ -f "$SBCTL_TEST_ALPINE_RELEASE" ]@' alpine/install.sh >"$CASE_DIR/alpine-install.sh"
+touch "$CASE_DIR/alpine-release"
+export SBCTL_TEST_ALPINE_RELEASE="$CASE_DIR/alpine-release"
+export SBCTL_INSTALL_TARGET="$CASE_DIR/alpine/sbin/sbctl"
+export SBCTL_INSTALL_SYMLINK="$CASE_DIR/alpine/bin/sbctl"
+cat >"$CASE_DIR/bin/apk" <<'SH'
+#!/usr/bin/env sh
+printf 'apk called\n' >>"$SBCTL_INSTALL_TEST_APK_LOG"
+SH
+chmod +x "$CASE_DIR/bin/apk"
+export SBCTL_INSTALL_TEST_APK_LOG="$CASE_DIR/apk.log"
+sh "$CASE_DIR/alpine-install.sh" >/dev/null
+[[ $(<"$SBCTL_INSTALL_TEST_LOG") == 'install ' || $(<"$SBCTL_INSTALL_TEST_LOG") == 'install' ]]
+printf 'untouched\n' >"$SBCTL_INSTALL_TEST_LOG"
+sh "$CASE_DIR/alpine-install.sh" >"$CASE_DIR/alpine-update.out"
+[[ $(<"$SBCTL_INSTALL_TEST_LOG") == untouched ]]
+grep -Fq '管理脚本已更新' "$CASE_DIR/alpine-update.out"
+sh "$CASE_DIR/alpine-install.sh" 1.2.3 >/dev/null
+[[ $(<"$SBCTL_INSTALL_TEST_LOG") == 'install 1.2.3' ]]
+
 printf 'installer smoke checks passed.\n'
