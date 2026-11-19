@@ -28,14 +28,32 @@ bootstrap_tmp_dir() {
 }
 
 candidate=$(bootstrap_tmp_dir) || die "无法创建引导安装临时文件。"
-trap 'rm -f "$candidate"' EXIT
+staged=""
+cleanup() { rm -f "$candidate"; [[ -z $staged ]] || rm -f "$staged"; }
+trap cleanup EXIT
 fetch "$DIST_URL" "$candidate" || die "sbctl 发行版下载失败。"
 grep -Fq '# Built from modular sources by scripts/build.sh.' "$candidate" || die "下载内容不是有效的 sbctl 发行版。"
 bash -n "$candidate" || die "sbctl 发行版语法校验失败。"
 
+[[ ! -L $TARGET ]] || die "目标路径是符号链接：$TARGET"
+if [[ -e $TARGET ]] && ! grep -Fq '# Built from modular sources by scripts/build.sh.' "$TARGET"; then
+  die "目标路径已存在且不是 sbctl：$TARGET"
+fi
+if [[ -e $SYMLINK && ! -L $SYMLINK && ! $SYMLINK -ef $TARGET ]]; then
+  die "快捷命令路径已被其他文件占用：$SYMLINK"
+fi
+mode=install
+if [[ $# -eq 0 && -f $TARGET ]]; then mode=update; fi
 install -d -m 755 "$(dirname "$TARGET")" "$(dirname "$SYMLINK")"
-install -m 755 "$candidate" "$TARGET"
+staged=$(mktemp "${TARGET}.tmp.XXXXXX")
+install -m 755 "$candidate" "$staged"
+mv -f "$staged" "$TARGET"
+staged=""
 ln -sfn "$TARGET" "$SYMLINK"
-info "正在安装/修复 sing-box..."
-"$TARGET" install "${1-}"
-info "完成。运行 sbctl 打开管理菜单。"
+if [[ $mode == update ]]; then
+  info "sbctl 管理脚本已更新。"
+else
+  info "正在安装/修复 sing-box..."
+  SBCTL_COMMAND_PATH="$TARGET" SBCTL_SYMLINK_PATH="$SYMLINK" "$TARGET" install "${1-}"
+  info "安装完成。运行 sbctl 打开管理菜单。"
+fi

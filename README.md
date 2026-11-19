@@ -54,7 +54,7 @@ Alpine Linux（以 root 运行）：
 wget -qO- https://raw.githubusercontent.com/QiuXiaoye1112/sbctl/main/alpine/install.sh | sh
 ```
 
-安装器会安装管理命令和 sing-box 核心；运行 `sbctl` 进入菜单，或使用 `sbctl install [版本]` 安装或修复核心。bootstrap 下载的是仓库 main 分支的发行文件；本地修改发布到该分支后上述远程命令才会生效。
+首次运行安装器会安装管理命令和 sing-box 核心。已有 sbctl 时，再次运行不带参数的安装命令会更新管理脚本。需要安装、更新或修复核心时，运行 `sbctl install [版本]`，也可以向安装器传入核心版本。运行 `sbctl` 进入菜单。bootstrap 下载仓库 main 分支的发行文件。
 
 ## 常用命令
 
