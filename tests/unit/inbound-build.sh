@@ -15,6 +15,19 @@ SBCTL_LOCK_FILE="$TMP/lock" \
 source ./sbctl.sh
 write_default_config
 
+(
+  detect_local_ips() { printf '%s\t%s\t%s\n' IPv4 192.0.2.20 eth0 IPv6 ::1 lo; }
+  # Use the selector sourced from sbctl.sh here, before the fixture override.
+  # shellcheck disable=SC2218
+  prompt_inbound_ip host <<<'1' >"$TMP/picker"
+  [[ $host == 192.0.2.20 && $(cat "$TMP/picker") != *'选择客户端连接地址类型'* ]]
+
+  detect_local_ips() { printf '%s\t%s\t%s\n' IPv4 127.0.0.1 lo IPv6 2001:db8::20 eth0; }
+  # shellcheck disable=SC2218
+  prompt_inbound_ip host <<<'1' >"$TMP/picker"
+  [[ $host == 2001:db8::20 && $(cat "$TMP/picker") != *'选择客户端连接地址类型'* ]]
+)
+
 case_protocol= case_security= case_transport= case_hop_mode= case_obfs=
 case_tag= case_port= case_name= case_password= case_listen= case_client_host=
 case_up= case_down= case_hop_range= case_internal_port= case_ws_path=
@@ -45,7 +58,6 @@ prompt_tag() { printf -v "$1" '%s' "$case_tag"; }
 prompt_value() {
   local __var=$1 prompt=$2
   case $prompt in
-    "监听地址") printf -v "$__var" '%s' "$case_listen" ;;
     "用户名称") printf -v "$__var" '%s' "$case_name" ;;
     "WebSocket 路径") printf -v "$__var" '%s' "$case_ws_path" ;;
     "端口跳跃范围") printf -v "$__var" '%s' "$case_hop_range" ;;
@@ -54,7 +66,7 @@ prompt_value() {
 }
 
 prompt_port() { printf -v "$1" '%s' "$case_port"; }
-prompt_public_host() { printf -v "$1" '%s' "$case_client_host"; }
+prompt_inbound_ip() { printf -v "$1" '%s' "$case_listen"; }
 prompt_optional() { printf -v "$1" '%s' "${case_username:-}"; }
 prompt_secret() {
   if [[ $2 == "混淆密码" ]]; then
@@ -121,15 +133,15 @@ run_build() {
   case $case_security in
     cert)
       assert_json '.tls.enabled==true and .tls.server_name=="cert.example.com" and .tls.certificate_path=="/tmp/cert.crt" and .tls.key_path=="/tmp/cert.key"'
-      [[ $host == cert.example.com && -z $public_key ]] || return 1
+      [[ $host == "$case_listen" && -z $public_key ]] || return 1
       ;;
     reality)
       assert_json '.tls.enabled==true and .tls.server_name=="reality.example.com" and .tls.reality.enabled==true and .tls.reality.handshake.server=="target.example.com" and .tls.reality.handshake.server_port==8443 and .tls.reality.private_key=="reality-private" and .tls.reality.short_id[0]=="deadbeef"'
-      [[ $host == reality-client.example.com && $public_key == reality-public ]] || return 1
+      [[ $host == "$case_listen" && $public_key == reality-public ]] || return 1
       ;;
     none)
       assert_json 'has("tls")|not'
-      [[ $host == 198.51.100.10 && -z $public_key ]] || return 1
+      [[ $host == "$case_listen" && -z $public_key ]] || return 1
       ;;
   esac
 
@@ -168,7 +180,7 @@ run_case() {
   case_hop_range=${11-30000-50000}
   case_internal_port=${12-10326}
   case_ws_path=${13-/ws-test}
-  case_listen='0.0.0.0'
+  case_listen='198.51.100.10'
   case_port=443
   case_name="${case_tag}-user"
   case_password="${case_tag}-password"

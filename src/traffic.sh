@@ -250,7 +250,7 @@ traffic_seed_periods() {
     traffic_validate_date "$day" || continue
     start=$(traffic_period_start "$day 23:59:59") || return 1
     mapping=$(jq -nc --argjson mapping "$mapping" --arg day "$day" --arg start "$start" '$mapping + {($day):$start}') || return 1
-  done < <(jq -r '[.inbounds[]?.daily | keys[]?] | unique[]' "$TRAFFIC_FILE")
+  done < <(jq -r '[.inbounds[]? | (.daily // {}) | keys[]] | unique[]' "$TRAFFIC_FILE")
   tmp=$(temp_file)
   jq --argjson mapping "$mapping" '
     .inbounds |= with_entries(
@@ -260,7 +260,8 @@ traffic_seed_periods() {
       ))
     ) | .periodsSeeded=true
   ' "$TRAFFIC_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
+  install -m 600 "$tmp" "$TRAFFIC_FILE" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
 
 traffic_update_file() {
@@ -308,7 +309,8 @@ traffic_update_file() {
     .inbounds |= with_entries(select((.value.deleted != true) or ((.value.daily|length) > 0) or ((.value.cycles|length) > 0) or (.value.limit.enabled==true))) |
     if $markCollected then .lastCollectedAt=$now else . end
   ' "$TRAFFIC_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
+  install -m 600 "$tmp" "$TRAFFIC_FILE" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
 
 traffic_sync_inventory() {
@@ -497,9 +499,14 @@ traffic_limit_is_blocked() {
   ' "$TRAFFIC_FILE" >/dev/null 2>&1
 }
 
+traffic_listener_rows() {
+  jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring),(.listen // "::")] | @tsv' "$CONFIG_FILE"
+}
+
 traffic_restore_nft_rules() {
-  local tag type port protocol blocked count=0 payload batch comment_count comment_block exists=0 rc=0
+  local tag type port address ip protocol blocked count=0 payload batch comment_count comment_block exists=0 rc=0 dst src rows
   command_exists nft || return 1
+  rows=$(traffic_listener_rows) || return 1
   if payload=$(nft -j list table inet "$TRAFFIC_NFT_TABLE" 2>/dev/null); then
     exists=1
     if ! jq -e '[.nftables[]?.rule | select(. != null) | select(((.comment // "") | startswith("sbctl-traffic:")) | not)] | length==0' <<<"$payload" >/dev/null; then
@@ -512,32 +519,49 @@ traffic_restore_nft_rules() {
   printf 'add table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
   printf 'add chain inet %s input { type filter hook input priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
   printf 'add chain inet %s output { type filter hook output priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
-  while IFS=$'\t' read -r tag type port; do
+  while IFS=$'\t' read -r tag type port address; do
     [[ -n $tag ]] && validate_port "$port" || continue
+    ip=$(normalize_socket_ip "$address") || { rc=1; break; }
+    case $ip in
+      0.0.0.0|::) dst="" ; src="" ;;
+      *:*) dst="ip6 daddr $ip "; src="ip6 saddr $ip " ;;
+      *) dst="ip daddr $ip "; src="ip saddr $ip " ;;
+    esac
     comment_count=$(jq -nr --arg s "sbctl-traffic:count:${tag}" '$s|@json')
     comment_block=$(jq -nr --arg s "sbctl-traffic:block:${tag}" '$s|@json')
     blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
     while IFS= read -r protocol; do
       if ((blocked)); then
-        printf 'add rule inet %s input %s dport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
-        printf 'add rule inet %s output %s sport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
+        printf 'add rule inet %s input %s%s dport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$dst" "$protocol" "$port" "$comment_block" >>"$batch"
+        printf 'add rule inet %s output %s%s sport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$src" "$protocol" "$port" "$comment_block" >>"$batch"
       fi
-      printf 'add rule inet %s input %s dport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
-      printf 'add rule inet %s output %s sport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
+      printf 'add rule inet %s input %s%s dport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$dst" "$protocol" "$port" "$comment_count" >>"$batch"
+      printf 'add rule inet %s output %s%s sport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$src" "$protocol" "$port" "$comment_count" >>"$batch"
       count=$((count + 1))
     done < <(traffic_protocols_for_type "$type")
-  done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null || true)
+  done <<<"$rows"
   if ((count == 0)); then
     : >"$batch"
     if ((exists)); then printf 'delete table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"; fi
   fi
-  if [[ -s $batch ]]; then nft -f "$batch" || rc=1; fi
+  if ((rc == 0)) && [[ -s $batch ]]; then nft -f "$batch" || rc=1; fi
   rm -f "$batch"
   return "$rc"
 }
 
 traffic_build_iptables_rules() {
-  local command tag type port protocol blocked count=0
+  local command tag type port address ip protocol blocked count=0 rows
+  local -a dst=() src=()
+  rows=$(traffic_listener_rows) || return 1
+  while IFS=$'\t' read -r tag type port address; do
+    [[ -n $tag ]] && validate_port "$port" || continue
+    ip=$(normalize_socket_ip "$address") || return 1
+    case $ip in
+      0.0.0.0|::) ;;
+      *:*) command_exists ip6tables || { warn "IPv6 流量统计需要 ip6tables。"; return 1; } ;;
+      *) command_exists iptables || { warn "IPv4 流量统计需要 iptables。"; return 1; } ;;
+    esac
+  done <<<"$rows"
   traffic_clear_iptables_rules || return 1
   for command in iptables ip6tables; do
     command_exists "$command" || continue
@@ -545,19 +569,26 @@ traffic_build_iptables_rules() {
     "$command" -t filter -N "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || return 1
     "$command" -t filter -C INPUT -j "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I INPUT 1 -j "$TRAFFIC_IPTABLES_IN_CHAIN" || return 1
     "$command" -t filter -C OUTPUT -j "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I OUTPUT 1 -j "$TRAFFIC_IPTABLES_OUT_CHAIN" || return 1
-    while IFS=$'\t' read -r tag type port; do
+    while IFS=$'\t' read -r tag type port address; do
       [[ -n $tag ]] && validate_port "$port" || continue
+      ip=$(normalize_socket_ip "$address") || return 1
+      dst=(); src=()
+      case $ip in
+        0.0.0.0|::) ;;
+        *:*) [[ $command == ip6tables ]] || continue; dst=(-d "$ip"); src=(-s "$ip") ;;
+        *) [[ $command == iptables ]] || continue; dst=(-d "$ip"); src=(-s "$ip") ;;
+      esac
       blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
       while IFS= read -r protocol; do
         if ((blocked)); then
-          "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
-          "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
+          "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" "${dst[@]}" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
+          "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" "${src[@]}" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
         fi
-        "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
-        "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
+        "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" "${dst[@]}" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
+        "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" "${src[@]}" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
         count=$((count + 1))
       done < <(traffic_protocols_for_type "$type")
-    done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null || true)
+    done <<<"$rows"
   done
   ((count > 0)) || traffic_clear_iptables_rules
 }
@@ -659,15 +690,17 @@ traffic_collect() {
   traffic_is_enabled || return 0
   require_root internal-traffic-collect
   traffic_lock_acquire || { warn "另一个流量采集任务正在运行。"; return 1; }
-  local counters samples rc=0
-  counters=$(traffic_read_counters) || rc=1
-  if ((rc == 0)); then
-    samples=$(traffic_samples_json <<<"$counters") || rc=1
-  fi
-  if ((rc == 0)); then traffic_update_file "$samples" || rc=1; fi
-  if ((rc == 0)); then traffic_rules_restore || rc=1; fi
+  local rc=0
+  traffic_save_counters && traffic_rules_restore || rc=1
   traffic_lock_release
   ((rc == 0)) || { warn "流量采集未完成，现有累计记录已尽量保留。"; return 1; }
+}
+
+traffic_save_counters() {
+  local counters samples
+  counters=$(traffic_read_counters) || return 1
+  samples=$(traffic_samples_json <<<"$counters") || return 1
+  traffic_update_file "$samples"
 }
 
 traffic_rename_records() {

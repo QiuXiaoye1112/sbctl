@@ -9,6 +9,9 @@ fi
 T=$(mktemp -d)
 NS="sbctl-hop-$$"
 trap 'kill ${http_pid:-} ${server_pid:-} ${client_pid:-} 2>/dev/null || true; ip netns del $NS 2>/dev/null || true; rm -rf "$T"' EXIT
+mount -t tmpfs tmpfs /run
+mkdir -p /run/netns
+mount --bind /run/netns /run/netns
 mount --make-rshared /run/netns
 ip netns add $NS
 ip link add sbctl-server type veth peer name sbctl-client

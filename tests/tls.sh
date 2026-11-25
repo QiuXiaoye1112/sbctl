@@ -26,6 +26,7 @@ SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t1/cfg" SBCTL_CONFIG_FILE="$TMP/t1/cfg/co
   SBCTL_META_FILE="$TMP/t1/meta.json" SBCTL_CERT_DIR="$TMP/t1/cfg/certs" SBCTL_LOCK_FILE="$TMP/t1/lock" \
 bash -c '
   set -Eeuo pipefail; source ./sbctl.sh; write_default_config
+  prompt_inbound_ip() { printf -v "$1" "%s" 192.0.2.10; }
   prompt_public_host_called=0; prompt_public_host() { prompt_public_host_called=1; }
   choose() {
     local __var=$1 prompt=$2
@@ -41,7 +42,7 @@ bash -c '
   build_inbound inbound host public hop
   [[ $(jq -r .type <<<"$inbound") == anytls ]]
   [[ $(jq -r .tls.server_name <<<"$inbound") == example.com ]]
-  [[ $host == example.com ]]
+  [[ $host == 192.0.2.10 ]]
   [[ $prompt_public_host_called == 0 ]]
 '
 
@@ -52,6 +53,7 @@ SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t2/cfg" SBCTL_CONFIG_FILE="$TMP/t2/cfg/co
   SBCTL_META_FILE="$TMP/t2/meta.json" SBCTL_CERT_DIR="$TMP/t2/cfg/certs" SBCTL_LOCK_FILE="$TMP/t2/lock" \
 bash -c '
   set -Eeuo pipefail; source ./sbctl.sh; write_default_config
+  prompt_inbound_ip() { printf -v "$1" "%s" 192.0.2.10; }
   prompt_public_host_called=0; prompt_public_host() { prompt_public_host_called=1; }
   choose() {
     local __var=$1 prompt=$2
@@ -70,7 +72,7 @@ bash -c '
   build_inbound inbound host public hop
   [[ $(jq -r .type <<<"$inbound") == hysteria2 ]]
   [[ $(jq -r .tls.server_name <<<"$inbound") == example.com ]]
-  [[ $host == example.com ]]
+  [[ $host == 192.0.2.10 ]]
   [[ $prompt_public_host_called == 0 ]]
 '
 
@@ -81,6 +83,7 @@ SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t3/cfg" SBCTL_CONFIG_FILE="$TMP/t3/cfg/co
   SBCTL_META_FILE="$TMP/t3/meta.json" SBCTL_CERT_DIR="$TMP/t3/cfg/certs" SBCTL_LOCK_FILE="$TMP/t3/lock" \
 bash -c '
   set -Eeuo pipefail; source ./sbctl.sh; write_default_config
+  prompt_inbound_ip() { printf -v "$1" "%s" 192.0.2.10; }
   prompt_public_host_called=0; prompt_public_host() { prompt_public_host_called=1; printf -v "$1" "%s" 5.6.7.8; }
   choose() {
     local __var=$1 prompt=$2
@@ -104,8 +107,8 @@ bash -c '
   [[ $(jq -r .type <<<"$inbound") == anytls ]]
   [[ $(jq -r .tls.server_name <<<"$inbound") == www.microsoft.com ]]
   [[ $(jq -r .tls.reality.enabled <<<"$inbound") == true ]]
-  [[ $host == 5.6.7.8 ]]
-  [[ $prompt_public_host_called == 1 ]]
+  [[ $host == 192.0.2.10 ]]
+  [[ $prompt_public_host_called == 0 ]]
 '
 
 # ============================================================
@@ -115,6 +118,7 @@ SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t4/cfg" SBCTL_CONFIG_FILE="$TMP/t4/cfg/co
   SBCTL_META_FILE="$TMP/t4/meta.json" SBCTL_CERT_DIR="$TMP/t4/cfg/certs" SBCTL_LOCK_FILE="$TMP/t4/lock" \
 bash -c '
   set -Eeuo pipefail; source ./sbctl.sh; write_default_config
+  prompt_inbound_ip() { printf -v "$1" "%s" 192.0.2.10; }
   prompt_public_host_called=0; prompt_public_host() { prompt_public_host_called=1; }
   choose() {
     local __var=$1 prompt=$2
@@ -141,13 +145,13 @@ bash -c '
   [[ $(jq -r .type <<<"$inbound") == hysteria2 ]]
   [[ $(jq -r .listen_port <<<"$inbound") == 10326 ]]
   [[ $(jq -r .tls.server_name <<<"$inbound") == example.com ]]
-  [[ $host == example.com ]]
+  [[ $host == 192.0.2.10 ]]
   [[ $hop == 30000-50000 ]]
   [[ $prompt_public_host_called == 0 ]]
 '
 
 # ============================================================
-# Test 5: modifying to cert TLS updates the client host to the certificate SNI
+# Test 5: modifying cert TLS preserves the existing connection address
 # ============================================================
 SBCTL_TESTING=1 SBCTL_CONFIG_DIR="$TMP/t5/cfg" SBCTL_CONFIG_FILE="$TMP/t5/cfg/config.json" \
   SBCTL_META_FILE="$TMP/t5/meta.json" SBCTL_CERT_DIR="$TMP/t5/cfg/certs" SBCTL_LOCK_FILE="$TMP/t5/lock" \
@@ -159,14 +163,14 @@ bash -c '
   choose() { printf -v "$1" "%s" 2; }
   build_certificate_tls() {
     printf -v "$1" "%s" "{\"enabled\":true,\"server_name\":\"cert.example.com\",\"certificate_path\":\"/tmp/c.crt\",\"key_path\":\"/tmp/c.key\"}"
-    printf -v "$2" "%s" cert.example.com
+    [[ -z ${2-} ]] || printf -v "$2" "%s" cert.example.com
   }
   public_host_for_tag() { printf "%s" old.example.com; }
   build_inbound_meta_candidate() { seen_host=$2; printf "{}" >"$5"; }
   apply_candidate_with_meta() { :; }
   seen_host=""
   modify_inbound_security anytls-existing
-  [[ $seen_host == cert.example.com ]]
+  [[ $seen_host == old.example.com ]]
 '
 
 echo "cert TLS host tests passed."

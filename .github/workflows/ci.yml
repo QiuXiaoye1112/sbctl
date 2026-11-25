@@ -9,8 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install fallback test dependencies
-        run: sudo apt-get update && sudo apt-get install -y curl jq openssl iproute2 python3
+      - name: Install network test dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq openssl iproute2 python3 nftables iptables
       - name: Download verified sing-box 1.13.18
         shell: bash
         run: |
@@ -37,6 +37,11 @@ jobs:
         run: bash tests/outbound-domain.sh
       - name: Real 1.13 TCP Happy Eyeballs fallback
         run: sudo --preserve-env=SBCTL_REAL_SING_BOX_BIN,SBCTL_EXPECT_SING_BOX_SERIES bash tests/outbound-fallback-tcp.sh
+      - name: Real Hysteria2 shared listeners, hopping ranges and quotas
+        run: |
+          sudo --preserve-env=SBCTL_REAL_SING_BOX_BIN bash tests/real-hy2-hop.sh
+          sudo --preserve-env=SBCTL_REAL_SING_BOX_BIN bash tests/real-hy2-ip-bind.sh
+          sudo --preserve-env=SBCTL_REAL_SING_BOX_BIN env SBCTL_TEST_BACKEND=iptables bash tests/real-hy2-ip-bind.sh
 
   smoke:
     runs-on: ubuntu-latest

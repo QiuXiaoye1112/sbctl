@@ -107,7 +107,8 @@ modify_inbound_menu() {
     fi
     ui_section "基础设置"
     ui_option 1 "修改入站名称"
-    ui_option 2 "修改地址和端口"
+    ui_option 2 "修改客户端连接地址"
+    ui_option 6 "修改监听端口"
     ui_section "安全与传输"
     ui_option 3 "修改安全方式 / 证书"
     if [[ $type == hysteria2 ]]; then
@@ -124,7 +125,8 @@ modify_inbound_menu() {
            if ! inbound_exists "$current_tag" && inbound_exists "$new_tag"; then current_tag=$new_tag; fi
          fi
          pause;;
-      2) run_menu_action modify_inbound_basic "$current_tag"; pause;;
+      2) run_menu_action modify_inbound_basic "$current_tag" address; pause;;
+      6) run_menu_action modify_inbound_basic "$current_tag" port; pause;;
       3) run_menu_action modify_inbound_security "$current_tag"; pause;;
       4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; *) warn "无效选项。";; esac; pause;;
       5) case $type in hysteria2) run_menu_action hy2_modify_bandwidth "$current_tag";; *) warn "无效选项。";; esac; pause;;

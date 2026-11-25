@@ -82,7 +82,7 @@ bash -c '
     local __var=$1
     printf -v "$__var" "%s" 443
   }
-  prompt_public_host() { printf -v "$1" "%s" 203.0.113.10; }
+  prompt_inbound_ip() { printf -v "$1" "%s" 203.0.113.10; }
   build_certificate_tls() { printf -v "$1" "%s" "{\"enabled\":true,\"server_name\":\"example.com\",\"certificate_path\":\"/tmp/a.crt\",\"key_path\":\"/tmp/a.key\"}"; }
   prompt_secret() { printf -v "$1" "%s" secret; }
   prompt_optional_positive_int() { printf -v "$1" "%s" ""; }
@@ -127,7 +127,7 @@ bash -c '
       "用户名称") printf -v "$__var" "%s" user-hop ;;
     esac
   }
-  prompt_public_host() { printf -v "$1" "%s" 203.0.113.10; }
+  prompt_inbound_ip() { printf -v "$1" "%s" 203.0.113.10; }
   build_certificate_tls() { printf -v "$1" "%s" "{\"enabled\":true,\"server_name\":\"example.com\",\"certificate_path\":\"/tmp/a.crt\",\"key_path\":\"/tmp/a.key\"}"; }
   prompt_secret() { printf -v "$1" "%s" secret; }
   prompt_optional_positive_int() { printf -v "$1" "%s" ""; }
@@ -173,7 +173,7 @@ bash -c '
       "端口跳跃范围") printf -v "$__var" "%s" 25000-35000 ;;
     esac
   }
-  prompt_public_host() { printf -v "$1" "%s" 203.0.113.10; }
+  prompt_inbound_ip() { printf -v "$1" "%s" 203.0.113.10; }
   build_certificate_tls() { printf -v "$1" "%s" "{}"; }
   warn() { :; }
 
@@ -226,7 +226,7 @@ JSON
 '
 
 # ============================================================
-# Test 6: NAT failure → hop meta disabled, share uses real port
+# Test 6: NAT failure rolls back the listener transaction
 # ============================================================
 SBCTL_TESTING=1 \
 SBCTL_CONFIG_DIR="$TMP/t6/cfg" \
@@ -240,24 +240,23 @@ bash -c '
   write_default_config
   init_meta
 
-  # Simulate: hopping meta set, but NAT sync fails
-  hy2_hop_meta_set hy2-fail "20000-30000"
-  [[ $(hy2_hop_range_for_tag hy2-fail) == 20000-30000 ]]
-
-  # Mock hy2_hop_sync to simulate NAT failure
-  hy2_hop_sync() { return 1; }
-
-  # Simulate add_inbound post-apply NAT failure path
-  if hy2_hop_apply_nat; then
+  sing_box_installed() { return 1; }
+  service_is_active() { return 1; }
+  config_before=$(cat "$CONFIG_FILE")
+  meta_before=$(cat "$META_FILE")
+  candidate=$(temp_file)
+  meta_candidate=$(temp_file)
+  jq '\''.inbounds += [{type:"hysteria2",tag:"hy2-fail",listen:"192.0.2.10",listen_port:443}]'\'' "$CONFIG_FILE" >"$candidate"
+  jq '\''.inbounds["hy2-fail"].hysteria2PortHopping={enabled:true,range:"20000-30000"}'\'' "$META_FILE" >"$meta_candidate"
+  calls=0
+  hy2_hop_sync() { ((calls+=1)); ((calls == 2)); }
+  if apply_candidate_with_meta "$candidate" "$meta_candidate" 1; then
     echo "NAT failure was not propagated" >&2; exit 1
-  else
-    warn "端口跳跃 NAT 配置失败，当前使用内部监听端口连接。"
-    hy2_hop_meta_disable hy2-fail
   fi
-
-  [[ -z $(hy2_hop_range_for_tag hy2-fail) ]]
+  [[ $(cat "$CONFIG_FILE") == "$config_before" && $(cat "$META_FILE") == "$meta_before" && $calls == 2 ]]
 
   (
+    uname() { printf "%s\n" Linux; }
     hy2_hop_enabled_count() { echo 1; }
     hy2_hop_ensure_backend() { :; }
     command_exists() { [[ $1 == nft ]]; }
@@ -297,34 +296,21 @@ JSON
   if hy2_hop_configure hy2-mod 1 </dev/null >/dev/null 2>&1; then exit 1; fi
   [[ $(cat "$CONFIG_FILE") == "$before_config" && $(cat "$META_FILE") == "$before_meta" ]]
 
-  # Enable hopping (assume_yes=1 mode) — fresh, no existing range
-  prompt_value() { printf -v "$1" "%s" 20000-40000; }
-  hy2_hop_check_conflicts() { return 0; }
-  nft() { :; }
-  command_exists() { [[ $1 == nft ]]; }
-  rc-service() { return 0; }
-  rc-update() { return 0; }
-  systemctl() { return 0; }
-  install_quick_command() { :; }
-  hy2_hop_boot_service_ensure() { :; }
-  hy2_hop_boot_service_remove() { :; }
+  # Exercise the transactional path for enabling, changing and disabling hopping.
+  ensure_dependencies() { :; }
+  sing_box_installed() { return 1; }
+  service_is_active() { return 1; }
+  hy2_hop_sync() { :; }
+  prompt_value() { printf -v "$1" "%s" "$range_choice"; }
+  range_choice=20000-40000
   hy2_hop_configure hy2-mod 1
   [[ $(hy2_hop_range_for_tag hy2-mod) == 20000-40000 ]]
 
-  # Modify range (has existing, user picks "1" to modify)
-  prompt_value() { printf -v "$1" "%s" 30000-50000; }
-  hy2_hop_configure() {
-    # Simulate the "modify existing" path: prompt → validate → set → sync
-    local tag=$1
-    hy2_hop_check_conflicts "30000-50000" "$tag" || return 1
-    hy2_hop_meta_set "$tag" "30000-50000"
-    hy2_hop_sync
-  }
-  hy2_hop_configure hy2-mod
+  range_choice=30000-50000
+  hy2_hop_configure hy2-mod <<<1
   [[ $(hy2_hop_range_for_tag hy2-mod) == 30000-50000 ]]
 
-  # Disable
-  hy2_hop_meta_disable hy2-mod
+  hy2_hop_configure hy2-mod <<<2
   [[ -z $(hy2_hop_range_for_tag hy2-mod) ]]
 '
 
@@ -386,11 +372,25 @@ JSON
   before_cfg=$(cat "$CONFIG_FILE"); before_meta=$(cat "$META_FILE")
   prompt_value() { printf -v "$1" "%s" 20000-30000; }
   hy2_pick_internal_port() { printf -v "$1" "%s" 45000; }
-  apply_candidate() { cp "$1" "$CONFIG_FILE"; }
+  ensure_dependencies() { :; }
+  sing_box_installed() { return 1; }
+  service_is_active() { return 1; }
   calls=0
   hy2_hop_sync() { ((calls+=1)); ((calls > 1)); }
   if hy2_hop_configure h 1; then exit 1; fi
   [[ $(cat "$CONFIG_FILE") == "$before_cfg" && $(cat "$META_FILE") == "$before_meta" && $calls == 2 ]]
+'
+
+SBCTL_TESTING=1 SBCTL_COMMAND_PATH="$TMP/t10/sbctl" SBCTL_OPENRC_INIT_DIR="$TMP/t10/init.d" bash -c '
+  source ./sbctl.sh
+  mkdir -p "$OPENRC_INIT_DIR"
+  touch "$QUICK_COMMAND"
+  chmod +x "$QUICK_COMMAND"
+  init_system() { printf "%s" openrc; }
+  rc-update() { :; }
+  hy2_hop_boot_service_ensure
+  sh -n "$OPENRC_INIT_DIR/sbctl-hy2-hop-restore"
+  grep -Fq "start() { \"$QUICK_COMMAND\" internal-hy2-hop-restore; }" "$OPENRC_INIT_DIR/sbctl-hy2-hop-restore"
 '
 
 printf 'hy2 hop tests passed.\n'

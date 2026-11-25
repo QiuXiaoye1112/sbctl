@@ -46,7 +46,9 @@ validate_candidate() {
 
 # Transactional config+meta apply.
 apply_candidate_with_meta() {
-  local candidate=$1 meta_candidate=${2:-} cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0
+  local candidate=$1 meta_candidate=${2:-} update_listeners=${3:-0}
+  local cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0 traffic_locked=0
+  local old_hop_rows="" new_hop_rows="" hop_changed=0
   ensure_config
   init_meta
   if [[ ${SBCTL_TAG_MIGRATION:-0} != 1 ]] && _config_has_missing_tags; then
@@ -58,23 +60,55 @@ apply_candidate_with_meta() {
     validate_metadata_candidate "$meta_candidate" \
       || { error "metadata 候选文件无效。"; return 1; }
   fi
+  if ((update_listeners)); then old_hop_rows=$(hy2_hop_rows) || return 1; fi
   service_is_active && old_active=1
-  cfg_rollback=$(temp_file)
-  meta_rollback=$(temp_file)
-  cp -a "$CONFIG_FILE" "$cfg_rollback"
-  if [[ -f $META_FILE ]]; then cp -a "$META_FILE" "$meta_rollback"; had_meta=1; fi
+  cfg_rollback=$(temp_file) || return 1
+  meta_rollback=$(temp_file) || { rm -f "$cfg_rollback"; return 1; }
+  if ! cp -a "$CONFIG_FILE" "$cfg_rollback" || { [[ -f $META_FILE ]] && ! cp -a "$META_FILE" "$meta_rollback"; }; then
+    rm -f "$cfg_rollback" "$meta_rollback"
+    return 1
+  fi
+  [[ ! -f $META_FILE ]] || had_meta=1
+  if ((update_listeners)) && traffic_is_enabled; then
+    if ! traffic_lock_acquire; then
+      rm -f "$cfg_rollback" "$meta_rollback"
+      warn "另一个流量采集任务正在运行。"
+      return 1
+    fi
+    traffic_locked=1
+    if ! traffic_save_counters; then
+      traffic_lock_release
+      rm -f "$cfg_rollback" "$meta_rollback"
+      error "旧流量未能保存，已取消监听变更。"
+      return 1
+    fi
+  fi
   install -m 600 "$candidate" "$CONFIG_FILE" || failed=1
   if ((failed == 0)) && [[ -n $meta_candidate ]]; then install -m 600 "$meta_candidate" "$META_FILE" || failed=1; fi
+  if ((failed == 0 && update_listeners)); then
+    if ! new_hop_rows=$(hy2_hop_rows); then
+      failed=1
+    elif [[ $new_hop_rows != "$old_hop_rows" ]]; then
+      hop_changed=1
+      hy2_hop_sync || failed=1
+    fi
+    if ((failed == 0 && traffic_locked)) && ! traffic_rules_restore; then failed=1; fi
+  fi
   if ((failed == 0 && old_active)) && ! restart_service_checked; then failed=1; fi
+  if ((failed == 0 && traffic_locked)) && ! traffic_update_file '{}' false; then failed=1; fi
   if ((failed)); then
     error "状态应用失败，正在回滚 config/meta。"
     install -m 600 "$cfg_rollback" "$CONFIG_FILE" || true
     if ((had_meta)); then install -m 600 "$meta_rollback" "$META_FILE" || true; else rm -f "$META_FILE"; fi
+    if ((hop_changed)); then hy2_hop_sync || warn "原端口跳跃规则恢复失败。"; fi
+    if ((traffic_locked)); then traffic_rules_restore || warn "原流量规则恢复失败。"; fi
     if ((old_active)); then service_restart >/dev/null 2>&1 || true; fi
     rm -f "$cfg_rollback" "$meta_rollback"
+    ((traffic_locked == 0)) || traffic_lock_release
     return 1
   fi
   rm -f "$cfg_rollback" "$meta_rollback"
+  ((traffic_locked == 0)) || traffic_lock_release
   if ((old_active)); then
     info "配置已应用。"
   else
@@ -405,10 +439,15 @@ meta_set_host() {
   install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
 }
 public_host_for_tag() {
-  local tag=$1 host=""
+  local tag=$1 host="" listen canonical
   host=$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE" 2>/dev/null || true)
   if [[ -z $host ]]; then
-    prompt_public_host host || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
+    listen=$(inbound_listen "$tag") || return 1
+    if canonical=$(normalize_socket_ip "$listen") && [[ $canonical != 0.0.0.0 && $canonical != :: ]]; then
+      host=$listen
+    else
+      prompt_public_host host >&2 || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
+    fi
   fi
   printf '%s' "$host"
 }

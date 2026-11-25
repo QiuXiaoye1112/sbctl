@@ -15,7 +15,8 @@ meta_cert_list() { :; }
 port_in_use_os() { return 1; }
 # Each prefix stops at a different prompt in the SOCKS builder. Call under
 # an if to exercise Bash's suppressed-errexit behavior used by add_inbound.
-for input in '' $'5\n' $'5\ntest\n' $'5\ntest\n127.0.0.1\n' $'5\ntest\n127.0.0.1\nexample.com\n' $'5\ntest\n127.0.0.1\nexample.com\n12345\n' $'5\ntest\n127.0.0.1\nexample.com\n12345\nuser\n'; do
+detect_local_ips() { printf '%s\t%s\t%s\n' IPv4 192.0.2.10 eth0 IPv6 ::1 lo; }
+for input in '' $'3\n' $'3\ntest\n' $'3\ntest\n1\n' $'3\ntest\n1\n12345\n' $'3\ntest\n1\n12345\nuser\n'; do
   printf '%s' "$input" >"$TMP/input"
   json=unchanged host=unchanged public=unchanged hop=unchanged
   if build_inbound json host public hop <"$TMP/input" >"$TMP/output" 2>&1; then

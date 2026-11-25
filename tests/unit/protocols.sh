@@ -31,11 +31,11 @@ choose() {
     "QUIC 混淆") printf -v "$__var" '%s' 1 ;;
   esac
 }
+prompt_inbound_ip() { printf -v "$1" '%s' 127.0.0.1; }
 prompt_tag() { printf -v "$1" '%s' hy2-no-obfs; }
 prompt_value() {
   local __var=$1 prompt=$2
   case $prompt in
-    "监听地址") printf -v "$__var" '%s' 127.0.0.1 ;;
     "用户名称") printf -v "$__var" '%s' alice ;;
   esac
 }
@@ -59,7 +59,6 @@ choose() {
     "选择入站协议") printf -v "$__var" '%s' 3 ;;
   esac
 }
-prompt_public_host() { printf -v "$1" '%s' 203.0.113.10; }
 prompt_optional() { printf -v "$1" '%s' ''; }
 inbound=''; host=''; public=''; hop=''
 build_inbound inbound host public hop

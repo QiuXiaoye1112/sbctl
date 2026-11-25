@@ -12,7 +12,7 @@
 
 ### 与 xrayctl 共存
 
-sbctl 可以与 xrayctl/Xray 同时安装。两者使用独立的命令、服务、配置、metadata、备份和 Certbot 环境。创建或修改 sing-box 入站及 Hysteria2 内部监听端口时，sbctl 只依据自身配置和 `ss`/`netstat` 的实时监听结果避开端口，不读取 xrayctl 配置，也不为已停止的 Xray 服务预留端口。sbctl 和 xrayctl 的自动端口都会固定避开 Hysteria2 默认跳跃范围 `30000-50000`；Hysteria2 自定义跳跃范围仍只检查 sbctl 自身范围是否重叠。
+sbctl 可以与 xrayctl/Xray 同时安装。两者使用独立的命令、服务、配置、metadata、备份和 Certbot 环境。创建或修改 sing-box 入站及 Hysteria2 内部监听端口时，sbctl 只依据自身配置和 `ss`/`netstat` 的实时监听结果避开端口，不读取 xrayctl 配置，也不为已停止的 Xray 服务预留端口。sbctl 和 xrayctl 的自动端口都会固定避开 Hysteria2 默认跳跃范围 `30000-50000`；Hysteria2 跳跃范围会检查同一目标 IP 上的其他跳跃范围及已占用的 UDP 端口。
 
 BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也都可以开启或关闭。关闭时会清理两者的已知持久化文件，避免重启后被另一份配置重新开启；第三方 sysctl 配置不会被修改。两套证书环境保持隔离，但 Certbot 操作会通过 `/run/lock/certbot.lock` 串行执行，避免同时操作 80 端口/nginx；同一个域名仍建议只交给一个工具自动签发和续期，避免重复申请。
 
@@ -33,6 +33,12 @@ BBR 是主机全局开关，sbctl 与 xrayctl 都读取内核当前状态，也�
 - systemd / OpenRC 服务管理和运行时硬化
 - BBR 能力检测和受限容器保护
 - 主菜单彻底删除、残留扫描和资源归属保护
+
+### 入站地址与共用端口
+
+新建入站时从本机地址列表选择一个 IPv4 或 IPv6，单栈主机直接显示对应地址列表。所选 IP 用于监听和分享链接，TLS 证书名称或 REALITY 的 SNI 单独配置。修改连接地址和监听端口各有独立菜单，旧入站的监听和分享地址会保留到手动修改为止。
+
+绑定不同 IP 的入站可以共用监听端口。启用端口跳跃的 Hysteria2 入站也可以在不同 IP 上使用同一段 UDP 端口，各自转发到对应的监听端口。流量和额度按入站标签独立计算。旧的通配监听仍可使用，并会与覆盖范围重叠的端口设置冲突。
 
 ### 本机 IPv6 出站回退边界
 
@@ -160,7 +166,7 @@ sing-box check -c <candidate>
 事务覆盖：
 
 - 新增入站
-- 修改监听地址/端口
+- 分别修改客户端连接地址和监听端口
 - 修改 TLS / REALITY
 - 入站重命名
 - 入站删除

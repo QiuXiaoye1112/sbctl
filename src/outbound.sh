@@ -26,37 +26,38 @@ _ifconfig_address_rows() {
 }
 
 detect_local_ips() {
-  local iface ip line
+  local scope=${1-} iface ip line
   if command_exists ip; then
     while IFS= read -r line; do
       iface=$(awk '{print $2}' <<<"$line")
       ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
-      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ $scope != inbound && $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
       validate_ipv4 "$ip" || continue
-      [[ $ip =~ ^127\. ]] && continue
+      [[ $scope != inbound && $ip =~ ^127\. ]] && continue
       printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
     done < <(ip -o -4 addr show 2>/dev/null)
     while IFS= read -r line; do
+      if [[ $scope == inbound && $line =~ [[:space:]](tentative|dadfailed)([[:space:]]|$) ]]; then continue; fi
       iface=$(awk '{print $2}' <<<"$line")
       ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
       ip=${ip%%%*}
-      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
-      [[ -z $ip || $ip == ::1 || $ip == fe80:* ]] && continue
+      [[ $scope != inbound && $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ -z $ip || $ip == fe80:* || ( $scope != inbound && $ip == ::1 ) ]] && continue
       printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
     done < <(ip -o -6 addr show 2>/dev/null)
   elif command_exists ifconfig; then
     local family
     while IFS=$'\t' read -r family ip iface; do
-      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ $scope != inbound && $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
       case $family in
         4)
           validate_ipv4 "$ip" || continue
-          [[ $ip =~ ^127\. ]] && continue
+          [[ $scope != inbound && $ip =~ ^127\. ]] && continue
           printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
           ;;
         6)
           validate_ip_literal "$ip" && ! validate_ipv4 "$ip" || continue
-          [[ $ip == ::1 || $ip == fe80:* ]] && continue
+          [[ $ip == fe80:* || ( $scope != inbound && $ip == ::1 ) ]] && continue
           printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
           ;;
       esac

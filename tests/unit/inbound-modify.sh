@@ -29,20 +29,8 @@ seed_config() {
   printf '%s\n' '{"schema":2,"inbounds":{"anytls-edit":{"host":"old-client.example.com","realityPublicKey":"old-public"}},"certificates":{},"managedResources":{},"migrations":{}}' >"$META_FILE"
 }
 
-prompt_value() {
-  local __var=$1 prompt=$2
-  case "$active_case:$prompt" in
-    basic:监听地址) printf -v "$__var" '%s' 127.0.0.1 ;;
-    *) printf -v "$__var" '%s' '' ;;
-  esac
-}
-
+prompt_inbound_ip() { printf -v "$1" '%s' 127.0.0.1; }
 prompt_port() { printf -v "$1" '%s' 24443; }
-prompt_public_host() {
-  if [[ $active_case == basic ]]; then printf -v "$1" '%s' basic-client.example.com
-  else printf -v "$1" '%s' reality-client.example.com
-  fi
-}
 
 choose() { printf -v "$1" '%s' "$security_choice"; }
 
@@ -67,13 +55,22 @@ build_inbound_meta_candidate() {
 apply_candidate_with_meta() {
   [[ $apply_mode == success ]] || return 1
   install -m 600 "$1" "$CONFIG_FILE"
-  install -m 600 "$2" "$META_FILE"
+  [[ -z $2 ]] || install -m 600 "$2" "$META_FILE"
 }
 
 seed_config
 modify_inbound_basic anytls-edit
 jq -e '.inbounds[]|select(.tag=="anytls-edit")|.listen=="127.0.0.1" and .listen_port==24443' "$CONFIG_FILE" >/dev/null
-[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == basic-client.example.com ]]
+[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == 127.0.0.1 ]]
+
+(
+  seed_config
+  before_meta=$(cat "$META_FILE")
+  prompt_inbound_ip() { return 99; }
+  modify_inbound_basic anytls-edit port
+  jq -e '.inbounds[] | select(.tag=="anytls-edit") | .listen=="0.0.0.0" and .listen_port==24443' "$CONFIG_FILE" >/dev/null
+  [[ $(cat "$META_FILE") == "$before_meta" ]]
+)
 
 seed_config
 active_case=security
@@ -88,7 +85,7 @@ active_case=security
 security_choice=2
 modify_inbound_security anytls-edit
 jq -e '.inbounds[]|select(.tag=="anytls-edit")|.tls.enabled==true and (.tls.reality.enabled // false)==false and .tls.server_name=="cert2.example.com" and .tls.certificate_path=="/tmp/cert2.crt"' "$CONFIG_FILE" >/dev/null
-[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == cert2.example.com ]]
+[[ $(jq -r '.inbounds["anytls-edit"].host' "$META_FILE") == old-client.example.com ]]
 [[ $(jq -r '.inbounds["anytls-edit"].realityPublicKey // empty' "$META_FILE") == '' ]]
 
 seed_config

@@ -48,6 +48,27 @@ output=$(apply_candidate_with_meta "$candidate" "$meta_candidate")
 [[ ! -e ${LOCK_FILE}.restarted ]]
 [[ $(jq -r '.inbounds[0].tag' "$CONFIG_FILE") == candidate ]]
 [[ $(jq -r '.inbounds.candidate.host' "$META_FILE") == example.com ]]
+
+traffic_is_enabled() { return 0; }
+traffic_save_counters() {
+  [[ $(jq -r '.inbounds[0].listen_port' "$CONFIG_FILE") == 32001 ]]
+  printf '%s\n' sample >>"${LOCK_FILE}.events"
+}
+traffic_rules_restore() {
+  local port
+  port=$(jq -r '.inbounds[0].listen_port' "$CONFIG_FILE")
+  printf 'rules %s\n' "$port" >>"${LOCK_FILE}.events"
+  [[ $port == 32001 ]]
+}
+hy2_hop_enabled_count() { printf '%s\n' 0; }
+jq '.inbounds[0].listen_port=443' "$CONFIG_FILE" >"$candidate"
+if apply_candidate_with_meta "$candidate" "$meta_candidate" 1; then
+  printf 'listener transaction accepted failed traffic rules\n' >&2
+  exit 1
+fi
+[[ $(cut -d' ' -f1 "${LOCK_FILE}.events" | paste -sd ' ' -) == 'sample rules rules' ]]
+[[ $(tail -n 1 "${LOCK_FILE}.events") == 'rules 32001' ]]
+[[ $(jq -r '.inbounds[0].listen_port' "$CONFIG_FILE") == 32001 && ! -e $TRAFFIC_LOCK ]]
 BASH
 
 printf 'state transaction integration checks passed.\n'
