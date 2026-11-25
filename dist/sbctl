@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SBCTL_VERSION="0.5.0"
-readonly SBCTL_BUILD_COMMIT="5823a54464ef"
+readonly SBCTL_BUILD_COMMIT="e142a7750624"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly SING_BOX_MIN_VERSION="1.12.0"
@@ -689,6 +689,54 @@ ensure_dependencies() {
   ((${#missing[@]} == 0)) || install_packages "${missing[@]}"
 }
 
+# Compare socket addresses independently of their textual IPv6 representation.
+normalize_socket_ip() {
+  local address=$1 a b c d piece left right result="" missing
+  local -a before=() after=()
+  if validate_ipv4 "$address"; then
+    IFS=. read -r a b c d <<<"$address"
+    printf '%d.%d.%d.%d\n' "$((10#$a))" "$((10#$b))" "$((10#$c))" "$((10#$d))"
+    return
+  fi
+  if [[ $address == *:*.* ]]; then
+    piece=${address##*:}
+    validate_ipv4 "$piece" || return 1
+    IFS=. read -r a b c d <<<"$piece"
+    address="${address%:*}:$(printf '%x:%x' "$((10#$a * 256 + 10#$b))" "$((10#$c * 256 + 10#$d))")"
+  fi
+  [[ $address == *:* && $address =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  if [[ $address == *::* ]]; then
+    left=${address%%::*}; right=${address#*::}
+    [[ $left != :* && $left != *: && $right != :* && $right != *: && $right != *::* ]] || return 1
+    [[ -z $left ]] || IFS=: read -r -a before <<<"$left"
+    [[ -z $right ]] || IFS=: read -r -a after <<<"$right"
+    missing=$((8 - ${#before[@]} - ${#after[@]}))
+    ((missing > 0)) || return 1
+  else
+    [[ $address != :* && $address != *: ]] || return 1
+    IFS=: read -r -a before <<<"$address"
+    ((${#before[@]} == 8)) || return 1
+    missing=0
+  fi
+  for piece in "${before[@]}"; do
+    [[ $piece =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    result+="$(printf '%04x:' "$((16#$piece))")"
+  done
+  while ((missing > 0)); do result+='0000:'; missing=$((missing - 1)); done
+  for piece in "${after[@]}"; do
+    [[ $piece =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    result+="$(printf '%04x:' "$((16#$piece))")"
+  done
+  result=${result%:}
+  case $result in
+    0000:0000:0000:0000:0000:0000:0000:0000) printf '::\n' ;;
+    0000:0000:0000:0000:0000:ffff:*)
+      left=${result%:*}; left=${left##*:}; right=${result##*:}
+      printf '%d.%d.%d.%d\n' "$((16#$left / 256))" "$((16#$left % 256))" "$((16#$right / 256))" "$((16#$right % 256))" ;;
+    *) printf '%s\n' "$result" ;;
+  esac
+}
+
 # ---- module: state ----
 # sbctl state — config/meta lifecycle, migrations, transactions, backup and restore.
 
@@ -737,7 +785,9 @@ validate_candidate() {
 
 # Transactional config+meta apply.
 apply_candidate_with_meta() {
-  local candidate=$1 meta_candidate=${2:-} cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0
+  local candidate=$1 meta_candidate=${2:-} update_listeners=${3:-0}
+  local cfg_rollback meta_rollback old_active=0 had_meta=0 failed=0 traffic_locked=0
+  local old_hop_rows="" new_hop_rows="" hop_changed=0
   ensure_config
   init_meta
   if [[ ${SBCTL_TAG_MIGRATION:-0} != 1 ]] && _config_has_missing_tags; then
@@ -749,23 +799,55 @@ apply_candidate_with_meta() {
     validate_metadata_candidate "$meta_candidate" \
       || { error "metadata 候选文件无效。"; return 1; }
   fi
+  if ((update_listeners)); then old_hop_rows=$(hy2_hop_rows) || return 1; fi
   service_is_active && old_active=1
-  cfg_rollback=$(temp_file)
-  meta_rollback=$(temp_file)
-  cp -a "$CONFIG_FILE" "$cfg_rollback"
-  if [[ -f $META_FILE ]]; then cp -a "$META_FILE" "$meta_rollback"; had_meta=1; fi
+  cfg_rollback=$(temp_file) || return 1
+  meta_rollback=$(temp_file) || { rm -f "$cfg_rollback"; return 1; }
+  if ! cp -a "$CONFIG_FILE" "$cfg_rollback" || { [[ -f $META_FILE ]] && ! cp -a "$META_FILE" "$meta_rollback"; }; then
+    rm -f "$cfg_rollback" "$meta_rollback"
+    return 1
+  fi
+  [[ ! -f $META_FILE ]] || had_meta=1
+  if ((update_listeners)) && traffic_is_enabled; then
+    if ! traffic_lock_acquire; then
+      rm -f "$cfg_rollback" "$meta_rollback"
+      warn "另一个流量采集任务正在运行。"
+      return 1
+    fi
+    traffic_locked=1
+    if ! traffic_save_counters; then
+      traffic_lock_release
+      rm -f "$cfg_rollback" "$meta_rollback"
+      error "旧流量未能保存，已取消监听变更。"
+      return 1
+    fi
+  fi
   install -m 600 "$candidate" "$CONFIG_FILE" || failed=1
   if ((failed == 0)) && [[ -n $meta_candidate ]]; then install -m 600 "$meta_candidate" "$META_FILE" || failed=1; fi
+  if ((failed == 0 && update_listeners)); then
+    if ! new_hop_rows=$(hy2_hop_rows); then
+      failed=1
+    elif [[ $new_hop_rows != "$old_hop_rows" ]]; then
+      hop_changed=1
+      hy2_hop_sync || failed=1
+    fi
+    if ((failed == 0 && traffic_locked)) && ! traffic_rules_restore; then failed=1; fi
+  fi
   if ((failed == 0 && old_active)) && ! restart_service_checked; then failed=1; fi
+  if ((failed == 0 && traffic_locked)) && ! traffic_update_file '{}' false; then failed=1; fi
   if ((failed)); then
     error "状态应用失败，正在回滚 config/meta。"
     install -m 600 "$cfg_rollback" "$CONFIG_FILE" || true
     if ((had_meta)); then install -m 600 "$meta_rollback" "$META_FILE" || true; else rm -f "$META_FILE"; fi
+    if ((hop_changed)); then hy2_hop_sync || warn "原端口跳跃规则恢复失败。"; fi
+    if ((traffic_locked)); then traffic_rules_restore || warn "原流量规则恢复失败。"; fi
     if ((old_active)); then service_restart >/dev/null 2>&1 || true; fi
     rm -f "$cfg_rollback" "$meta_rollback"
+    ((traffic_locked == 0)) || traffic_lock_release
     return 1
   fi
   rm -f "$cfg_rollback" "$meta_rollback"
+  ((traffic_locked == 0)) || traffic_lock_release
   if ((old_active)); then
     info "配置已应用。"
   else
@@ -1096,10 +1178,15 @@ meta_set_host() {
   install -m 600 "$tmp" "$META_FILE"; rm -f "$tmp"
 }
 public_host_for_tag() {
-  local tag=$1 host=""
+  local tag=$1 host="" listen canonical
   host=$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE" 2>/dev/null || true)
   if [[ -z $host ]]; then
-    prompt_public_host host || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
+    listen=$(inbound_listen "$tag") || return 1
+    if canonical=$(normalize_socket_ip "$listen") && [[ $canonical != 0.0.0.0 && $canonical != :: ]]; then
+      host=$listen
+    else
+      prompt_public_host host >&2 || { error "入站 ${tag} 缺少客户端连接地址；请在交互模式下修改入站并补填。"; return 1; }
+    fi
   fi
   printf '%s' "$host"
 }
@@ -1366,49 +1453,63 @@ hy2_port_in_default_hop_range() {
   hy2_port_in_range "$1" "30000-50000"
 }
 
+hy2_hop_rows() {
+  [[ -f $META_FILE ]] || return 0
+  local config
+  config=$(jq -c '.inbounds // []' "$CONFIG_FILE") || return 1
+  jq -r --argjson inbounds "$config" '
+    .inbounds | to_entries[] | select(.value.hysteria2PortHopping.enabled==true) |
+    .key as $tag | ($inbounds | map(select(.tag==$tag and .type=="hysteria2")) | first) as $inbound |
+    [$tag,.value.hysteria2PortHopping.range,($inbound.listen // "::"),($inbound.listen_port // 0)] | @tsv
+  ' "$META_FILE"
+}
+
 hy2_port_in_any_hop_range() {
-  local port=$1 range
-  while IFS= read -r range; do
-    [[ -n $range ]] || continue
-    hy2_port_in_range "$port" "$range" && return 0
-  done < <(jq -r '.inbounds[]?.hysteria2PortHopping.range // empty' "$META_FILE" 2>/dev/null || true)
+  local port=$1 address=${2:-::} tag range bind target
+  while IFS=$'\t' read -r tag range bind target; do
+    [[ -n $tag ]] && hy2_port_in_range "$port" "$range" && listener_addresses_overlap "$address" "$bind" && return 0
+  done < <(hy2_hop_rows)
   return 1
 }
 
 hy2_internal_port_available() {
-  local port=$1 range=$2
+  local port=$1 range=$2 address=${3:-::}
   validate_port "$port" || return 1
   hy2_port_in_default_hop_range "$port" && return 1
   hy2_port_in_range "$port" "$range" && return 1
-  port_in_config "$port" && return 1
-  port_in_use_os "$port" && return 1
+  hy2_port_in_any_hop_range "$port" "$address" && return 1
+  port_in_config "$port" "" "$address" && return 1
+  port_in_use_os "$port" "$address" && return 1
   return 0
 }
 
 hy2_pick_internal_port() {
-  local __var=$1 range=$2 candidate hex i
+  local __var=$1 range=$2 address=${3:-::} candidate hex i
   for ((i=0; i<256; i++)); do
     hex=$(random_hex 2); candidate=$((10000 + (16#$hex % 55536)))
-    if hy2_internal_port_available "$candidate" "$range"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
+    if hy2_internal_port_available "$candidate" "$range" "$address"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
   done
   for ((candidate=10000; candidate<=65535; candidate++)); do
-    if hy2_internal_port_available "$candidate" "$range"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
+    if hy2_internal_port_available "$candidate" "$range" "$address"; then printf -v "$__var" '%s' "$candidate"; return 0; fi
   done
   return 1
 }
 
 prompt_hy2_internal_port() {
-  local __var=$1 range=$2 value=""
+  local __var=$1 range=$2 address=${3:-::} value=""
   while true; do
     prompt_optional value "内部监听端口（留空自动选择）" || return 1
     if [[ -z $value ]]; then
-      hy2_pick_internal_port value "$range" || { error "找不到可用的内部监听端口。"; return 1; }
+      hy2_pick_internal_port value "$range" "$address" || { error "找不到可用的内部监听端口。"; return 1; }
       info "内部监听端口：${value}"; printf -v "$__var" '%s' "$value"; return 0
     fi
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
-    hy2_port_in_range "$value" "$range" && { warn "内部监听端口不能位于跳跃端口范围 ${range} 内。"; continue; }
-    port_in_config "$value" && { warn "该端口已被其他 sing-box 入站使用。"; continue; }
-    port_in_use_os "$value" && { warn "系统检测到该端口已被占用，请换一个端口。"; continue; }
+    value=$((10#$value))
+    if hy2_port_in_range "$value" "$range" || hy2_port_in_any_hop_range "$value" "$address"; then
+      warn "内部监听端口不能落在此地址的跳跃范围内。"; continue
+    fi
+    port_in_config "$value" "" "$address" && { warn "该地址的端口已被其他 sing-box 入站使用。"; continue; }
+    port_in_use_os "$value" "$address" && { warn "该地址的端口已被占用。"; continue; }
     printf -v "$__var" '%s' "$value"; return 0
   done
 }
@@ -1478,25 +1579,36 @@ hy2_modify_bandwidth() {
 }
 
 hy2_hop_check_conflicts() {
-  local range=$1 except_tag=${2-} new_start new_end tag existing existing_start existing_end
+  local range=$1 except_tag=${2-} address=${3:-::} new_start new_end tag existing existing_start existing_end bound port rows
+  validate_hy2_hop_range "$range" || return 1
   new_start=${range%-*}; new_end=${range#*-}
-  [[ -f $META_FILE ]] || return 0
-  while IFS=$'\t' read -r tag existing; do
-    [[ -n $tag && -n $existing ]] || continue
-    [[ $tag != "$except_tag" ]] || continue
+  rows=$(hy2_hop_rows) || return 1
+  while IFS=$'\t' read -r tag existing bound port; do
+    [[ -n $tag && $tag != "$except_tag" ]] || continue
+    validate_hy2_hop_range "$existing" || return 1
     existing_start=${existing%-*}; existing_end=${existing#*-}
-    # Overlap: new_start <= existing_end AND new_end >= existing_start
-    if ((10#$new_start <= 10#$existing_end && 10#$new_end >= 10#$existing_start)); then
-      warn "端口跳跃范围与入站 ${tag} 的 ${existing} 重叠，请重新选择。"
+    if ((10#$new_start <= 10#$existing_end && 10#$new_end >= 10#$existing_start)) &&
+       listener_addresses_overlap "$address" "$bound"; then
+      warn "此地址的端口跳跃范围与入站 ${tag} 的 ${existing} 重叠。"
       return 1
     fi
-  done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+  done <<<"$rows"
+  rows=$(jq -r --arg except "$except_tag" '
+    .inbounds[]? | select(.tag!=$except and (.type=="hysteria2" or .type=="socks")) |
+    [.tag,.listen_port,(.listen // "::")] | @tsv
+  ' "$CONFIG_FILE") || return 1
+  while IFS=$'\t' read -r tag port bound; do
+    [[ -n $tag ]] || continue
+    if hy2_port_in_range "$port" "$range" && listener_addresses_overlap "$address" "$bound"; then
+      warn "跳跃范围覆盖了入站 ${tag} 的 UDP 监听端口 ${port}。"
+      return 1
+    fi
+  done <<<"$rows"
+  if port_in_use_os "$range" "$address" "$except_tag" udp; then
+    warn "跳跃范围覆盖了此地址上正在使用的 UDP 端口。"
+    return 1
+  fi
   return 0
-}
-
-# Apply NAT rules only (meta must already be set). Called from add_inbound after apply.
-hy2_hop_apply_nat() {
-  hy2_hop_sync
 }
 
 hy2_hop_range_for_tag() {
@@ -1542,20 +1654,38 @@ hy2_hop_enabled_count() {
 }
 
 hy2_hop_ensure_backend() {
-  if command_exists nft || command_exists iptables; then return 0; fi
+  if command_exists nft || command_exists iptables || command_exists ip6tables; then return 0; fi
   info "端口跳跃需要 nftables/iptables，正在安装 nftables..."
-  install_packages nftables
-  command_exists nft || die "nftables 安装失败，无法启用 Hysteria2 端口跳跃。"
+  if ! (install_packages nftables) || ! command_exists nft; then
+    warn "nftables 安装失败，无法启用 Hysteria2 端口跳跃。"
+    return 1
+  fi
 }
 
 hy2_hop_clear_rules() {
   if command_exists nft; then
-    nft delete table inet sbctl_hy2_hop >/dev/null 2>&1 || true
-  elif command_exists iptables; then
-    iptables -t nat -F SBCTL_HY2_HOP 2>/dev/null || true
-    iptables -t nat -D PREROUTING -j SBCTL_HY2_HOP 2>/dev/null || true
-    iptables -t nat -X SBCTL_HY2_HOP 2>/dev/null || true
+    if nft list table inet sbctl_hy2_hop >/dev/null 2>&1; then
+      nft delete table inet sbctl_hy2_hop || return 1
+    fi
   fi
+  hy2_hop_clear_iptables_rules
+}
+
+hy2_hop_clear_iptables_rules() {
+  local cmd
+  for cmd in iptables ip6tables; do
+    command_exists "$cmd" || continue
+    while "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1; do
+      "$cmd" -t nat -D PREROUTING -p udp -j SBCTL_HY2_HOP || return 1
+    done
+    # Older installations attempted a jump without the UDP match.
+    while "$cmd" -t nat -C PREROUTING -j SBCTL_HY2_HOP >/dev/null 2>&1; do
+      "$cmd" -t nat -D PREROUTING -j SBCTL_HY2_HOP || return 1
+    done
+    if "$cmd" -t nat -S SBCTL_HY2_HOP >/dev/null 2>&1; then
+      "$cmd" -t nat -F SBCTL_HY2_HOP && "$cmd" -t nat -X SBCTL_HY2_HOP || return 1
+    fi
+  done
 }
 
 hy2_hop_boot_service_remove() {
@@ -1594,12 +1724,12 @@ EOF_UNIT
       systemctl enable sbctl-hy2-hop-restore.service >/dev/null 2>&1 || return 1
       ;;
     openrc)
-      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<'EOF_RC' || return 1
+      cat >"${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" <<EOF_RC || return 1
 #!/sbin/openrc-run
 name="sbctl-hy2-hop-restore"
 description="Restore sbctl Hysteria2 port hopping NAT rules"
-$(printf '%s' 'depend() { need net; }')
-$(printf '%s' 'start() { /usr/local/sbin/sbctl internal-hy2-hop-restore; }')
+depend() { need net; }
+start() { "${QUICK_COMMAND}" internal-hy2-hop-restore; }
 EOF_RC
       chmod 755 "${OPENRC_INIT_DIR}/sbctl-hy2-hop-restore" || return 1
       rc-update add sbctl-hy2-hop-restore default >/dev/null 2>&1 || return 1
@@ -1607,15 +1737,15 @@ EOF_RC
   esac
 }
 
-# Canonical hy2_hop_restore_all lives in hy2_nft.sh (nftables-aware version)
-
 hy2_hop_restore_all() {
   [[ $(uname -s) == Linux ]] || return 0
-  [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return 0; }
-  local count tag range target start end cmd
+  [[ -f $CONFIG_FILE ]] || { hy2_hop_clear_rules; return; }
+  local count tag range target start end cmd address ip endpoint rows
+  local -a match=() destination=()
   count=$(hy2_hop_enabled_count)
-  if ((count == 0)); then hy2_hop_clear_rules; return 0; fi
+  if ((count == 0)); then hy2_hop_clear_rules; return; fi
   hy2_hop_ensure_backend || return 1
+  rows=$(hy2_hop_rows) || return 1
   if command_exists nft; then
     local batch rc=0
     batch=$(temp_file) || return 1
@@ -1623,32 +1753,52 @@ hy2_hop_restore_all() {
       printf '%s\n' 'delete table inet sbctl_hy2_hop' >>"$batch"
     fi
     printf '%s\n' 'add table inet sbctl_hy2_hop' 'add chain inet sbctl_hy2_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }' >>"$batch"
-    while IFS=$'\t' read -r tag range; do
-      [[ -n $tag && -n $range ]] || continue
-      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
-      validate_hy2_hop_range "$range" && validate_port "$target" || { rc=1; break; }
-      printf 'add rule inet sbctl_hy2_hop prerouting udp dport %s redirect to :%s\n' "$range" "$target" >>"$batch"
-    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
-    if ((rc == 0)); then nft -f "$batch" || rc=1; fi
+    while IFS=$'\t' read -r tag range address target; do
+      [[ -n $tag && $target != 0 ]] || continue
+      validate_hy2_hop_range "$range" && validate_port "$target" && ip=$(normalize_socket_ip "$address") || { rc=1; break; }
+      range="$((10#${range%-*}))-$((10#${range#*-}))"
+      case $ip in
+        0.0.0.0|::) printf 'add rule inet sbctl_hy2_hop prerouting udp dport %s redirect to :%s\n' "$range" "$target" ;;
+        *:*) printf 'add rule inet sbctl_hy2_hop prerouting ip6 daddr %s udp dport %s dnat ip6 to [%s]:%s\n' "$ip" "$range" "$ip" "$target" ;;
+        *) printf 'add rule inet sbctl_hy2_hop prerouting ip daddr %s udp dport %s dnat ip to %s:%s\n' "$ip" "$range" "$ip" "$target" ;;
+      esac >>"$batch"
+    done <<<"$rows"
+    if ((rc == 0)); then
+      if nft -f "$batch"; then hy2_hop_clear_iptables_rules || rc=1; else rc=1; fi
+    fi
     rm -f "$batch"
     return "$rc"
   else
+    while IFS=$'\t' read -r tag range address target; do
+      [[ -n $tag && $target != 0 ]] || continue
+      validate_hy2_hop_range "$range" && validate_port "$target" && ip=$(normalize_socket_ip "$address") || return 1
+      case $ip in
+        0.0.0.0|::) ;;
+        *:*) command_exists ip6tables || { warn "IPv6 端口跳跃需要 ip6tables。"; return 1; } ;;
+        *) command_exists iptables || { warn "IPv4 端口跳跃需要 iptables。"; return 1; } ;;
+      esac
+    done <<<"$rows"
     for cmd in iptables ip6tables; do
       command_exists "$cmd" || continue
       "$cmd" -t nat -N SBCTL_HY2_HOP >/dev/null 2>&1 || true
       "$cmd" -t nat -F SBCTL_HY2_HOP || return 1
       "$cmd" -t nat -C PREROUTING -p udp -j SBCTL_HY2_HOP >/dev/null 2>&1 || "$cmd" -t nat -A PREROUTING -p udp -j SBCTL_HY2_HOP || return 1
     done
-    while IFS=$'\t' read -r tag range; do
-      [[ -n $tag && -n $range ]] || continue
-      target=$(jq -r --arg tag "$tag" '.inbounds[]?|select(.tag==$tag and .type=="hysteria2")|.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
-      validate_port "$target" || continue
-      start=${range%-*}; end=${range#*-}
+    while IFS=$'\t' read -r tag range address target; do
+      [[ -n $tag && $target != 0 ]] || continue
+      validate_hy2_hop_range "$range" && validate_port "$target" && ip=$(normalize_socket_ip "$address") || return 1
+      start=$((10#${range%-*})); end=$((10#${range#*-}))
       for cmd in iptables ip6tables; do
         command_exists "$cmd" || continue
-        "$cmd" -t nat -A SBCTL_HY2_HOP -p udp --dport "${start}:${end}" -j REDIRECT --to-ports "$target" || return 1
+        match=()
+        case $ip in
+          0.0.0.0|::) destination=(-j REDIRECT --to-ports "$target") ;;
+          *:*) [[ $cmd == ip6tables ]] || continue; match=(-d "$ip"); endpoint="[$ip]:$target"; destination=(-j DNAT --to-destination "$endpoint") ;;
+          *) [[ $cmd == iptables ]] || continue; match=(-d "$ip"); endpoint="$ip:$target"; destination=(-j DNAT --to-destination "$endpoint") ;;
+        esac
+        "$cmd" -t nat -A SBCTL_HY2_HOP "${match[@]}" -p udp --dport "${start}:${end}" "${destination[@]}" || return 1
       done
-    done < <(jq -r '.inbounds|to_entries[]|select(.value.hysteria2PortHopping.enabled==true)|[.key,.value.hysteria2PortHopping.range]|@tsv' "$META_FILE")
+    done <<<"$rows"
   fi
 }
 
@@ -1660,90 +1810,60 @@ hy2_hop_sync() {
     hy2_hop_restore_all || return 1
     hy2_hop_boot_service_ensure || return 1
   else
-    hy2_hop_clear_rules
+    hy2_hop_clear_rules || return 1
     hy2_hop_boot_service_remove
   fi
 }
 
-# Restore the pre-change state and its runtime rules after a failed update.
-hy2_hop_rollback() {
-  local cfg=$1 meta=$2 changed=$3 had_meta=${4:-1} failed=0
-  if ((changed)); then
-    apply_candidate "$cfg" || failed=1
-  fi
-  if ((had_meta)); then install -m 600 "$meta" "$META_FILE" || failed=1
-  else rm -f "$META_FILE" || failed=1; fi
-  hy2_hop_sync || failed=1
-  ((failed == 0)) || warn "端口跳跃回滚不完整，请检查配置、metadata 和 NAT 规则。"
-  return "$failed"
-}
-
 hy2_hop_configure() {
-  local tag=$1 assume_yes=${2:-0} type range current
+  local tag=$1 assume_yes=${2:-0} range current address choice tmp meta_tmp port rc=0
+  ensure_dependencies inbound-hopping
+  ensure_config
   inbound_exists "$tag" || { warn "入站不存在：$tag"; return 1; }
-  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE")
-  [[ $type == hysteria2 ]] || { warn "端口跳跃仅支持 Hysteria2 入站。"; return 1; }
+  jq -e --arg tag "$tag" 'any(.inbounds[]; .tag==$tag and .type=="hysteria2")' "$CONFIG_FILE" >/dev/null ||
+    { warn "端口跳跃仅支持 Hysteria2 入站。"; return 1; }
+  address=$(inbound_listen "$tag") || return 1
+  current=$(hy2_hop_range_for_tag "$tag") || return 1
+  choice=1
+  if [[ -n $current && $assume_yes != 1 ]]; then
+    printf '当前端口跳跃范围: %s\n1) 修改范围\n2) 关闭\n0) 返回\n' "$current"
+    read -r -p "请选择: " choice || { echo; return 0; }
+    case $choice in 1|2) ;; 0) return 0;; *) warn "无效选项。"; return 1;; esac
+  fi
 
-  current=$(hy2_hop_range_for_tag "$tag")
-  if [[ -n $current ]]; then
-    printf '当前端口跳跃范围: %s\n' "$current"
-    if [[ $assume_yes != 1 ]]; then
-      printf '1) 修改范围\n2) 关闭\n0) 返回\n'
-      local choice
-      read -r -p "请选择: " choice || { echo; return; }
-      case $choice in
-        1) :;;
-        2)
-          local old_meta old_cfg
-          old_meta=$(temp_file); old_cfg=$(temp_file)
-          cp -a "$META_FILE" "$old_meta" && cp -a "$CONFIG_FILE" "$old_cfg" || { rm -f "$old_meta" "$old_cfg"; return 1; }
-          if ! hy2_hop_meta_disable "$tag" || ! hy2_hop_sync; then
-            hy2_hop_rollback "$old_cfg" "$old_meta" 0 || true
-            rm -f "$old_meta" "$old_cfg"; return 1
-          fi
-          rm -f "$old_meta" "$old_cfg"
-          info "端口跳跃已关闭。"; return 0;;
-        0) return 0;;
-        *) warn "无效选项。"; return 1;;
-      esac
+  range=""
+  port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' "$CONFIG_FILE") || return 1
+  if [[ $choice == 1 ]]; then
+    while true; do
+      prompt_value range "端口跳跃范围" "${current:-30000-50000}" || return 1
+      validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
+      hy2_hop_check_conflicts "$range" "$tag" "$address" && break
+    done
+    if hy2_port_in_range "$port" "$range"; then
+      info "内部监听端口 ${port} 位于跳跃范围内，正在分配新端口。"
+      hy2_pick_internal_port port "$range" "$address" || { warn "无法分配可用端口。"; return 1; }
     fi
   fi
 
-  while true; do
-    prompt_value range "端口跳跃范围" "${current:-30000-50000}" || return 1
-    validate_hy2_hop_range "$range" || { warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"; continue; }
-    hy2_hop_check_conflicts "$range" "$tag" || continue
-    break
-  done
-
-  local listen_port internal_port tmp old_meta old_cfg changed=0 had_meta=0
-  old_meta=$(temp_file); old_cfg=$(temp_file)
-  if [[ -f $META_FILE ]]; then
-    cp -a "$META_FILE" "$old_meta" || { rm -f "$old_meta" "$old_cfg"; return 1; }
-    had_meta=1
+  init_meta
+  tmp=$(temp_file) || return 1
+  meta_tmp=$(temp_file) || { rm -f "$tmp"; return 1; }
+  if ! jq --arg tag "$tag" --argjson port "$port" '(.inbounds[] | select(.tag==$tag) | .listen_port)=$port' "$CONFIG_FILE" >"$tmp" ||
+     ! jq --arg tag "$tag" --arg range "$range" '
+       if $range=="" then del(.inbounds[$tag].hysteria2PortHopping)
+       else .inbounds[$tag].hysteria2PortHopping={enabled:true,range:$range} end
+     ' "$META_FILE" >"$meta_tmp"; then
+    rm -f "$tmp" "$meta_tmp"
+    return 1
   fi
-  cp -a "$CONFIG_FILE" "$old_cfg" || { rm -f "$old_meta" "$old_cfg"; return 1; }
-  listen_port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
-  if hy2_port_in_range "$listen_port" "$range"; then
-    warn "listen_port ${listen_port} 在跳跃范围内，需要重新选择内部端口。"
-    hy2_pick_internal_port internal_port "$range" || { rm -f "$old_meta" "$old_cfg"; warn "无法分配可用端口。"; return 1; }
-    tmp=$(temp_file)
-    if ! jq --arg tag "$tag" --argjson internal "$internal_port" '(.inbounds[]|select(.tag==$tag)) |= (.listen_port=$internal)' "$CONFIG_FILE" >"$tmp" || ! apply_candidate "$tmp"; then
-      rm -f "$tmp" "$old_meta" "$old_cfg"; return 1
-    fi
-    rm -f "$tmp"
-    changed=1
-    listen_port=$internal_port
+  apply_candidate_with_meta "$tmp" "$meta_tmp" 1 || rc=$?
+  rm -f "$tmp" "$meta_tmp"
+  ((rc == 0)) || return "$rc"
+  if [[ -n $range ]]; then
+    info "Hysteria2 端口跳跃已启用：${range} -> UDP ${port}"
+  else
+    info "端口跳跃已关闭。"
   fi
-  if ! hy2_hop_meta_set "$tag" "$range" || ! hy2_hop_sync; then
-    warn "端口跳跃 NAT 同步失败，正在恢复原状态。"
-    hy2_hop_rollback "$old_cfg" "$old_meta" "$changed" "$had_meta" || true
-    rm -f "$old_meta" "$old_cfg"; return 1
-  fi
-  rm -f "$old_meta" "$old_cfg"
-  traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
-  info "Hysteria2 端口跳跃已启用：${range} -> UDP ${listen_port}"
-
 }
 
 # Internal commands (called via dispatch)
@@ -1762,13 +1882,70 @@ internal_hy2_hop_clear() {
 # Uses a single jq call per display page.
 
 inbound_exists() { jq -e --arg tag "$1" '.inbounds[]?|select(.tag==$tag)' "$CONFIG_FILE" >/dev/null; }
-port_in_config() { jq -e --argjson port "$1" --arg except "${2-}" '.inbounds[]?|select(.listen_port==$port and .tag!=$except)' "$CONFIG_FILE" >/dev/null; }
-port_in_use_os() {
-  local port=$1
-  if command_exists ss; then ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"
-  elif command_exists netstat; then netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"
-  else return 1; fi
+inbound_listen() {
+  jq -r --arg tag "$1" '.inbounds[]? | select(.tag==$tag) | .listen // "::"' "$CONFIG_FILE"
 }
+
+# Treat legacy wildcards as overlapping either family, like their firewall rules.
+listener_addresses_overlap() {
+  local first second
+  first=$(normalize_socket_ip "$1") || first='*'
+  second=$(normalize_socket_ip "$2") || second='*'
+  case $first in 0.0.0.0|::|'*') return 0;; esac
+  case $second in 0.0.0.0|::|'*') return 0;; esac
+  [[ $first == "$second" ]]
+}
+
+port_in_config() {
+  local port=$1 except=${2-} address=${3:-::} rows bound
+  rows=$(jq -r --argjson port "$port" --arg except "$except" '
+    .inbounds[]? | select(.listen_port==$port and .tag!=$except) | .listen // "::"
+  ' "$CONFIG_FILE") || return 0
+  while IFS= read -r bound; do
+    [[ -n $bound ]] && listener_addresses_overlap "$address" "$bound" && return 0
+  done <<<"$rows"
+  return 1
+}
+
+port_in_use_os() {
+  local port=$1 address=${2:-::} except=${3-} transport=${4-} endpoints endpoint details bound bound_port
+  local old_address="" old_port="" own_binary=${SING_BOX_BIN##*/}
+  if command_exists ss && endpoints=$(ss -H -lntupe 2>/dev/null || ss -H -lntup 2>/dev/null); then
+    endpoints=$(awk '{print $5 "\t" $0}' <<<"$endpoints")
+  elif command_exists netstat && endpoints=$(netstat -lntup 2>/dev/null || netstat -lntu 2>/dev/null); then
+    endpoints=$(awk '$1 ~ /^(tcp|udp)/ {print $4 "\t" $0}' <<<"$endpoints")
+  else
+    return 1
+  fi
+  if [[ -n $except ]] && service_is_active; then
+    old_address=$(inbound_listen "$except")
+    old_port=$(jq -r --arg tag "$except" '.inbounds[]?|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")
+  fi
+  while IFS=$'\t' read -r endpoint details; do
+    [[ -z $transport || $details == "$transport"[[:space:]]* || $details == "${transport}6"[[:space:]]* ]] || continue
+    bound_port=${endpoint##*:}
+    if [[ $port == *-* ]]; then
+      hy2_port_in_range "$bound_port" "$port" || continue
+    else
+      [[ $bound_port == "$port" ]] || continue
+    fi
+    bound=${endpoint%:*}; bound=${bound#\[}; bound=${bound%\]}; bound=${bound%%%*}
+    if [[ $bound_port == "$old_port" && ( $details == *\""$own_binary"\"* || $details == *"/$own_binary" ) ]]; then
+      if [[ $(normalize_socket_ip "$bound" || printf '*') == "$(normalize_socket_ip "$old_address")" ]] ||
+         { [[ $bound == '*' || $bound == :: || $bound == 0.0.0.0 ]] &&
+           [[ $old_address == 0.0.0.0 || $old_address == :: ]]; }; then
+        continue
+      fi
+    fi
+    if [[ $bound == 0.0.0.0 && $address == *:* && $address != :: ]] ||
+       { [[ $bound == :: || $bound == '*' ]] && [[ $details == *v6only:1* && $address != *:* && $address != 0.0.0.0 ]]; }; then
+      continue
+    fi
+    listener_addresses_overlap "$address" "$bound" && return 0
+  done <<<"$endpoints"
+  return 1
+}
+
 prompt_tag() {
   local __var=$1 default=$2 value
   while true; do
@@ -1800,18 +1977,64 @@ _random_port_avoiding_hops() {
 }
 
 prompt_port() {
-  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} value current_port=""
+  local __var=$1 default=${2:-$(_random_port_avoiding_hops)} except=${3-} address=${4:-::} type=${5-} value
   while true; do
     prompt_value value "监听端口" "$default" || return 1
     validate_port "$value" || { warn "端口必须为 1-65535。"; continue; }
-    port_in_config "$value" "$except" && { warn "该端口已被其他入站使用。"; continue; }
-    [[ -z $except ]] || current_port=$(jq -r --arg tag "$except" '.inbounds[]?|select(.tag==$tag)|.listen_port // empty' "$CONFIG_FILE")
-    if port_in_use_os "$value" && ! { [[ -n $except && $value == "$current_port" ]] && service_is_active; }; then
-      warn "系统检测到端口 ${value} 已被占用，请换一个端口。"
+    value=$((10#$value))
+    port_in_config "$value" "$except" "$address" && { warn "该地址的端口已被其他入站使用。"; continue; }
+    port_in_use_os "$value" "$address" "$except" && { warn "该地址的端口已被占用。"; continue; }
+    if [[ $type == hysteria2 || $type == socks ]] && hy2_port_in_any_hop_range "$value" "$address"; then
+      warn "该端口已被此地址的 Hysteria2 跳跃范围覆盖。"
       continue
     fi
     printf -v "$__var" '%s' "$value"; return
   done
+}
+
+prompt_inbound_ip() {
+  local __out=$1 local_ip canonical family_choice=1 ip_choice
+  local label=${2:-选择要绑定的本机} network_v4=0 network_v6=0
+  local -a addresses_v4=() addresses_v6=()
+  local -A seen=()
+  while IFS=$'\t' read -r _ local_ip _; do
+    [[ -n $local_ip ]] || continue
+    canonical=$(normalize_socket_ip "$local_ip") || continue
+    case $canonical in 0.0.0.0|::|fe[89ab][0-9a-f]:*) continue;; esac
+    [[ -z ${seen[$canonical]+x} ]] || continue
+    seen[$canonical]=1
+    if [[ $canonical == *:* ]]; then
+      addresses_v6+=("$local_ip")
+      if [[ $canonical != 0000:0000:0000:0000:0000:0000:0000:0001 ]]; then network_v6=1; fi
+    else
+      addresses_v4+=("$canonical")
+      if [[ $canonical != 127.* ]]; then network_v4=1; fi
+    fi
+  done < <(detect_local_ips inbound)
+
+  # A loopback address alone does not make the other family available to clients.
+  if ((network_v4 || network_v6)); then
+    if ((network_v4 == 0)); then addresses_v4=(); fi
+    if ((network_v6 == 0)); then addresses_v6=(); fi
+  fi
+
+  if ((${#addresses_v4[@]} == 0 && ${#addresses_v6[@]} == 0)); then
+    warn "未检测到可绑定的本机 IPv4 或 IPv6 地址。"
+    return 1
+  fi
+  if ((${#addresses_v4[@]} > 0 && ${#addresses_v6[@]} > 0)); then
+    choose family_choice "选择客户端连接地址类型" "IPv4" "IPv6" || return 1
+  elif ((${#addresses_v4[@]} == 0)); then
+    family_choice=2
+  fi
+
+  if ((family_choice == 1)); then
+    choose ip_choice "${label} IPv4" "${addresses_v4[@]}" || return 1
+    printf -v "$__out" '%s' "${addresses_v4[$((ip_choice-1))]}"
+  else
+    choose ip_choice "${label} IPv6" "${addresses_v6[@]}" || return 1
+    printf -v "$__out" '%s' "${addresses_v6[$((ip_choice-1))]}"
+  fi
 }
 
 build_inbound() {
@@ -1820,25 +2043,21 @@ build_inbound() {
   case $choice in 1) type=anytls;; 2) type=hysteria2;; 3) type=socks;; 4) type=http;; esac
   ui_section "监听与连接"
   prompt_tag tag "${type}-$(random_hex 2)" || return 1
-  prompt_value listen "监听地址" "0.0.0.0" || return 1
+  prompt_inbound_ip listen || return 1
+  client_host=$listen
 
-  # ---- client_host resolution ----
-  #   cert TLS   → auto from certificate server_name (no prompt_public_host)
-  #   REALITY    → prompt_public_host (client_host may differ from SNI)
-  #   no TLS     → prompt_public_host
   case $type in
     anytls)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
       if [[ $choice == 1 ]]; then
         build_reality_tls tls reality_public || return 1
-        prompt_public_host client_host || return 1
       else
-        build_certificate_tls tls client_host || return 1
+        build_certificate_tls tls || return 1
       fi
-      prompt_port port || return 1
+      prompt_port port "" "" "$listen" "$type" || return 1
       ;;
     hysteria2)
-      build_certificate_tls tls client_host || return 1
+      build_certificate_tls tls || return 1
       local hop_choice
       choose hop_choice "端口模式" "普通端口" "端口跳跃" || return 1
       if [[ $hop_choice == 2 ]]; then
@@ -1847,17 +2066,16 @@ build_inbound() {
           validate_hy2_hop_range "$selected_hop_range" && break
           warn "格式：起始端口-结束端口，起始端口必须小于结束端口。"
         done
-        if ! hy2_hop_check_conflicts "$selected_hop_range" "$tag"; then
+        if ! hy2_hop_check_conflicts "$selected_hop_range" "$tag" "$listen"; then
           return 1
         fi
-        prompt_hy2_internal_port port "$selected_hop_range" || return 1
+        prompt_hy2_internal_port port "$selected_hop_range" "$listen" || return 1
       else
-        prompt_port port || return 1
+        prompt_port port "" "" "$listen" "$type" || return 1
       fi
       ;;
     socks|http)
-      prompt_public_host client_host || return 1
-      prompt_port port || return 1
+      prompt_port port "" "" "$listen" "$type" || return 1
       ;;
   esac
 
@@ -1910,20 +2128,10 @@ add_inbound() {
     rm -f "$meta_tmp"
     meta_tmp=$meta_tmp2
   fi
-  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    # Configure NAT rules post-apply for port hopping
-    if [[ $type == hysteria2 && -n $hop_range ]]; then
-      if hy2_hop_apply_nat; then
-        info "Hysteria2 端口跳跃已启用：${hop_range} -> UDP $(jq -r '.listen_port' <<<"$inbound")"
-      else
-        warn "端口跳跃 NAT 配置失败，正在恢复原跳跃规则。"
-        if ! hy2_hop_meta_disable "$tag" || ! hy2_hop_sync; then
-          warn "端口跳跃回滚不完整，请检查 metadata 和 NAT 规则。"
-          rc=1
-        fi
-      fi
+  if apply_candidate_with_meta "$tmp" "$meta_tmp" 1; then
+    if [[ -n $hop_range ]]; then
+      info "Hysteria2 端口跳跃已启用：${hop_range} -> UDP $(jq -r '.listen_port' <<<"$inbound")"
     fi
-    traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
     heading "入站已创建"
     show_inbound "$tag"
     print_share "$tag" "" || true
@@ -2043,23 +2251,56 @@ delete_inbound() {
 
 modify_inbound_basic() {
   ensure_dependencies inbound-modify; ensure_config
-  local tag=${1-} listen port host public tmp meta_tmp rc=0
+  local tag=${1-} mode=${2:-both} listen port type old_listen old_port hop_range tmp meta_tmp="" rc=0
   [[ -n $tag ]] || select_inbound tag || return 0
   inbound_exists "$tag" || die "找不到入站：$tag"
-  prompt_value listen "监听地址" "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen // "0.0.0.0"' "$CONFIG_FILE")" || return 1
-  prompt_port port "$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE")" "$tag" || return 1
-  prompt_public_host host "$(public_host_for_tag "$tag")" || return 1
-  public=$(jq -r --arg tag "$tag" '.inbounds[$tag].realityPublicKey // empty' "$META_FILE" 2>/dev/null || true)
-  tmp=$(temp_file); meta_tmp=$(temp_file)
-  jq --arg tag "$tag" --arg listen "$listen" --argjson port "$port" '(.inbounds[]|select(.tag==$tag)) |= (.listen=$listen | .listen_port=$port)' "$CONFIG_FILE" >"$tmp"
-  build_inbound_meta_candidate "$tag" "$host" "$public" "$tmp" "$meta_tmp"
-  if apply_candidate_with_meta "$tmp" "$meta_tmp"; then
-    hy2_hop_sync || { warn "入站已修改，但端口跳跃规则同步失败，请重试同步。"; rc=1; }
-    traffic_after_config_change || warn "流量统计规则未能同步，请在流量信息中刷新。"
-  else
-    rc=$?
+  old_listen=$(inbound_listen "$tag") || return 1
+  old_port=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.listen_port' "$CONFIG_FILE") || return 1
+  type=$(jq -r --arg tag "$tag" '.inbounds[]|select(.tag==$tag)|.type' "$CONFIG_FILE") || return 1
+  listen=$old_listen; port=$old_port
+  if [[ $mode != port ]]; then
+    info "监听地址：$old_listen"
+    prompt_inbound_ip listen || return 1
   fi
-  rm -f "$tmp" "$meta_tmp"
+  if [[ $mode != address ]]; then
+    prompt_port port "$old_port" "$tag" "$listen" "$type" || return 1
+  elif port_in_config "$port" "$tag" "$listen" || port_in_use_os "$port" "$listen" "$tag"; then
+    warn "该地址的端口已被占用。"
+    return 1
+  fi
+  hop_range=$(hy2_hop_range_for_tag "$tag") || return 1
+  if [[ -n $hop_range ]]; then
+    hy2_hop_check_conflicts "$hop_range" "$tag" "$listen" || return 1
+  fi
+  if [[ $type == hysteria2 || $type == socks ]] && hy2_port_in_any_hop_range "$port" "$listen"; then
+    warn "监听端口不能落在此地址的跳跃范围内。"
+    return 1
+  fi
+  if [[ $listen == "$old_listen" && $port == "$old_port" ]] &&
+     { [[ $mode == port ]] || [[ $listen == "$(jq -r --arg tag "$tag" '.inbounds[$tag].host // empty' "$META_FILE" 2>/dev/null)" ]]; }; then
+    info "监听设置未更改。"
+    return 0
+  fi
+  tmp=$(temp_file) || return 1
+  if ! jq --arg tag "$tag" --arg listen "$listen" --arg mode "$mode" --argjson port "$port" '
+    (.inbounds[] | select(.tag==$tag)) |=
+      (if $mode=="port" then . else .listen=$listen end |
+       if $mode=="address" then . else .listen_port=$port end)
+  ' "$CONFIG_FILE" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ $mode != port ]]; then
+    init_meta
+    meta_tmp=$(temp_file) || { rm -f "$tmp"; return 1; }
+    if ! jq --arg tag "$tag" --arg listen "$listen" '.inbounds[$tag].host=$listen' "$META_FILE" >"$meta_tmp"; then
+      rm -f "$tmp" "$meta_tmp"
+      return 1
+    fi
+  fi
+  apply_candidate_with_meta "$tmp" "$meta_tmp" 1 || rc=$?
+  rm -f "$tmp"
+  [[ -z $meta_tmp ]] || rm -f "$meta_tmp"
   return "$rc"
 }
 
@@ -2087,18 +2328,15 @@ modify_inbound_security() {
   case $type in
     anytls)
       choose choice "选择 TLS 安全层" "REALITY" "证书 TLS" || return 1
-      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public || return 1; else build_certificate_tls tls host || return 1; fi
+      if protocol_capability "$type" reality && [[ $choice == 1 ]]; then build_reality_tls tls public || return 1; else build_certificate_tls tls || return 1; fi
       ;;
     hysteria2)
       info "Hysteria2 必须使用证书 TLS。"
-      build_certificate_tls tls host || return 1
+      build_certificate_tls tls || return 1
       ;;
     *) die "${type} 入站没有 sbctl 可管理的 TLS/REALITY 安全层。";;
   esac
-  if [[ -z $host ]]; then
-    host=$(public_host_for_tag "$tag" || true)
-    [[ -n $host ]] || prompt_public_host host || return 1
-  fi
+  host=$(public_host_for_tag "$tag") || return 1
   tmp=$(temp_file); meta_tmp=$(temp_file)
   jq --arg tag "$tag" --argjson tls "$tls" --arg type "$type" '
     (.inbounds[]|select(.tag==$tag)|.tls)=$tls |
@@ -2373,37 +2611,38 @@ _ifconfig_address_rows() {
 }
 
 detect_local_ips() {
-  local iface ip line
+  local scope=${1-} iface ip line
   if command_exists ip; then
     while IFS= read -r line; do
       iface=$(awk '{print $2}' <<<"$line")
       ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
-      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ $scope != inbound && $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
       validate_ipv4 "$ip" || continue
-      [[ $ip =~ ^127\. ]] && continue
+      [[ $scope != inbound && $ip =~ ^127\. ]] && continue
       printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
     done < <(ip -o -4 addr show 2>/dev/null)
     while IFS= read -r line; do
+      if [[ $scope == inbound && $line =~ [[:space:]](tentative|dadfailed)([[:space:]]|$) ]]; then continue; fi
       iface=$(awk '{print $2}' <<<"$line")
       ip=$(awk '{print $4}' <<<"$line"); ip=${ip%/*}
       ip=${ip%%%*}
-      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
-      [[ -z $ip || $ip == ::1 || $ip == fe80:* ]] && continue
+      [[ $scope != inbound && $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ -z $ip || $ip == fe80:* || ( $scope != inbound && $ip == ::1 ) ]] && continue
       printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
     done < <(ip -o -6 addr show 2>/dev/null)
   elif command_exists ifconfig; then
     local family
     while IFS=$'\t' read -r family ip iface; do
-      [[ $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
+      [[ $scope != inbound && $iface =~ ^(docker|br-|veth|virbr|lo|lxc|cali|flannel|cilium) ]] && continue
       case $family in
         4)
           validate_ipv4 "$ip" || continue
-          [[ $ip =~ ^127\. ]] && continue
+          [[ $scope != inbound && $ip =~ ^127\. ]] && continue
           printf '%s (IPv4)\t%s\t%s\n' "$ip" "$ip" "$iface"
           ;;
         6)
           validate_ip_literal "$ip" && ! validate_ipv4 "$ip" || continue
-          [[ $ip == ::1 || $ip == fe80:* ]] && continue
+          [[ $ip == fe80:* || ( $scope != inbound && $ip == ::1 ) ]] && continue
           printf '%s (IPv6)\t%s\t%s\n' "$ip" "$ip" "$iface"
           ;;
       esac
@@ -3938,7 +4177,7 @@ traffic_seed_periods() {
     traffic_validate_date "$day" || continue
     start=$(traffic_period_start "$day 23:59:59") || return 1
     mapping=$(jq -nc --argjson mapping "$mapping" --arg day "$day" --arg start "$start" '$mapping + {($day):$start}') || return 1
-  done < <(jq -r '[.inbounds[]?.daily | keys[]?] | unique[]' "$TRAFFIC_FILE")
+  done < <(jq -r '[.inbounds[]? | (.daily // {}) | keys[]] | unique[]' "$TRAFFIC_FILE")
   tmp=$(temp_file)
   jq --argjson mapping "$mapping" '
     .inbounds |= with_entries(
@@ -3948,7 +4187,8 @@ traffic_seed_periods() {
       ))
     ) | .periodsSeeded=true
   ' "$TRAFFIC_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
+  install -m 600 "$tmp" "$TRAFFIC_FILE" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
 
 traffic_update_file() {
@@ -3996,7 +4236,8 @@ traffic_update_file() {
     .inbounds |= with_entries(select((.value.deleted != true) or ((.value.daily|length) > 0) or ((.value.cycles|length) > 0) or (.value.limit.enabled==true))) |
     if $markCollected then .lastCollectedAt=$now else . end
   ' "$TRAFFIC_FILE" >"$tmp" || { rm -f "$tmp"; return 1; }
-  install -m 600 "$tmp" "$TRAFFIC_FILE"; rm -f "$tmp"
+  install -m 600 "$tmp" "$TRAFFIC_FILE" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
 
 traffic_sync_inventory() {
@@ -4185,9 +4426,14 @@ traffic_limit_is_blocked() {
   ' "$TRAFFIC_FILE" >/dev/null 2>&1
 }
 
+traffic_listener_rows() {
+  jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring),(.listen // "::")] | @tsv' "$CONFIG_FILE"
+}
+
 traffic_restore_nft_rules() {
-  local tag type port protocol blocked count=0 payload batch comment_count comment_block exists=0 rc=0
+  local tag type port address ip protocol blocked count=0 payload batch comment_count comment_block exists=0 rc=0 dst src rows
   command_exists nft || return 1
+  rows=$(traffic_listener_rows) || return 1
   if payload=$(nft -j list table inet "$TRAFFIC_NFT_TABLE" 2>/dev/null); then
     exists=1
     if ! jq -e '[.nftables[]?.rule | select(. != null) | select(((.comment // "") | startswith("sbctl-traffic:")) | not)] | length==0' <<<"$payload" >/dev/null; then
@@ -4200,32 +4446,49 @@ traffic_restore_nft_rules() {
   printf 'add table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
   printf 'add chain inet %s input { type filter hook input priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
   printf 'add chain inet %s output { type filter hook output priority -5; policy accept; }\n' "$TRAFFIC_NFT_TABLE" >>"$batch"
-  while IFS=$'\t' read -r tag type port; do
+  while IFS=$'\t' read -r tag type port address; do
     [[ -n $tag ]] && validate_port "$port" || continue
+    ip=$(normalize_socket_ip "$address") || { rc=1; break; }
+    case $ip in
+      0.0.0.0|::) dst="" ; src="" ;;
+      *:*) dst="ip6 daddr $ip "; src="ip6 saddr $ip " ;;
+      *) dst="ip daddr $ip "; src="ip saddr $ip " ;;
+    esac
     comment_count=$(jq -nr --arg s "sbctl-traffic:count:${tag}" '$s|@json')
     comment_block=$(jq -nr --arg s "sbctl-traffic:block:${tag}" '$s|@json')
     blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
     while IFS= read -r protocol; do
       if ((blocked)); then
-        printf 'add rule inet %s input %s dport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
-        printf 'add rule inet %s output %s sport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_block" >>"$batch"
+        printf 'add rule inet %s input %s%s dport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$dst" "$protocol" "$port" "$comment_block" >>"$batch"
+        printf 'add rule inet %s output %s%s sport %s drop comment %s\n' "$TRAFFIC_NFT_TABLE" "$src" "$protocol" "$port" "$comment_block" >>"$batch"
       fi
-      printf 'add rule inet %s input %s dport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
-      printf 'add rule inet %s output %s sport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$protocol" "$port" "$comment_count" >>"$batch"
+      printf 'add rule inet %s input %s%s dport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$dst" "$protocol" "$port" "$comment_count" >>"$batch"
+      printf 'add rule inet %s output %s%s sport %s counter comment %s\n' "$TRAFFIC_NFT_TABLE" "$src" "$protocol" "$port" "$comment_count" >>"$batch"
       count=$((count + 1))
     done < <(traffic_protocols_for_type "$type")
-  done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null || true)
+  done <<<"$rows"
   if ((count == 0)); then
     : >"$batch"
     if ((exists)); then printf 'delete table inet %s\n' "$TRAFFIC_NFT_TABLE" >>"$batch"; fi
   fi
-  if [[ -s $batch ]]; then nft -f "$batch" || rc=1; fi
+  if ((rc == 0)) && [[ -s $batch ]]; then nft -f "$batch" || rc=1; fi
   rm -f "$batch"
   return "$rc"
 }
 
 traffic_build_iptables_rules() {
-  local command tag type port protocol blocked count=0
+  local command tag type port address ip protocol blocked count=0 rows
+  local -a dst=() src=()
+  rows=$(traffic_listener_rows) || return 1
+  while IFS=$'\t' read -r tag type port address; do
+    [[ -n $tag ]] && validate_port "$port" || continue
+    ip=$(normalize_socket_ip "$address") || return 1
+    case $ip in
+      0.0.0.0|::) ;;
+      *:*) command_exists ip6tables || { warn "IPv6 流量统计需要 ip6tables。"; return 1; } ;;
+      *) command_exists iptables || { warn "IPv4 流量统计需要 iptables。"; return 1; } ;;
+    esac
+  done <<<"$rows"
   traffic_clear_iptables_rules || return 1
   for command in iptables ip6tables; do
     command_exists "$command" || continue
@@ -4233,19 +4496,26 @@ traffic_build_iptables_rules() {
     "$command" -t filter -N "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || return 1
     "$command" -t filter -C INPUT -j "$TRAFFIC_IPTABLES_IN_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I INPUT 1 -j "$TRAFFIC_IPTABLES_IN_CHAIN" || return 1
     "$command" -t filter -C OUTPUT -j "$TRAFFIC_IPTABLES_OUT_CHAIN" >/dev/null 2>&1 || "$command" -t filter -I OUTPUT 1 -j "$TRAFFIC_IPTABLES_OUT_CHAIN" || return 1
-    while IFS=$'\t' read -r tag type port; do
+    while IFS=$'\t' read -r tag type port address; do
       [[ -n $tag ]] && validate_port "$port" || continue
+      ip=$(normalize_socket_ip "$address") || return 1
+      dst=(); src=()
+      case $ip in
+        0.0.0.0|::) ;;
+        *:*) [[ $command == ip6tables ]] || continue; dst=(-d "$ip"); src=(-s "$ip") ;;
+        *) [[ $command == iptables ]] || continue; dst=(-d "$ip"); src=(-s "$ip") ;;
+      esac
       blocked=0; traffic_limit_is_blocked "$tag" && blocked=1
       while IFS= read -r protocol; do
         if ((blocked)); then
-          "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
-          "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
+          "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" "${dst[@]}" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
+          "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" "${src[@]}" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:block:${tag}" -j DROP || return 1
         fi
-        "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
-        "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
+        "$command" -t filter -A "$TRAFFIC_IPTABLES_IN_CHAIN" "${dst[@]}" -p "$protocol" --dport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
+        "$command" -t filter -A "$TRAFFIC_IPTABLES_OUT_CHAIN" "${src[@]}" -p "$protocol" --sport "$port" -m comment --comment "sbctl-traffic:count:${tag}" -j RETURN || return 1
         count=$((count + 1))
       done < <(traffic_protocols_for_type "$type")
-    done < <(jq -r '.inbounds[]? | [.tag,.type,(.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null || true)
+    done <<<"$rows"
   done
   ((count > 0)) || traffic_clear_iptables_rules
 }
@@ -4347,15 +4617,17 @@ traffic_collect() {
   traffic_is_enabled || return 0
   require_root internal-traffic-collect
   traffic_lock_acquire || { warn "另一个流量采集任务正在运行。"; return 1; }
-  local counters samples rc=0
-  counters=$(traffic_read_counters) || rc=1
-  if ((rc == 0)); then
-    samples=$(traffic_samples_json <<<"$counters") || rc=1
-  fi
-  if ((rc == 0)); then traffic_update_file "$samples" || rc=1; fi
-  if ((rc == 0)); then traffic_rules_restore || rc=1; fi
+  local rc=0
+  traffic_save_counters && traffic_rules_restore || rc=1
   traffic_lock_release
   ((rc == 0)) || { warn "流量采集未完成，现有累计记录已尽量保留。"; return 1; }
+}
+
+traffic_save_counters() {
+  local counters samples
+  counters=$(traffic_read_counters) || return 1
+  samples=$(traffic_samples_json <<<"$counters") || return 1
+  traffic_update_file "$samples"
 }
 
 traffic_rename_records() {
@@ -6995,7 +7267,8 @@ modify_inbound_menu() {
     fi
     ui_section "基础设置"
     ui_option 1 "修改入站名称"
-    ui_option 2 "修改地址和端口"
+    ui_option 2 "修改客户端连接地址"
+    ui_option 6 "修改监听端口"
     ui_section "安全与传输"
     ui_option 3 "修改安全方式 / 证书"
     if [[ $type == hysteria2 ]]; then
@@ -7012,7 +7285,8 @@ modify_inbound_menu() {
            if ! inbound_exists "$current_tag" && inbound_exists "$new_tag"; then current_tag=$new_tag; fi
          fi
          pause;;
-      2) run_menu_action modify_inbound_basic "$current_tag"; pause;;
+      2) run_menu_action modify_inbound_basic "$current_tag" address; pause;;
+      6) run_menu_action modify_inbound_basic "$current_tag" port; pause;;
       3) run_menu_action modify_inbound_security "$current_tag"; pause;;
       4) case $type in hysteria2) run_menu_action hy2_hop_configure "$current_tag";; *) warn "无效选项。";; esac; pause;;
       5) case $type in hysteria2) run_menu_action hy2_modify_bandwidth "$current_tag";; *) warn "无效选项。";; esac; pause;;
