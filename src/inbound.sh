@@ -7,7 +7,7 @@ inbound_listen() {
   jq -r --arg tag "$1" '.inbounds[]? | select(.tag==$tag) | .listen // "::"' "$CONFIG_FILE"
 }
 
-# Treat legacy wildcards as overlapping either family, like their firewall rules.
+# Treat legacy wildcards as overlapping either address family.
 listener_addresses_overlap() {
   local first second
   first=$(normalize_socket_ip "$1") || first='*'
