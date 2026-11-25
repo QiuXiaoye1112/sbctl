@@ -195,7 +195,7 @@ bash -c '
 '
 
 run_generated_case() {
-  local name=$1 input=$2 assertion=$3 expected_share=$4 expected_host=${5:-1.2.3.4} case_dir
+  local name=$1 input=$2 assertion=$3 expected_share=$4 case_dir
   case_dir="$MOCK/$name"
   mkdir -p "$case_dir"
   SBCTL_SING_BOX_BIN="$MOCK/sing-box" \
@@ -204,34 +204,31 @@ run_generated_case() {
   SBCTL_META_FILE="$case_dir/meta.json" \
   SBCTL_CERT_DIR="$case_dir/certs" \
   SBCTL_LOCK_FILE="$case_dir/lock" \
-  TEST_INPUT="$input" TEST_ASSERTION="$assertion" TEST_SHARE="$expected_share" TEST_HOST="$expected_host" \
+  TEST_INPUT="$input" TEST_ASSERTION="$assertion" TEST_SHARE="$expected_share" \
   bash -c '
     set -Eeuo pipefail
     source ./sbctl.sh
-    detect_public_ipv4(){ return 1; }
-    detect_public_ipv6(){ return 1; }
+    detect_local_ips() { printf "IPv4\t127.0.0.1\tlo\n"; }
     add_inbound <<<"$TEST_INPUT"
     tag=$(jq -r .inbounds[0].tag "$CONFIG_FILE")
     jq -e "$TEST_ASSERTION" "$CONFIG_FILE" >/dev/null
-    [[ $(jq -r --arg tag "$tag" ".inbounds[\$tag].host" "$META_FILE") == "$TEST_HOST" ]]
+    [[ $(jq -r --arg tag "$tag" ".inbounds[\$tag].host" "$META_FILE") == 127.0.0.1 ]]
     share=$(print_share "$tag" "")
     grep -Fq "$TEST_SHARE" <<<"$share"
   '
 }
 
-run_generated_case anytls $'1\n\n\n1\n\n\n1.2.3.4\n24443\n\n\n' \
+run_generated_case anytls $'1\n\n1\n1\n\n\n24443\n\n\n' \
   '.inbounds[0].type=="anytls" and .inbounds[0].tls.reality.enabled==true' \
   '"type": "anytls"'
 
-run_generated_case socks $'3\n\n127.0.0.1\n127.0.0.1\n24449\nalice\n\n' \
+run_generated_case socks $'3\n\n1\n24449\nalice\n\n' \
   '.inbounds[0].type=="socks" and .inbounds[0].users[0].username=="alice"' \
-  '@127.0.0.1:24449' \
-  '127.0.0.1'
+  '@127.0.0.1:24449'
 
-run_generated_case http $'4\n\n127.0.0.1\n127.0.0.1\n24450\n\n' \
+run_generated_case http $'4\n\n1\n24450\n\n' \
   '.inbounds[0].type=="http" and (.inbounds[0].users|length)==0' \
-  'http://127.0.0.1:24450' \
-  '127.0.0.1'
+  'http://127.0.0.1:24450'
 
 HY="$MOCK/hy2"
 mkdir -p "$HY/certs"
@@ -247,12 +244,11 @@ SBCTL_LOCK_FILE="$HY/lock" \
 bash -c '
   set -Eeuo pipefail
   source ./sbctl.sh
-  detect_public_ipv4(){ return 1; }
-  detect_public_ipv6(){ return 1; }
+  detect_local_ips() { printf "IPv4\t127.0.0.1\tlo\n"; }
   add_inbound <<EOF2
 2
 
-
+1
 1
 24445
 
