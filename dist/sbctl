@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SBCTL_VERSION="0.5.0"
-readonly SBCTL_BUILD_COMMIT="e142a7750624"
+readonly SBCTL_BUILD_COMMIT="6c0664d83d48"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly SING_BOX_MIN_VERSION="1.12.0"
@@ -1886,7 +1886,7 @@ inbound_listen() {
   jq -r --arg tag "$1" '.inbounds[]? | select(.tag==$tag) | .listen // "::"' "$CONFIG_FILE"
 }
 
-# Treat legacy wildcards as overlapping either family, like their firewall rules.
+# Treat legacy wildcards as overlapping either address family.
 listener_addresses_overlap() {
   local first second
   first=$(normalize_socket_ip "$1") || first='*'
