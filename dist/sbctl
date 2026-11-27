@@ -6,7 +6,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SBCTL_VERSION="0.5.0"
-readonly SBCTL_BUILD_COMMIT="66b9512cdeab"
+readonly SBCTL_BUILD_COMMIT="7cf927bce72d"
 readonly PROJECT_REPO="QiuXiaoye1112/sbctl"
 readonly SCRIPT_DOWNLOAD_URL="${SBCTL_SCRIPT_URL:-https://github.com/${PROJECT_REPO}/raw/refs/heads/main/dist/sbctl}"
 readonly SING_BOX_MIN_VERSION="1.12.0"
@@ -4640,8 +4640,8 @@ traffic_write_file() {
   fi
 }
 
-# Save samples into a candidate so a failed firewall rebuild can leave
-# the live history and its still-running counters in their previous state.
+# Stage samples so a failed rule replacement can preserve the current
+# traffic history and the counters on the existing rules.
 traffic_publish_rules_locked() {
   local candidate=$1 backend=${2-} previous rc=0
   previous=$(temp_file) || return 1
