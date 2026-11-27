@@ -267,6 +267,55 @@ jq -e '
   .inbounds.anytls.limit.cycleStart=="2026-09-07 18:00:00" and
   .inbounds.anytls.limit.cycleEnd=="2026-10-07 18:00:00"
 ' "$TRAFFIC_FILE" >/dev/null
+# Only explicit refresh, a confirmed clear, or a change of the actual block
+# rules may sample. A recoverable rebuild failure leaves live counters intact.
+event_file="$TRAFFIC_FILE.events"
+traffic_read_counters() {
+  printf 'read\n' >>"$event_file"
+  [[ ${read_failure:-0} == 0 ]] || return 1
+  printf '%s\n' "$MOCK_COUNTERS"
+}
+traffic_rules_restore() {
+  printf 'restore\n' >>"$event_file"
+  [[ ${restore_failure:-0} == 0 ]]
+}
+: >"$event_file"
+before=$(cat "$TRAFFIC_FILE")
+traffic_menu <<<$'2\n0\n0' >/dev/null
+traffic_limit_set anytls <<<'3' >/dev/null
+traffic_clear_all_records <<<N >/dev/null
+confirm() { return 1; }
+traffic_clear_tag_records anytls >/dev/null
+[[ ! -s $event_file && $(cat "$TRAFFIC_FILE") == "$before" ]]
+traffic_period_set 4 01:00 >/dev/null
+confirm() { return 0; }
+traffic_limit_remove anytls >/dev/null
+traffic_limit_set anytls 3 7 18:00 >/dev/null
+[[ ! -s $event_file ]]
+
+MOCK_COUNTERS=$'anytls\t100'
+traffic_limit_menu <<<$'1\n0' >/dev/null
+[[ $(cat "$event_file") == $'read\nrestore' ]]
+before=$(cat "$TRAFFIC_FILE")
+: >"$event_file"
+if read_failure=1 traffic_clear_tag_records anytls >/dev/null 2>&1; then exit 1; fi
+[[ $(cat "$event_file") == read && $(cat "$TRAFFIC_FILE") == "$before" ]]
+: >"$event_file"
+if restore_failure=1 traffic_clear_all_records <<<RESET >/dev/null 2>&1; then exit 1; fi
+[[ $(cat "$event_file") == $'read\nrestore' && $(cat "$TRAFFIC_FILE") == "$before" ]]
+
+: >"$event_file"
+traffic_limit_set anytls 0.00000001 7 18:00 >/dev/null
+[[ $(cat "$event_file") == $'read\nrestore' ]]
+traffic_limit_is_blocked anytls
+jq -e '.inbounds.anytls.limit.usedBytes==400' "$TRAFFIC_FILE" >/dev/null
+: >"$event_file"
+MOCK_COUNTERS=''
+traffic_clear_tag_records anytls >/dev/null
+[[ $(cat "$event_file") == $'read\nrestore' ]]
+! traffic_limit_is_blocked anytls
+jq -e '.inbounds.anytls.daily=={} and .inbounds.anytls.limit.usedBytes==0' "$TRAFFIC_FILE" >/dev/null
+
 BASH_LIMITS
 
 # nft JSON snapshots are grouped by inbound tag across upload/download rules.

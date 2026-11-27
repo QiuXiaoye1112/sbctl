@@ -510,7 +510,6 @@ show_main_inbounds() {
 
 traffic_menu() {
   local choice
-  traffic_is_enabled && run_menu_action traffic_collect
   while true; do
     ui_page "流量信息" "主菜单"
     traffic_show "" "" --menu || true
@@ -525,7 +524,7 @@ traffic_menu() {
     ui_footer "返回主菜单"
     read -r -p "  请选择: " choice || { echo; return; }
     case $choice in
-      1) run_menu_action traffic_collect;;
+      1) info "正在刷新流量…"; run_menu_action traffic_collect;;
       2) traffic_limit_menu;;
       3) run_menu_action traffic_clear_tag_records; pause;;
       4) run_menu_action traffic_clear_all_records; pause;;
@@ -543,7 +542,6 @@ traffic_menu() {
 traffic_limit_menu() {
   local choice
   while true; do
-    if traffic_is_enabled; then run_menu_action traffic_collect || true; fi
     ui_page "月度流量限制" "主菜单 › 流量信息"
     traffic_limits_show --menu || true
     ui_section "额度操作"
@@ -559,7 +557,7 @@ traffic_limit_menu() {
     read -r -p "  请选择: " choice || { echo; return; }
     if traffic_limits_are_enabled; then
       case $choice in
-        1) continue;;
+        1) info "正在刷新流量…"; run_menu_action traffic_collect;;
         2) run_menu_action traffic_limit_set; pause;;
         3) run_menu_action traffic_limit_remove; pause;;
         4) run_menu_action traffic_limits_disable; pause;;
@@ -686,7 +684,7 @@ dispatch() {
     logs) service_logs "${1:-100}";;
     traffic)
       case ${1:-show} in
-        show) traffic_collect || true; traffic_show "${2-}" "${3-}";;
+        show) traffic_show "${2-}" "${3-}";;
         enable|start) traffic_enable;;
         disable|stop) traffic_disable;;
         collect|refresh) traffic_collect;;
@@ -710,7 +708,7 @@ dispatch() {
             *) die "未知 traffic limit 子命令：${2}";;
           esac
           ;;
-        [0-9][0-9][0-9][0-9]-*) traffic_collect || true; traffic_show "$1" "${2:-$(traffic_today)}";;
+        [0-9][0-9][0-9][0-9]-*) traffic_show "$1" "${2:-$(traffic_today)}";;
         *) die "未知 traffic 子命令：${1}";;
       esac
       ;;
