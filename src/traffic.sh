@@ -713,8 +713,8 @@ traffic_write_file() {
   fi
 }
 
-# Save samples into a candidate so a failed firewall rebuild can leave
-# the live history and its still-running counters in their previous state.
+# Stage samples so a failed rule replacement can preserve the current
+# traffic history and the counters on the existing rules.
 traffic_publish_rules_locked() {
   local candidate=$1 backend=${2-} previous rc=0
   previous=$(temp_file) || return 1
